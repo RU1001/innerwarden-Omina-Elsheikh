@@ -274,6 +274,121 @@ pub fn resolve_api_key(config_key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito::Server;
+
+    fn test_client(server: &Server) -> AbuseIpDbClient {
+        let mut client = AbuseIpDbClient::new("test-key".to_string(), 30);
+        client.base_url = server.url();
+        client
+    }
+
+    #[tokio::test]
+    async fn check_returns_none_when_unconfigured() {
+        let client = AbuseIpDbClient::new(String::new(), 30);
+        let result = client.check("1.2.3.4").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    //happy path
+    async fn check_returns_reputation_on_success() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("GET", "/api/v2/check")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("ipAddress".into(), "1.2.3.4".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "data": {
+                    "ipAddress": "1.2.3.4",
+                    "abuseConfidenceScore": 87,
+                    "totalReports": 342,
+                    "numDistinctUsers": 89,
+                    "countryCode": "CN",
+                    "isp": "SomeHosting Inc.",
+                    "isTor": false
+                }
+            }"#)
+            .create_async()
+            .await;
+
+        let client = test_client(&server);
+        let result = client.check("1.2.3.4").await;
+
+        mock.assert_async().await;
+
+        let rep = result.expect("should return Some");
+        assert_eq!(rep.confidence_score, 87);
+        assert_eq!(rep.total_reports, 342);
+        assert_eq!(rep.distinct_users, 89);
+        assert_eq!(rep.country_code.as_deref(), Some("CN"));
+        assert!(!rep.is_tor);
+    }
+    #[tokio::test]
+    async fn check_returns_none_on_rate_limit429 (){
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v2/check")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("ipAddress".into(), "1.2.3.4".into()),
+            ]))
+            .with_status(429)
+            .create_async()
+            .await;
+        
+        let client = test_client(&server);
+        let result = client.check("1.2.3.4").await;
+    
+        mock.assert_async().await;
+    
+        assert!(result.is_none());
+
+
+    }
+
+    #[tokio::test]
+    async fn check_return_none_when_not_200_or_429(){
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v2/check")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("ipAddress".into(), "1.2.3.4".into()),
+            ]))
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let client = test_client(&server);
+        let result = client.check("1.2.3.4").await;
+        
+        mock.assert_async().await;
+        assert!(result.is_none());
+
+    }
+
+    #[tokio::test]
+    async fn check_return_none_when_body_isnot_json(){
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v2/check")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("ipAddress".into(), "1.2.3.4".into()),
+            ]))
+            .with_status(200)
+            .with_body("not a json at all")
+            .create_async()
+            .await;
+
+        let client = test_client(&server);
+        let result = client.check("1.2.3.4").await;
+        
+        mock.assert_async().await;
+        assert!(result.is_none());
+
+    }
 
     #[test]
     fn deserializes_check_response() {
