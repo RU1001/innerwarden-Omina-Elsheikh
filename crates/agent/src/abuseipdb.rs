@@ -90,6 +90,7 @@ impl IpReputation {
 pub struct AbuseIpDbClient {
     api_key: String,
     max_age_days: u32,
+    base_url: String,
     http: reqwest::Client,
 }
 
@@ -102,6 +103,7 @@ impl AbuseIpDbClient {
         Self {
             api_key,
             max_age_days,
+            base_url: "https://api.abuseipdb.com".to_string(),
             http,
         }
     }
@@ -132,7 +134,7 @@ impl AbuseIpDbClient {
 
         let resp = self
             .http
-            .post("https://api.abuseipdb.com/api/v2/report")
+            .post(format!("{}/api/v2/report", self.base_url))
             .header("Key", &self.api_key)
             .header("Accept", "application/json")
             .json(&body)
@@ -182,7 +184,7 @@ impl AbuseIpDbClient {
 
         let resp = self
             .http
-            .get("https://api.abuseipdb.com/api/v2/check")
+            .get(format!("{}/api/v2/check", self.base_url))
             .query(&[
                 ("ipAddress", ip),
                 ("maxAgeInDays", &self.max_age_days.to_string()),
