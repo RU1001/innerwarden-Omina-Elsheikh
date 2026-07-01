@@ -361,6 +361,26 @@ mod tests {
     }
 
     #[test]
+    fn country_or_isp_missing(){
+        let rep = IpReputation {
+            confidence_score: 75,
+            total_reports: 100,
+            distinct_users: 30,
+            country_code: None,
+            isp: None,
+            is_tor: false,
+        };
+        let line = rep.as_context_line();
+        assert!(line.contains("score=75/100"));
+        assert!(line.contains("reports=100"));
+        assert!(line.contains("??"));
+        assert!(line.contains("unknown ISP"));
+        assert!(!line.contains("Tor"));
+    }
+
+    }
+
+    #[test]
     fn context_line_tor_flag() {
         // Flag path: Tor reputations should append an explicit marker.
         let rep = IpReputation {
@@ -381,6 +401,13 @@ mod tests {
         let client = AbuseIpDbClient::new(String::new(), 30);
         assert!(!client.is_configured());
     }
+    #[test]
+    fn configured_when_api_key(){
+        //Config path: API key should mark client as configured.
+        let client = AbuseIpDbClient::new("test-key".to_string,30);
+        assert!(client.is_configured);
+    }
+
 
     #[test]
     fn resolve_api_key_prefers_config() {
