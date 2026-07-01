@@ -378,7 +378,7 @@ mod tests {
         assert!(!line.contains("Tor"));
     }
 
-    }
+    
 
     #[test]
     fn context_line_tor_flag() {
@@ -404,8 +404,8 @@ mod tests {
     #[test]
     fn configured_when_api_key(){
         //Config path: API key should mark client as configured.
-        let client = AbuseIpDbClient::new("test-key".to_string,30);
-        assert!(client.is_configured);
+        let client = AbuseIpDbClient::new("test-key".to_string(),30);
+        assert!(client.is_configured());
     }
 
 
