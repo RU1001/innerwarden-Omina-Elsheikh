@@ -13,6 +13,16 @@ use crate::{
     shield_inline, telemetry_tick, AgentState,
 };
 
+/// True when a post-graph anomaly recalibration error is just the expected
+/// "no autoencoder model trained yet" condition (a fresh or frequently
+/// redeployed host before the nightly trainer has produced a model). These are
+/// not failures and must not be WARN-logged every 30s slow-loop tick — a single
+/// untrained box produced ~2.7k WARN lines in 7 days. Real recalibration errors
+/// still log at WARN.
+fn is_pretraining_no_model(err_msg: &str) -> bool {
+    err_msg.contains("no model loaded")
+}
+
 // ── Disk-low guard for SQLite blob writes ────────────────────────────
 //
 // Operational fix for the 2026-04-25 02:59 UTC class of hangs: when
@@ -728,13 +738,26 @@ fn kg_tick(
                                             events_read = events.len(),
                                             "anomaly: post-graph anchor recalibration complete"
                                         );
-                                        state
-                                            .anomaly_engine
-                                            .clear_post_graph_recalibration_flag();
+                                        state.anomaly_engine.clear_post_graph_recalibration_flag();
                                     }
-                                    Err(e) => warn!(
-                                        "anomaly: post-graph recalibration failed (will retry next tick): {e}"
-                                    ),
+                                    Err(e) => {
+                                        let msg = e.to_string();
+                                        if is_pretraining_no_model(&msg) {
+                                            // Expected before the nightly
+                                            // autoencoder has trained a model on
+                                            // this host (fresh / frequently
+                                            // redeployed box). Not an error and
+                                            // must not spam WARN every 30s tick —
+                                            // 2.7k lines/7d observed on Azure.
+                                            tracing::debug!(
+                                                "anomaly: recalibration skipped — {msg}"
+                                            );
+                                        } else {
+                                            warn!(
+                                                "anomaly: post-graph recalibration failed (will retry next tick): {msg}"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1130,6 +1153,13 @@ pub(crate) async fn process_narrative_tick(
             &kc_events,
             &mut state.correlation_engine,
         );
+        // Spec 081 — managed-agent coexistence: register the kernel PID-block
+        // for offending chain PIDs, but WITHHOLD it for a positively-verified,
+        // IW-managed AI agent acting on its own services (data_exfil/exploit_c2
+        // shape). Detection is unchanged — the incidents were already produced
+        // above and are written + notified below. The verifier fails closed, so
+        // a real attacker / forged identity / recycled pid is still kernel-blocked.
+        killchain_inline::register_kernel_blocks(&kc_incidents, state).await;
         killchain_inline::write_incidents(data_dir, state.sqlite_store.as_deref(), &kc_incidents);
         // Phase 7B (audit RC-2 — Slice C): kill chain detections fire
         // on operator SSH sessions (operator runs `cat /etc/passwd`,
@@ -1190,6 +1220,10 @@ pub(crate) async fn process_narrative_tick(
         )
         .await;
         let gate_counter = state.telemetry.gate_suppressed_counter();
+        // Resolve the operator-facing server identity once (cheap; uses the
+        // `[agent] tags` → knowledge-graph hostname → /etc/hostname ladder).
+        let burst_host =
+            crate::notification_gate::resolve_host_id(&cfg.agent.tags, &state.knowledge_graph);
         killchain_inline::notify_telegram(
             &state.telegram_client,
             &kc_incidents,
@@ -1197,6 +1231,7 @@ pub(crate) async fn process_narrative_tick(
             &mut state.telegram_deferred,
             gate_counter.as_ref(),
             &self_traffic_list,
+            &burst_host,
         );
 
         // Periodic stale PID cleanup (every 60s).
@@ -1226,6 +1261,23 @@ pub(crate) async fn process_narrative_tick(
             );
         }
         state.last_orphan_recovery = std::time::Instant::now();
+
+        // Re-verify already-decided needs_review cases against the LIVE firewall
+        // (operator report 2026-06-13): a High/Crit case decided needs_review
+        // BEFORE its IP got blocked stays in "needs your attention" forever once
+        // the block lands later — #987 only verified at first-decision, and the
+        // in-memory block record can diverge from an orphaned ufw rule. This
+        // flips such cases to a truthful Contained decision by probing the actual
+        // firewall (never the record). Recon-only (active-harm stays surfaced);
+        // hole-free (returns raise new incidents + live-verified re-block).
+        let recontained =
+            crate::orphan_recovery::reverify_already_blocked_needs_review(state, data_dir).await;
+        if recontained > 0 {
+            tracing::info!(
+                recontained,
+                "slow_loop: re-verified {recontained} needs_review case(s) as already-contained (live firewall)"
+            );
+        }
     }
 
     // 2026-06-10 — operator-unblock drain. Runs every tick (one bounded SQL
@@ -1242,6 +1294,23 @@ pub(crate) async fn process_narrative_tick(
             info!(unblocked, "slow_loop: drained operator unblock requests");
         }
     }
+
+    // Spec 080 G4 — Execution Gate divergence monitor (FREE honesty net).
+    // Self-throttled (10 min) live-vs-signed check: raises a self-incident when
+    // the paid gate's signed allowlist has not converged to the kernel maps, so
+    // the paid feature can never silently go inert / stay un-applied. Verifies
+    // the LIVE kernel state, never the record (same principle as spec 076).
+    crate::execution_gate_monitor::process_execution_gate_tick(data_dir);
+
+    // DNS Guard intel bridge — export the agent's malicious-domain intel to the
+    // paid DNS Guard's denylist file (free detect → paid prevent). Self-throttled
+    // (5 min) + write-only-if-changed; no-op unless `[dns_guard] export_enabled`.
+    crate::dns_guard_export::process_dns_guard_export_tick(&cfg.dns_guard, state);
+
+    // DNS Guard ingest — tail the guard's block events (byte-offset cursor) and
+    // surface each `dns_guard.blocked` malicious-domain lookup as a High incident
+    // so it's visible in IW. No-op unless `[dns_guard] ingest_enabled`.
+    crate::dns_guard_ingest::process_dns_guard_ingest_tick(data_dir, &cfg.dns_guard, state);
 
     // Spec 062 Phase 2 — needs_review timeout sweep. Every 10 minutes,
     // auto-resolve low/medium needs_review items that sat past the grace
@@ -1276,6 +1345,20 @@ pub(crate) async fn process_narrative_tick(
         state.last_block_enforcement_reconcile = std::time::Instant::now();
     }
 
+    // Spec 081 follow-up — agent-guard registry reconciliation. Self-throttled
+    // (5 min): auto-register co-located AI agents (OpenClaw, …) so the managed-
+    // agent response gate's `by_pid` hint survives agent restarts, and prune
+    // dead pids so a recycled pid can never inherit the spec-081 exemption. Only
+    // supplies the membership hint — the verifier still independently re-IDs +
+    // fingerprint-matches + trusted-root + own-config + uid-checks live (no new
+    // hole). No-op unless `[agent_guard] auto_register = true` (default on).
+    crate::agent_registry_reconcile::process_agent_registry_reconcile_tick(
+        &cfg.agent_guard,
+        state,
+        data_dir,
+    )
+    .await;
+
     // Feed events through threat DNA engine (behavioral fingerprinting + anomaly detection).
     if cfg.dna.enabled {
         dna_inline::process_events(
@@ -1305,12 +1388,15 @@ pub(crate) async fn process_narrative_tick(
             shield_inline::process_events(shield, &events_entries, &ip_risks).await;
         shield_inline::write_incidents(data_dir, &shield_incidents);
         let gate_counter = state.telemetry.gate_suppressed_counter();
+        let burst_host =
+            crate::notification_gate::resolve_host_id(&cfg.agent.tags, &state.knowledge_graph);
         shield_inline::notify_telegram(
             &state.telegram_client,
             &shield_incidents,
             &state.notification_burst_tracker,
             &mut state.telegram_deferred,
             gate_counter.as_ref(),
+            &burst_host,
         );
         // Sync: register shield blocks in agent blocklist and attacker intel.
         for ip in &shield_blocked {
@@ -1660,6 +1746,22 @@ mod tests {
     use crate::knowledge_graph::types::Node;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn pretraining_no_model_is_classified_as_expected() {
+        // The exact runtime message (neural_lifecycle.rs:1315) must be treated
+        // as the expected pre-training condition (debug, not WARN spam).
+        assert!(is_pretraining_no_model(
+            "no model loaded: train_nightly first"
+        ));
+        // A genuine recalibration failure must NOT be suppressed.
+        assert!(!is_pretraining_no_model(
+            "sqlite read failed: database is locked"
+        ));
+        assert!(!is_pretraining_no_model(
+            "anomaly engine: dimension mismatch 48 vs 65"
+        ));
+    }
 
     /// 2026-05-03 (Wave 5b PR-3 anchor): the slow_loop ticks every
     /// 30 s, but the src_ip backfill must run at MOST once per

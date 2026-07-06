@@ -28,8 +28,9 @@ pub(crate) fn cmd_enable(
     id: &str,
     params: HashMap<String, String>,
     yes: bool,
+    force: bool,
 ) -> Result<()> {
-    cmd_enable_with_deferred_restart(cli, registry, id, params, yes, false)
+    cmd_enable_with_deferred_restart(cli, registry, id, params, yes, false, force)
 }
 
 pub(crate) fn cmd_enable_with_deferred_restart(
@@ -39,6 +40,7 @@ pub(crate) fn cmd_enable_with_deferred_restart(
     params: HashMap<String, String>,
     yes: bool,
     defer_restarts: bool,
+    force: bool,
 ) -> Result<()> {
     if !cli.dry_run {
         require_sudo(cli);
@@ -47,15 +49,20 @@ pub(crate) fn cmd_enable_with_deferred_restart(
     let mut opts = make_opts(cli, params, yes);
     opts.defer_restarts = defer_restarts;
 
-    if cap.is_enabled(&opts) {
+    if cap.is_enabled(&opts) && !force {
         println!(
-            "Capability '{}' is already enabled. Nothing to do.",
+            "Capability '{}' is already enabled. Nothing to do.\n\
+             (Use --force to re-apply and repair drift, e.g. a missing sudoers drop-in.)",
             cap.id()
         );
         return Ok(());
     }
 
-    println!("Enabling capability: {}\n", cap.name());
+    if cap.is_enabled(&opts) && force {
+        println!("Re-applying capability (--force): {}\n", cap.name());
+    } else {
+        println!("Enabling capability: {}\n", cap.name());
+    }
 
     // --- Preflight checks ---
     println!("Preflight checks:");
@@ -309,7 +316,7 @@ mod tests {
         let cli = test_cli(&temp, true);
         let registry = CapabilityRegistry::default_all();
 
-        let err = cmd_enable(&cli, &registry, "not-a-cap", HashMap::new(), true)
+        let err = cmd_enable(&cli, &registry, "not-a-cap", HashMap::new(), true, false)
             .expect_err("unknown capability should error");
 
         assert!(err.to_string().contains("not-a-cap"));
@@ -323,7 +330,7 @@ mod tests {
         let registry = CapabilityRegistry::default_all();
         let params = HashMap::from([("provider".to_string(), "unknown-provider".to_string())]);
 
-        let err = cmd_enable(&cli, &registry, "ai", params, true)
+        let err = cmd_enable(&cli, &registry, "ai", params, true, false)
             .expect_err("failed preflight should stop enable");
 
         assert!(err.to_string().contains("preflight checks failed"));
@@ -340,7 +347,7 @@ mod tests {
         let cli = test_cli(&temp, true);
         let registry = CapabilityRegistry::default_all();
 
-        cmd_enable(&cli, &registry, "ai", ollama_params(), true)
+        cmd_enable(&cli, &registry, "ai", ollama_params(), true, false)
             .expect("dry-run enable should succeed");
 
         assert!(!crate::config_editor::read_bool(
@@ -356,7 +363,7 @@ mod tests {
         let cli = test_cli(&temp, false);
         let registry = CapabilityRegistry::default_all();
 
-        cmd_enable_with_deferred_restart(&cli, &registry, "ai", ollama_params(), true, true)
+        cmd_enable_with_deferred_restart(&cli, &registry, "ai", ollama_params(), true, true, false)
             .expect("enable should apply with deferred restart");
 
         let config = std::fs::read_to_string(&cli.agent_config).expect("test should read config");
@@ -377,7 +384,7 @@ mod tests {
             "mistral"
         );
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let audit_path = cli.data_dir.join(format!("admin-actions-{today}.jsonl"));
         let audit = std::fs::read_to_string(audit_path).expect("enable should write audit entry");
         assert!(audit.contains("\"action\":\"enable\""));
@@ -395,14 +402,42 @@ mod tests {
         )
         .expect("test should write enabled config");
 
-        cmd_enable(&cli, &registry, "ai", ollama_params(), true)
+        cmd_enable(&cli, &registry, "ai", ollama_params(), true, false)
             .expect("already-enabled capability should be a no-op");
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         assert!(!cli
             .data_dir
             .join(format!("admin-actions-{today}.jsonl"))
             .exists());
+    }
+
+    #[test]
+    fn cmd_enable_force_reapplies_when_already_enabled() {
+        // --force must re-run apply even when config says enabled, so drift
+        // (e.g. a deleted sudoers drop-in) gets repaired. Proven by the audit
+        // entry, which is only written when apply actually runs.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, false);
+        let registry = CapabilityRegistry::default_all();
+        std::fs::write(
+            &cli.agent_config,
+            "[ai]\nenabled = true\nprovider = \"ollama\"\nmodel = \"mistral\"\n",
+        )
+        .expect("test should write enabled config");
+
+        // defer_restarts = true to avoid shelling out to systemctl in tests;
+        // force = true is the behavior under test.
+        cmd_enable_with_deferred_restart(&cli, &registry, "ai", ollama_params(), true, true, true)
+            .expect("force should re-apply an already-enabled capability");
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        assert!(
+            cli.data_dir
+                .join(format!("admin-actions-{today}.jsonl"))
+                .exists(),
+            "force re-apply must run apply (audit entry written)"
+        );
     }
 
     #[test]
@@ -457,7 +492,7 @@ mod tests {
             "ai",
             "enabled"
         ));
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let audit_path = cli.data_dir.join(format!("admin-actions-{today}.jsonl"));
         let audit = std::fs::read_to_string(audit_path).expect("disable should write audit entry");
         assert!(audit.contains("\"action\":\"disable\""));
@@ -473,7 +508,7 @@ mod tests {
         cmd_disable(&cli, &registry, "ai", true)
             .expect("already-disabled capability should be a no-op");
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         assert!(!cli
             .data_dir
             .join(format!("admin-actions-{today}.jsonl"))

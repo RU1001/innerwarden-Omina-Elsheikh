@@ -11,7 +11,9 @@ mod firewall;
 mod firmware;
 mod ignore;
 mod kernel;
+mod kernel_hardening;
 mod kernel_modules;
+mod mac;
 mod permissions;
 mod services;
 mod ssh;
@@ -32,7 +34,9 @@ use firewall::check_firewall;
 use firmware::check_firmware;
 use ignore::{is_ignored, load_ignore_list};
 use kernel::check_kernel;
+use kernel_hardening::check_kernel_hardening;
 use kernel_modules::check_kernel_modules;
+use mac::check_mac;
 use permissions::check_permissions;
 use services::check_services;
 use ssh::check_ssh;
@@ -227,6 +231,8 @@ fn run_checks(env: &impl HardenEnv) -> Vec<CheckResult> {
         check_ssh(env),
         check_firewall(env),
         check_kernel(env),
+        check_kernel_hardening(env),
+        check_mac(env),
         check_permissions(env),
         check_updates(env),
         check_docker(env),
@@ -1744,6 +1750,8 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
                 "SSH",
                 "Firewall",
                 "Kernel",
+                "Kernel Hardening",
+                "Access Control",
                 "Permissions",
                 "Updates",
                 "Docker",

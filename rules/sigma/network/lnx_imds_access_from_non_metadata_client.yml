@@ -1,0 +1,29 @@
+title: Linux IMDS Access From Non-Metadata Client
+id: 86157017-c2b1-4d4a-8c33-93b8e67e4af4
+status: test
+description: Detects access to the IMDS from a non-metadata client.
+references:
+    - https://attack.mitre.org/techniques/T1552/005/
+author: John Ortega
+date: 2026-06-27
+tags:
+    - attack.credential-access
+    - attack.t1552.005
+logsource:
+    product: linux
+    category: network_connection
+detection:
+    selection:
+        kind: network.outbound_connect
+        DestinationIp: "169.254.169.254"
+    filter:
+        comm:
+            - cloud-init
+            - ec2-metadata-collector
+            - instance-controller
+            - gcp-metadata-server
+            - azure-metadata-monitor
+    condition: selection and not filter
+falsepositives:
+    - Unknown
+level: medium

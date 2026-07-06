@@ -227,7 +227,11 @@ fn extract_json(text: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ai::AiAction;
+
     use super::*;
+    use innerwarden_core::{entities::EntityRef, event::Severity, incident::Incident};
+    use serde_json::json;
 
     #[test]
     fn extract_json_bare_object() {
@@ -275,5 +279,235 @@ mod tests {
             OllamaProvider::new("http://localhost:11434/".into(), "llama3.2".into(), None).unwrap();
         let url = format!("{}/api/chat", p.base_url.trim_end_matches('/'));
         assert_eq!(url, "http://localhost:11434/api/chat");
+    }
+
+    fn provider(base_url: String, api_key: Option<&str>) -> OllamaProvider {
+        OllamaProvider::new(
+            base_url,
+            "llama3.2".into(),
+            api_key.map(ToString::to_string),
+        )
+        .unwrap()
+    }
+
+    fn ollama_response(content: &str) -> String {
+        json!({ "message": { "content": content } }).to_string()
+    }
+
+    fn decision_json() -> &'static str {
+        r#"{
+            "action": "block_ip",
+            "target_ip": "203.0.113.10",
+            "target_user": null,
+            "duration_secs": null,
+            "skill_id": "block-ip-ufw",
+            "confidence": 0.91,
+            "auto_execute": true,
+            "reason": "credential stuffing from a hostile host",
+            "alternatives": ["monitor"],
+            "estimated_threat": "high"
+        }"#
+    }
+
+    fn test_incident() -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".into(),
+            incident_id: "ssh_bruteforce:203.0.113.10:test-host".into(),
+            severity: Severity::High,
+            title: "SSH brute force".into(),
+            summary: "Repeated failed SSH login attempts".into(),
+            evidence: json!({ "source_ip": "203.0.113.10" }),
+            recommended_checks: vec![],
+            tags: vec!["ssh".into()],
+            entities: vec![EntityRef::ip("203.0.113.10")],
+        }
+    }
+
+    fn test_context(incident: &Incident) -> DecisionContext<'_> {
+        DecisionContext {
+            incident,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked: vec![],
+            available_skills: vec![],
+            ip_reputation: None,
+            ip_geo: None,
+            ip_dshield: None,
+            ip_dshield_attacker: false,
+            host_posture: None,
+            prior_decisions: None,
+            graph_context: None,
+            graph_subgraph: None,
+            playbook_outcome: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_posts_to_api_chat_and_returns_message_content() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/chat")
+            .match_header(
+                "content-type",
+                mockito::Matcher::Regex("application/json.*".to_string()),
+            )
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "model": "llama3.2",
+                "stream": false
+            })))
+            .with_status(200)
+            .with_body(ollama_response("analysis complete"))
+            .create_async()
+            .await;
+        let provider = provider(format!("{}/", server.url()), None);
+
+        let content = provider.chat("system", "user").await.unwrap();
+
+        assert_eq!(content, "analysis complete");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn chat_sends_bearer_auth_when_api_key_is_configured() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/chat")
+            .match_header("authorization", "Bearer test-key")
+            .with_status(200)
+            .with_body(ollama_response("authenticated"))
+            .create_async()
+            .await;
+        let provider = provider(server.url(), Some("test-key"));
+
+        let content = provider.chat("system", "user").await.unwrap();
+
+        assert_eq!(content, "authenticated");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn chat_non_success_includes_status_and_response_body() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/chat")
+            .with_status(503)
+            .with_body("downstream unavailable")
+            .create_async()
+            .await;
+        let provider = provider(server.url(), None);
+
+        let err = provider.chat("system", "user").await.unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("Ollama chat returned 503"), "got: {msg}");
+        assert!(msg.contains("downstream unavailable"), "got: {msg}");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_empty_message_content() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_body(ollama_response(""))
+            .create_async()
+            .await;
+        let provider = provider(server.url(), None);
+
+        let err = provider.chat("system", "user").await.unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("Ollama chat returned an empty response"),
+            "got: {msg}"
+        );
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn decide_extracts_json_decision_from_prose_response() {
+        let mut server = mockito::Server::new_async().await;
+        let content = format!("Sure, here is the decision:\n{}\nDone.", decision_json());
+        let m = server
+            .mock("POST", "/api/chat")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "model": "llama3.2",
+                "stream": false,
+                "format": "json",
+                "options": {
+                    "temperature": 0.2,
+                    "num_predict": 512
+                }
+            })))
+            .with_status(200)
+            .with_body(ollama_response(&content))
+            .create_async()
+            .await;
+        let provider = provider(server.url(), None);
+        let incident = test_incident();
+        let ctx = test_context(&incident);
+
+        let decision = provider.decide(&ctx).await.unwrap();
+
+        assert!(matches!(
+            decision.action,
+            AiAction::BlockIp {
+                ref ip,
+                ref skill_id
+            } if ip == "203.0.113.10" && skill_id == "block-ip-ufw"
+        ));
+        assert_eq!(decision.confidence, 0.91);
+        assert!(decision.auto_execute);
+        assert_eq!(decision.estimated_threat, "high");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn decide_auth_failure_includes_cloud_api_key_hint() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/chat")
+            .match_header("authorization", "Bearer bad-key")
+            .with_status(401)
+            .with_body("invalid token")
+            .create_async()
+            .await;
+        let provider = provider(server.url(), Some("bad-key"));
+        let incident = test_incident();
+        let ctx = test_context(&incident);
+
+        let err = provider.decide(&ctx).await.unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("authentication failed"), "got: {msg}");
+        assert!(msg.contains("OLLAMA_API_KEY"), "got: {msg}");
+        assert!(
+            msg.contains("https://ollama.com/settings/api-keys"),
+            "got: {msg}"
+        );
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn decide_local_model_not_found_includes_pull_hint() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/chat")
+            .with_status(404)
+            .with_body(r#"{"error":"model 'llama3.2' not found"}"#)
+            .create_async()
+            .await;
+        let provider = provider(server.url(), None);
+        let incident = test_incident();
+        let ctx = test_context(&incident);
+
+        let err = provider.decide(&ctx).await.unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("model 'llama3.2' not found"), "got: {msg}");
+        assert!(msg.contains("ollama pull llama3.2"), "got: {msg}");
+        m.assert_async().await;
     }
 }

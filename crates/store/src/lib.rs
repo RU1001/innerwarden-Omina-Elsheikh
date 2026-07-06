@@ -109,6 +109,23 @@ impl Store {
         // conn means the runtime can park the task and another
         // task can take the conn — easy fan-out into deadlock when
         // every task is waiting on the next.
+        // Establish WAL mode ONCE, on a single connection, BEFORE building the
+        // pool. WAL is a persistent property of the db file, so once it is set
+        // the 16 pooled connections' `PRAGMA journal_mode = WAL` (in
+        // PRAGMA_SETUP) is a no-op that acquires no exclusive lock. Without
+        // this, `build()` opens all 16 connections at once and each races on
+        // the WAL mode-change transition, which returns SQLITE_BUSY immediately
+        // regardless of the `busy_timeout` set earlier in the same batch (a
+        // known SQLite quirk). r2d2's default handler logs each race as
+        // `ERROR ... database is locked` on every fresh start, which looks
+        // alarming even though the schema-open retry below recovers. Doing it
+        // once up front keeps the warm 16-connection pool AND removes the spam.
+        // Best-effort: a failure here is non-fatal — the pool's own PRAGMA_SETUP
+        // still sets WAL (just with the race), and the retry below recovers.
+        if let Ok(conn) = r2d2_sqlite::rusqlite::Connection::open(&db_path) {
+            let _ = conn.execute_batch("PRAGMA busy_timeout = 30000; PRAGMA journal_mode = WAL;");
+        }
+
         let pool = Pool::builder()
             .max_size(16)
             .connection_timeout(std::time::Duration::from_secs(5))
@@ -302,6 +319,25 @@ mod tests {
             held.len(),
             8,
             "pool must hand out >= 8 simultaneous connections"
+        );
+    }
+
+    #[test]
+    fn fresh_store_opens_in_wal_mode_without_lock_errors() {
+        // The pre-pool WAL establishment must leave a fresh db in WAL mode, so
+        // the 16 pooled connections' `journal_mode = WAL` is a no-op that never
+        // races (no "database is locked" ERROR spam on first start).
+        use tempfile::TempDir;
+        let td = TempDir::new().unwrap();
+        let store = Store::open(td.path()).expect("open file-backed");
+        let conn = store.pool.get().expect("get conn");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("query journal_mode");
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "fresh store must be in WAL mode"
         );
     }
 

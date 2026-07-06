@@ -25,12 +25,11 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
-        bpf_probe_read_kernel_str_bytes, bpf_probe_read_user,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_task, bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, kretprobe, lsm, map, tracepoint, xdp},
-    maps::{HashMap, LruHashMap, RingBuf},
+    maps::{HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext, XdpContext},
 };
 
@@ -43,9 +42,8 @@ use innerwarden_ebpf_types::{
     IopermEvent, IoplEvent, KillEvent, ListenEvent, LsmDecisionEvent, MemfdCreateEvent,
     ModuleLoadEvent, MountEvent, MprotectEvent, MsrWriteEvent, PrctlEvent, PrivEscEvent,
     ProcessExitEvent, PtraceEvent, RenameEvent, SetUidEvent, SetnsEvent, SocketBindEvent,
-    SyscallKind,
-    TimingProbeEvent, TimingTarget, TruncateEvent, UnlinkEvent, UtimensatEvent, MAX_COMM_LEN,
-    MAX_FILENAME_LEN,
+    SyscallKind, TimingProbeEvent, TimingTarget, TruncateEvent, UnlinkEvent, UtimensatEvent,
+    MAX_ARGS, MAX_ARG_LEN, MAX_COMM_LEN, MAX_FILENAME_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,6 +97,18 @@ static COMM_ALLOWLIST: HashMap<[u8; 16], u32> = HashMap::with_max_entries(256, 0
 /// Populated by agent from container inventory.
 #[map]
 static CGROUP_ALLOWLIST: HashMap<u64, u32> = HashMap::with_max_entries(128, 0);
+
+/// InnerWarden's OWN service cgroups (sensor, agent, watchdog, supervisor).
+/// Key: cgroup_id. Value: 1. Populated by the userspace loader from non-forgeable
+/// `/proc/<pid>/exe` identity, refreshed in the ring loop. Checked FIRST in the
+/// high-volume handlers via `is_self_cgroup()` so InnerWarden's own syscalls —
+/// including the integrity collector's credential reads — are dropped before the
+/// ring reserve and never flood the buffer or self-alert. DISTINCT from
+/// CGROUP_ALLOWLIST (known-safe containers, non-secret gate only): this map fully
+/// mutes a cgroup, so only our own non-forgeable cgroups may ever enter it — a
+/// container can never be silenced through it.
+#[map]
+static SELF_CGROUP: HashMap<u64, u32> = HashMap::with_max_entries(16, 0);
 
 /// Per-PID rate limiter - prevents ring buffer flood from noisy processes.
 /// Key: PID. Value: last emission timestamp (ktime_ns).
@@ -169,7 +179,9 @@ fn chain_flag(pid: u32, flag: u32) {
 #[inline(always)]
 fn chain_is_attack(pid: u32) -> bool {
     let flags = unsafe { PID_CHAIN.get(&pid) }.copied().unwrap_or(0);
-    if flags == 0 { return false; }
+    if flags == 0 {
+        return false;
+    }
     // Shell patterns
     (flags & PATTERN_REVERSE_SHELL) == PATTERN_REVERSE_SHELL
         || (flags & PATTERN_BIND_SHELL) == PATTERN_BIND_SHELL
@@ -228,6 +240,17 @@ fn is_comm_allowed(handler_bit: u32) -> bool {
 fn is_cgroup_allowed() -> bool {
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     unsafe { CGROUP_ALLOWLIST.get(&cgroup_id) }.is_some()
+}
+
+/// True when the current task is one of InnerWarden's OWN processes (by cgroup).
+/// Drops our own syscalls — including credential reads the integrity collector
+/// makes — in-kernel before reserve, so we never flood the ring or alert on
+/// ourselves. Non-forgeable: SELF_CGROUP holds only our real service cgroups,
+/// seeded from `/proc/<pid>/exe`. Empty by default → no-op until seeded.
+#[inline(always)]
+fn is_self_cgroup() -> bool {
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    unsafe { SELF_CGROUP.get(&cgroup_id) }.is_some()
 }
 
 /// Per-PID rate limiter. Returns true if the event should be SKIPPED.
@@ -300,28 +323,75 @@ macro_rules! syscall_arg_at {
     };
 }
 
+/// Read the `$i`-th entry of an execve `argv[]` array (userspace `char **` at
+/// `$base`) into `event.argv[$i]`, updating `$n` to the count captured. `$i`
+/// MUST be a literal so the index into the reserved ring entry is constant (the
+/// eBPF verifier rejects a runtime index into `event.argv`). Evaluates to `true`
+/// when an arg was read, `false` at the argv NULL terminator; callers chain with
+/// `&&` so capture stops at the first NULL (manual unroll, no loop). Fail-soft:
+/// a bad userspace read stops capture rather than aborting the event.
+macro_rules! read_argv_slot {
+    ($base:expr, $i:literal, $event:expr, $n:expr) => {{
+        let slot = ($base as usize + $i * core::mem::size_of::<u64>()) as *const u64;
+        let str_addr = unsafe { bpf_probe_read_user(slot) }.unwrap_or(0);
+        if str_addr != 0 {
+            unsafe {
+                let _ = bpf_probe_read_user_str_bytes(str_addr as *const u8, &mut $event.argv[$i]);
+            }
+            $n = $i as u32 + 1;
+            true
+        } else {
+            false
+        }
+    }};
+}
+
 // Per-arg pt_regs byte offset as a LITERAL (expands at the call site). Two
 // arch-specific definitions selected by build-host cfg. Literals are required:
 // a runtime/const-fn offset value mis-reads on the BPF target.
 #[cfg(iw_arch_x86_64)]
 macro_rules! __sc_off {
     // rdi, rsi, rdx, r10, r8, r9
-    (0) => { 112 };
-    (1) => { 104 };
-    (2) => { 96 };
-    (3) => { 56 };
-    (4) => { 72 };
-    (5) => { 64 };
+    (0) => {
+        112
+    };
+    (1) => {
+        104
+    };
+    (2) => {
+        96
+    };
+    (3) => {
+        56
+    };
+    (4) => {
+        72
+    };
+    (5) => {
+        64
+    };
 }
 #[cfg(iw_arch_aarch64)]
 macro_rules! __sc_off {
     // x0..x5
-    (0) => { 0 };
-    (1) => { 8 };
-    (2) => { 16 };
-    (3) => { 24 };
-    (4) => { 32 };
-    (5) => { 40 };
+    (0) => {
+        0
+    };
+    (1) => {
+        8
+    };
+    (2) => {
+        16
+    };
+    (3) => {
+        24
+    };
+    (4) => {
+        32
+    };
+    (5) => {
+        40
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +586,112 @@ fn try_privesc(ctx: &ProbeContext) -> Result<(), i64> {
 #[map]
 static LSM_POLICY: HashMap<u32, u32> = HashMap::with_max_entries(16, 0);
 
+/// Execution Gate allowlist (Active Defence / paid). Key = FNV-1a hash of the
+/// executing binary's path (≤256 bytes, NUL-terminated prefix). Value = 1
+/// (allowed). Populated by the userspace loader from the signed allowlist; pinned
+/// at `/sys/fs/bpf/innerwarden/exec_allowlist` so it survives sensor restart.
+///
+/// Enforcement is gated by `LSM_POLICY` key 3 (exec-gate mode): 0 = off
+/// (dry-run default — the gate is inert), 1 = enforce (an exec whose path-hash is
+/// not present is blocked with -EPERM). Path-hash (not inode) is the v1 key: it
+/// reuses the filename read the hook already does and avoids fragile per-kernel
+/// inode struct offsets; the binary-swap gap is covered by the sensor's FIM.
+#[map]
+static EXEC_ALLOWLIST: HashMap<u64, u8> = HashMap::with_max_entries(20_000, 0);
+
+/// Execution Gate trusted DIRECTORY-PREFIX allowlist (Active Defence / paid).
+/// Key = FNV-1a hash of a directory path prefix INCLUDING its trailing `/`
+/// (e.g. `FNV("/var/lib/dpkg/info/")`, `FNV("/etc/cron.daily/")`). An exec whose
+/// path lies under ANY trusted prefix is allowed even when its exact path-hash
+/// is absent from `EXEC_ALLOWLIST`.
+///
+/// This is the "managed installer" trust for host-wide enforce: OS-maintenance
+/// scripts (dpkg maintainer scripts, initramfs, cron.daily, grub.d, kernel
+/// hooks) live in root-only-writable dirs whose per-file path changes every
+/// kernel/package version (`linux-image-<ver>.postinst`) but whose parent dir is
+/// stable. Exact-hash seeding therefore self-DoSes the next `apt`/kernel update;
+/// a stable directory prefix does not. A non-root / hijacked-agent attacker (the
+/// gate's threat model — root can disarm the gate) cannot drop a file in these
+/// dirs, so prefix trust adds no bypass. Populated + pinned by the userspace
+/// loader; empty by default (no prefix trusted) so behaviour is unchanged until
+/// the paid loader seeds it.
+#[map]
+static EXEC_TRUSTED_PREFIX: HashMap<u64, u8> = HashMap::with_max_entries(64, 0);
+
+/// Per-CPU scratch for reading the exec path OFF the stack. `innerwarden_lsm_exec`
+/// is already near the 512-byte BPF stack limit; a 256-byte path buffer on its
+/// stack overflows the verifier/LLVM limit (caught on the test001 x86_64 build).
+/// A per-CPU array holds the scratch buffer at zero stack cost.
+#[map]
+static EXEC_PATH_SCRATCH: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries(1, 0);
+
+/// `linux_binprm` field byte offsets, populated by the userspace loader from
+/// kernel BTF (CO-RE) so the Execution Gate works across kernel versions where
+/// the struct layout differs. Key 0 = `filename` byte offset (96 on 6.8). The
+/// gate falls back to 96 if this map is empty.
+#[map]
+static BPRM_OFFSETS: HashMap<u32, u32> = HashMap::with_max_entries(4, 0);
+
+/// `task_struct` field byte offsets, populated by the userspace loader from
+/// kernel BTF (CO-RE) so the execve handler can read the real parent across
+/// kernels. Key 0 = `real_parent` (a `task_struct *`); key 1 = `tgid` (the
+/// process PID). Absent / 0 means the handler skips the read and leaves
+/// `ppid = 0` (the userspace `/proc/<pid>/status` fallback then applies, i.e.
+/// the pre-existing behaviour) — it NEVER reads a guessed offset.
+#[map]
+static TASK_OFFSETS: HashMap<u32, u32> = HashMap::with_max_entries(4, 0);
+
+/// `task_struct->real_parent->tgid` for the current task: the parent PROCESS's
+/// PID, captured in-kernel at execve time. Returns 0 when the BTF offsets are
+/// unavailable or any kernel read fails, so the worst case is the pre-existing
+/// `ppid = 0` (userspace then reads `/proc`). This exists because the execve
+/// hook fires for SHORT-LIVED execs (notably systemd's sealed-executor
+/// `fexecve` of `/proc/self/fd/N`) whose `/proc` entry is already gone by the
+/// time the userspace ring reader looks — so the `/proc` fallback alone leaves
+/// their `ppid = 0`, which made the spec-PR1 fileless-systemd parent-lineage
+/// gate inert in prod. Mirrors the Execution Gate's `BPRM_OFFSETS` map-supplied
+/// offset + `bpf_probe_read_kernel` pattern; no vmlinux/CO-RE relocation needed.
+#[inline(always)]
+fn current_real_parent_tgid() -> u32 {
+    let rp_off = match unsafe { TASK_OFFSETS.get(&0u32) }.copied() {
+        Some(o) if o != 0 => o as usize,
+        _ => return 0,
+    };
+    let tgid_off = match unsafe { TASK_OFFSETS.get(&1u32) }.copied() {
+        Some(o) if o != 0 => o as usize,
+        _ => return 0,
+    };
+    let task = unsafe { bpf_get_current_task() };
+    if task == 0 {
+        return 0;
+    }
+    // task_struct->real_parent (a pointer), then ->tgid on that parent.
+    let parent = match unsafe { bpf_probe_read_kernel((task as usize + rp_off) as *const u64) } {
+        Ok(p) if p != 0 => p,
+        _ => return 0,
+    };
+    match unsafe { bpf_probe_read_kernel((parent as usize + tgid_off) as *const u32) } {
+        Ok(v) => v,
+        Err(_) => 0,
+    }
+}
+
+/// Execution Gate SCOPE (Active Defence / paid). Key = cgroup id of a process
+/// tree the gate should enforce (typically the AI agent's systemd cgroup and any
+/// descendant cgroups). Value = 1. Populated by the userspace loader from the
+/// resolved agent cgroup id(s); pinned at `/sys/fs/bpf/innerwarden/exec_gate_scope`
+/// so it survives sensor restart.
+///
+/// Used ONLY when `LSM_POLICY` key 4 (scope mode) == 1: the gate then applies
+/// solely to tasks whose current cgroup id is present here, and allows every
+/// other exec on the host unconditionally (host maintenance, containers, other
+/// services are never gated). When key 4 is absent/0 the gate is host-wide, the
+/// original behaviour, so this is opt-in with no regression. This is the
+/// "zero-trust for the AI agent" scoping: lock the agent's executable surface
+/// without touching the rest of the machine.
+#[map]
+static EXEC_GATE_SCOPE: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
+
 /// Per-PID and per-TGID block list consulted by `innerwarden_lsm_exec_min`.
 /// Spec 052 / INV-LSM-06: LRU eviction at capacity so a worm-style burst can't
 /// silently drop new registrations. INV-LSM-07: the agent inserts BOTH the PID
@@ -591,6 +767,74 @@ fn has_capability(cap_bit: u32) -> bool {
     false
 }
 
+/// FNV-1a hash of a path buffer up to the first NUL (or 256 bytes). Used as the
+/// `EXEC_ALLOWLIST` key for the Execution Gate. Bounded constant loop (256) so
+/// the eBPF verifier accepts it; no division, sleepable-safe. The same function
+/// runs in userspace (loader) to populate the map, so the keys agree.
+#[inline(always)]
+fn fnv1a_path(buf: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    let mut i = 0usize;
+    // Bounded by 256 (constant) for the verifier; also by buf.len().
+    while i < 256 && i < buf.len() {
+        let b = buf[i];
+        if b == 0 {
+            break;
+        }
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        i += 1;
+    }
+    h
+}
+
+/// Number of leading directory levels the prefix-trust check considers. Trusted
+/// maintenance dirs are shallow (`/var/lib/dpkg/info/` = 4, `/usr/share/
+/// initramfs-tools/` = 3), so 8 covers every real prefix. This bounds the map
+/// lookups to a small CONSTANT — a lookup inside the byte-scan loop instead blew
+/// the eBPF verifier's 1M-instruction budget (256 iters × a branching lookup).
+/// Gate decision for the exec at `buf`: exact path-hash on `EXEC_ALLOWLIST`, OR
+/// its PARENT DIRECTORY on `EXEC_TRUSTED_PREFIX` (managed-installer trust).
+///
+/// Verifier budget is the hard constraint here: the exact-allowlist FNV already
+/// loops the full 256-byte path and nearly fills the 1M-instruction limit, so a
+/// SEPARATE prefix scan, a per-iteration array write, OR a map lookup inside any
+/// loop all blow it (measured: each → `processed 1000001 insns`). So this does
+/// the cheapest possible thing: the SAME single FNV loop also remembers the
+/// running hash at the last `/` — which is `FNV(parent-dir-including-slash)`,
+/// exactly the key the loader stores (`FNV("/var/lib/dpkg/info/")`) — as one
+/// extra scalar, no lookup/array in the loop. Then just TWO lookups OUTSIDE the
+/// loop. Immediate-parent only (not every ancestor), so the loader seeds each
+/// concrete maintenance dir incl. nested ones (`/usr/share/initramfs-tools/
+/// scripts/local-top/`). Empty prefix map (default) → exact-allowlist-only →
+/// unchanged behaviour. Same FNV constants + trailing-slash convention as the
+/// loader, so keys agree.
+#[inline(always)]
+fn exec_gate_allowed(buf: &[u8]) -> bool {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    let mut parent: u64 = 0; // running hash at the last '/' = FNV(parent dir)
+    let mut i = 0usize;
+    while i < 256 && i < buf.len() {
+        let b = buf[i];
+        if b == 0 {
+            break;
+        }
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        if b == b'/' {
+            parent = h;
+        }
+        i += 1;
+    }
+    if unsafe { EXEC_ALLOWLIST.get(&h) }.is_some() {
+        return true; // exact path-hash on the allowlist
+    }
+    if parent != 0 && unsafe { EXEC_TRUSTED_PREFIX.get(&parent) }.is_some() {
+        return true; // parent dir is a trusted maintenance dir
+    }
+    false
+}
+
 // LSM hook entry point. Marked `sleepable` so the program lands in
 // the `lsm.s/` ELF section instead of `lsm/`. On kernel ≥ 6.4 the
 // verifier tightens the BTF FUNC arg0 check for `lsm/` programs: it
@@ -614,6 +858,119 @@ pub fn innerwarden_lsm_exec(ctx: LsmContext) -> i32 {
     match try_lsm_exec(&ctx) {
         Ok(ret) => ret,
         Err(_) => 0, // fail-open: allow on error
+    }
+}
+
+// ── Execution Gate: DEDICATED minimal LSM program (Active Defence) ─────
+// The gate lives in its OWN program, NOT in `innerwarden_lsm_exec` above: that
+// full hook fails the verifier on kernel ≥ 6.4 (too complex) and only the
+// `_min` hook actually attaches there — so a gate buried in the full hook never
+// runs (confirmed on test001 6.8: full hook LoadError EINVAL, gate did not block).
+// This program does ONLY the gate (one path read + a bounded FNV + one map
+// lookup), keeping total verifier complexity low enough to load on 6.x. Inert
+// unless LSM_POLICY key 3 == 1 (license-gated arming). Multiple LSM programs may
+// attach to the same hook; any `-EPERM` denies the exec.
+#[lsm(hook = "bprm_check_security", sleepable)]
+pub fn innerwarden_lsm_exec_gate(ctx: LsmContext) -> i32 {
+    match try_exec_gate(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 0, // fail-open: allow on error
+    }
+}
+
+fn try_exec_gate(ctx: &LsmContext) -> Result<i32, i64> {
+    // LSM_POLICY key 3 = exec-gate mode: 0 = off (inert), 1 = enforce (deny
+    // unknown with -EPERM), 2 = OBSERVE (emit a would-block event but ALLOW —
+    // for safe onboarding: learn the allowlist on a live host without bricking
+    // it, then flip to enforce after a clean window). Spec 077 P2.
+    let mode = unsafe { LSM_POLICY.get(&3u32) }.copied().unwrap_or(0);
+    if mode != 1 && mode != 2 {
+        return Ok(0);
+    }
+    let observe = mode == 2;
+    // Agent-scoped enforcement (spec 083): when LSM_POLICY key 4 == 1 the gate
+    // applies ONLY to tasks whose cgroup is in EXEC_GATE_SCOPE (the AI agent's
+    // cgroup tree). Every other exec on the host — system services, containers,
+    // package maintenance — is allowed unconditionally, so a general server can
+    // run the gate around just the agent without bricking apt/certbot/Docker.
+    // key 4 absent/0 = host-wide (the original, unchanged behaviour). Opt-in, no
+    // regression. One map read + (when scoped) one cgroup lookup: verifier-cheap.
+    let scoped = unsafe { LSM_POLICY.get(&4u32) }.copied().unwrap_or(0) == 1;
+    if scoped {
+        let cg = unsafe { bpf_get_current_cgroup_id() };
+        if unsafe { EXEC_GATE_SCOPE.get(&cg) }.is_none() {
+            return Ok(0); // outside the agent's scope → not gated
+        }
+    }
+    // Read bprm->filename. The byte offset is supplied at load time by the
+    // userspace loader from kernel BTF (CO-RE) via BPRM_OFFSETS key 0, so the gate
+    // works across kernels — the offset differs (96 on 6.8; `filename` is at
+    // bits_offset 768 there, NOT 72 which is `cred`). 96 is the fallback default.
+    let bprm_ptr: *const u8 = unsafe { ctx.arg(0) };
+    let filename_off = unsafe { BPRM_OFFSETS.get(&0u32) }.copied().unwrap_or(96) as usize;
+    let filename_ptr: *const u8 = unsafe {
+        bpf_probe_read_kernel(bprm_ptr.add(filename_off) as *const *const u8).map_err(|e| e)?
+    };
+    // Read the path into the per-cpu scratch (off-stack), then hash exactly the
+    // bytes `str_bytes` RETURNS (the path without the NUL, no over-read). Hashing
+    // the buffer instead was a bug (empty/wrong hash → everything missed → all
+    // blocked). Fail-open (allow) if the path cannot be read.
+    let scratch = match EXEC_PATH_SCRATCH.get_ptr_mut(0) {
+        Some(p) => unsafe { &mut *p },
+        None => return Ok(0),
+    };
+    let path = match unsafe { bpf_probe_read_kernel_str_bytes(filename_ptr, &mut scratch[..]) } {
+        Ok(p) => p,
+        Err(_) => return Ok(0),
+    };
+    // Exact path-hash on the allowlist, OR the parent dir is a trusted
+    // maintenance dir (managed-installer trust for OS dirs whose per-file paths
+    // change every kernel/package version). One FNV pass computes both keys.
+    if exec_gate_allowed(path) {
+        return Ok(0);
+    }
+
+    // Unknown binary under an armed gate — emit a block event carrying the REAL
+    // attempted path in `filename` (read straight from bprm->filename, same
+    // verifier-proven pattern as the legacy hook) and the b"EXEC_GATE" marker in
+    // argv[0] (every other kind-6 emitter zeroes argv, so the marker is
+    // unambiguous). The consumer renders it as `lsm.exec_gate_blocked` with the
+    // path inline — no fragile execve-event correlation needed (a denied exec
+    // leaves /proc/<pid> pointing at the OLD image, so userspace could not
+    // recover the attempted path after the fact).
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let ts = unsafe { bpf_ktime_get_ns() };
+    let cg = unsafe { bpf_get_current_cgroup_id() };
+    if let Some(mut entry) = EVENTS.reserve::<innerwarden_ebpf_types::ExecveEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::LsmBlocked as u32;
+        event.pid = pid_tgid as u32;
+        event.tgid = (pid_tgid >> 32) as u32;
+        event.uid = bpf_get_current_uid_gid() as u32;
+        event.gid = 0;
+        event.ppid = 0;
+        event.cgroup_id = cg;
+        event.ts_ns = ts;
+        event.argc = 0;
+        event.argv = [[0u8; 128]; 8];
+        event.filename = [0u8; 256];
+        let _ = unsafe { bpf_probe_read_kernel_str_bytes(filename_ptr, &mut event.filename) };
+        // Marker distinguishes a real block (enforce) from a would-block
+        // (observe) so the consumer renders lsm.exec_gate_blocked vs
+        // lsm.exec_gate_would_block. Both are 9 bytes.
+        let marker: &[u8] = if observe { b"EXEC_OBSV" } else { b"EXEC_GATE" };
+        event.argv[0][..marker.len()].copy_from_slice(marker);
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    // Observe mode allows the exec (learning, no brick); enforce denies it.
+    if observe {
+        Ok(0)
+    } else {
+        Ok(-1) // unknown binary under an armed gate → -EPERM
     }
 }
 
@@ -643,15 +1000,9 @@ pub fn innerwarden_lsm_exec_min(_ctx: LsmContext) -> i32 {
     let tgid = (pid_tgid >> 32) as u32;
 
     // INV-LSM-07: TGID first, PID fallback. Distinct keys covered.
-    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
-        .copied()
-        .unwrap_or(0)
-        != 0;
-    let blocked_by_pid = !blocked_by_tgid
-        && unsafe { BLOCKED_PIDS.get(&pid) }
-            .copied()
-            .unwrap_or(0)
-            != 0;
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }.copied().unwrap_or(0) != 0;
+    let blocked_by_pid =
+        !blocked_by_tgid && unsafe { BLOCKED_PIDS.get(&pid) }.copied().unwrap_or(0) != 0;
 
     if !(blocked_by_tgid || blocked_by_pid) {
         return 0; // allow: no event emitted (silent allow per spec)
@@ -706,15 +1057,9 @@ pub fn innerwarden_lsm_create_user_ns(_ctx: LsmContext) -> i32 {
     let tgid = (pid_tgid >> 32) as u32;
 
     // INV-LSM-07: TGID first, PID fallback.
-    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
-        .copied()
-        .unwrap_or(0)
-        != 0;
-    let blocked_by_pid = !blocked_by_tgid
-        && unsafe { BLOCKED_PIDS.get(&pid) }
-            .copied()
-            .unwrap_or(0)
-            != 0;
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }.copied().unwrap_or(0) != 0;
+    let blocked_by_pid =
+        !blocked_by_tgid && unsafe { BLOCKED_PIDS.get(&pid) }.copied().unwrap_or(0) != 0;
 
     if !(blocked_by_tgid || blocked_by_pid) {
         return 0; // allow (default for non-attack PIDs — no FPs on Chrome/Docker/etc)
@@ -761,15 +1106,9 @@ pub fn innerwarden_lsm_ptrace_access(_ctx: LsmContext) -> i32 {
     let pid = pid_tgid as u32;
     let tgid = (pid_tgid >> 32) as u32;
 
-    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
-        .copied()
-        .unwrap_or(0)
-        != 0;
-    let blocked_by_pid = !blocked_by_tgid
-        && unsafe { BLOCKED_PIDS.get(&pid) }
-            .copied()
-            .unwrap_or(0)
-            != 0;
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }.copied().unwrap_or(0) != 0;
+    let blocked_by_pid =
+        !blocked_by_tgid && unsafe { BLOCKED_PIDS.get(&pid) }.copied().unwrap_or(0) != 0;
 
     if !(blocked_by_tgid || blocked_by_pid) {
         return 0; // allow (gdb / strace / lldb / perf all unaffected)
@@ -811,15 +1150,9 @@ pub fn innerwarden_lsm_bpf_prog_load(_ctx: LsmContext) -> i32 {
     let pid = pid_tgid as u32;
     let tgid = (pid_tgid >> 32) as u32;
 
-    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
-        .copied()
-        .unwrap_or(0)
-        != 0;
-    let blocked_by_pid = !blocked_by_tgid
-        && unsafe { BLOCKED_PIDS.get(&pid) }
-            .copied()
-            .unwrap_or(0)
-            != 0;
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }.copied().unwrap_or(0) != 0;
+    let blocked_by_pid =
+        !blocked_by_tgid && unsafe { BLOCKED_PIDS.get(&pid) }.copied().unwrap_or(0) != 0;
 
     if !(blocked_by_tgid || blocked_by_pid) {
         return 0; // allow (innerwarden, systemd, cilium, falco all unaffected)
@@ -863,15 +1196,9 @@ pub fn innerwarden_lsm_mmap_file(_ctx: LsmContext) -> i32 {
     let pid = pid_tgid as u32;
     let tgid = (pid_tgid >> 32) as u32;
 
-    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
-        .copied()
-        .unwrap_or(0)
-        != 0;
-    let blocked_by_pid = !blocked_by_tgid
-        && unsafe { BLOCKED_PIDS.get(&pid) }
-            .copied()
-            .unwrap_or(0)
-            != 0;
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }.copied().unwrap_or(0) != 0;
+    let blocked_by_pid =
+        !blocked_by_tgid && unsafe { BLOCKED_PIDS.get(&pid) }.copied().unwrap_or(0) != 0;
 
     if !(blocked_by_tgid || blocked_by_pid) {
         return 0; // allow (all JIT compilers + dynamic linkers unaffected)
@@ -891,6 +1218,10 @@ pub fn innerwarden_lsm_mmap_file(_ctx: LsmContext) -> i32 {
 }
 
 fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
+    // NB: the Execution Gate lives in its OWN dedicated LSM program
+    // (`innerwarden_lsm_exec_gate`) — this full hook fails the verifier on kernel
+    // ≥ 6.4, so anything here only runs on older kernels.
+
     // ── Container drift detection (ALWAYS runs, even without guard mode) ──
     // Check if the binary is on an overlayfs upper layer (dropped after container start).
     // __upperdentry is at inode_ptr + sizeof(struct inode).
@@ -1121,11 +1452,7 @@ fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
 // sizeof(struct inode) is queried from kernel BTF by userspace and stored
 // in the INODE_SIZE map.
 
-fn check_overlay_drift(
-    ctx: &LsmContext,
-    cgroup_id: u64,
-    inode_size: u64,
-) -> Result<(), i64> {
+fn check_overlay_drift(ctx: &LsmContext, cgroup_id: u64, inode_size: u64) -> Result<(), i64> {
     // bprm_check_security(struct linux_binprm *bprm)
     let bprm_ptr: *const u8 = unsafe { ctx.arg(0) };
 
@@ -1133,8 +1460,7 @@ fn check_overlay_drift(
     // struct vm_area_struct *vma, unsigned long limit, mm, flags, etc. before file)
     const BPRM_FILE_OFFSET: usize = 48;
     let file_ptr: *const u8 = unsafe {
-        bpf_probe_read_kernel(bprm_ptr.add(BPRM_FILE_OFFSET) as *const *const u8)
-            .map_err(|e| e)?
+        bpf_probe_read_kernel(bprm_ptr.add(BPRM_FILE_OFFSET) as *const *const u8).map_err(|e| e)?
     };
     if file_ptr.is_null() {
         return Ok(());
@@ -1300,35 +1626,54 @@ fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // Classify the filename into a capability category
     let n = &name_buf;
     let cap_bit: u32 = if
-        // shadow, passwd, gshadow, group
-        (n[0] == b's' && n[1] == b'h' && n[2] == b'a' && n[3] == b'd' && n[4] == b'o' && n[5] == b'w')
-        || (n[0] == b'p' && n[1] == b'a' && n[2] == b's' && n[3] == b's' && n[4] == b'w' && n[5] == b'd')
+    // shadow, passwd, gshadow, group
+    (n[0] == b's'
+        && n[1] == b'h'
+        && n[2] == b'a'
+        && n[3] == b'd'
+        && n[4] == b'o'
+        && n[5] == b'w')
+        || (n[0] == b'p'
+            && n[1] == b'a'
+            && n[2] == b's'
+            && n[3] == b's'
+            && n[4] == b'w'
+            && n[5] == b'd')
         || (n[0] == b'g' && n[1] == b's' && n[2] == b'h' && n[3] == b'a' && n[4] == b'd')
     {
         innerwarden_ebpf_types::CAP_WRITE_CREDENTIALS
     } else if
-        // authorized_keys, id_rsa, id_ed25519
-        n[0] == b'a' && n[1] == b'u' && n[2] == b't' && n[3] == b'h' && n[4] == b'o' && n[5] == b'r'
+    // authorized_keys, id_rsa, id_ed25519
+    n[0] == b'a'
+        && n[1] == b'u'
+        && n[2] == b't'
+        && n[3] == b'h'
+        && n[4] == b'o'
+        && n[5] == b'r'
     {
         innerwarden_ebpf_types::CAP_WRITE_SSH
     } else if
-        // sudoers
-        n[0] == b's' && n[1] == b'u' && n[2] == b'd' && n[3] == b'o' && n[4] == b'e' && n[5] == b'r' && n[6] == b's'
+    // sudoers
+    n[0] == b's'
+        && n[1] == b'u'
+        && n[2] == b'd'
+        && n[3] == b'o'
+        && n[4] == b'e'
+        && n[5] == b'r'
+        && n[6] == b's'
     {
         innerwarden_ebpf_types::CAP_WRITE_SUDO
     } else if
-        // crontab, cron.d
-        n[0] == b'c' && n[1] == b'r' && n[2] == b'o' && n[3] == b'n'
-    {
+    // crontab, cron.d
+    n[0] == b'c' && n[1] == b'r' && n[2] == b'o' && n[3] == b'n' {
         innerwarden_ebpf_types::CAP_WRITE_CRON
     } else if
-        // ld.so.preload, ld.so.conf
-        n[0] == b'l' && n[1] == b'd' && n[2] == b'.' && n[3] == b's' && n[4] == b'o'
-    {
+    // ld.so.preload, ld.so.conf
+    n[0] == b'l' && n[1] == b'd' && n[2] == b'.' && n[3] == b's' && n[4] == b'o' {
         innerwarden_ebpf_types::CAP_WRITE_LDPRELOAD
     } else if
-        // .bashrc, .profile (persistence via shell config)
-        (n[0] == b'.' && n[1] == b'b' && n[2] == b'a' && n[3] == b's' && n[4] == b'h')
+    // .bashrc, .profile (persistence via shell config)
+    (n[0] == b'.' && n[1] == b'b' && n[2] == b'a' && n[3] == b's' && n[4] == b'h')
         || (n[0] == b'.' && n[1] == b'p' && n[2] == b'r' && n[3] == b'o' && n[4] == b'f')
     {
         innerwarden_ebpf_types::CAP_WRITE_PERSISTENCE
@@ -1510,7 +1855,7 @@ pub fn dispatch_execve(ctx: ProbeContext) -> u32 {
 
 #[inline(always)]
 fn try_dispatch_execve(regs: *const u8) -> Result<(), i64> {
-    if is_comm_allowed(0) || is_cgroup_allowed() {
+    if is_self_cgroup() || is_comm_allowed(0) || is_cgroup_allowed() {
         return Ok(());
     }
     let pid = bpf_get_current_pid_tgid() as u32;
@@ -1540,7 +1885,12 @@ fn try_dispatch_execve(regs: *const u8) -> Result<(), i64> {
     event.tgid = tgid;
     event.uid = uid;
     event.gid = gid;
-    event.ppid = 0;
+    // Capture the real parent PID in-kernel: the execve hook fires for
+    // short-lived processes whose /proc entry is gone before the userspace
+    // ring reader can read PPid, so the /proc fallback alone leaves ppid=0
+    // (which made the fileless-systemd parent-lineage gate inert in prod).
+    // 0 here => userspace /proc fallback (unchanged) — never a guessed offset.
+    event.ppid = current_real_parent_tgid();
     event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     event.ts_ns = ts;
     event.argc = 0;
@@ -1551,7 +1901,29 @@ fn try_dispatch_execve(regs: *const u8) -> Result<(), i64> {
     unsafe {
         let _ = bpf_probe_read_user_str_bytes(filename_ptr, &mut event.filename);
     }
-    event.argv = [[0u8; 128]; 8];
+    // Capture argv IN-KERNEL from the caller's still-mapped userspace memory.
+    // Userspace otherwise reconstructs argv from /proc/PID/cmdline, but a
+    // short-lived process (rm, find) exits before the ring reader runs, so /proc
+    // is already gone and only argv[0] survives -- leaving argv-based detectors
+    // (data_destruction_pattern) blind to `-rf` and the target path. Reading here
+    // at execve entry is reliable: the CALLING process's argv array is still live
+    // in its address space. Manually unrolled (see read_argv_slot!) so every index
+    // into the reserved ring entry is constant; `&&` stops at the NULL terminator.
+    event.argv = [[0u8; MAX_ARG_LEN]; MAX_ARGS];
+    let argv_base = unsafe { syscall_arg_at!(regs, 1) }.unwrap_or(0);
+    let mut argc: u32 = 0;
+    if argv_base != 0
+        && read_argv_slot!(argv_base, 0, event, argc)
+        && read_argv_slot!(argv_base, 1, event, argc)
+        && read_argv_slot!(argv_base, 2, event, argc)
+        && read_argv_slot!(argv_base, 3, event, argc)
+        && read_argv_slot!(argv_base, 4, event, argc)
+        && read_argv_slot!(argv_base, 5, event, argc)
+        && read_argv_slot!(argv_base, 6, event, argc)
+    {
+        let _ = read_argv_slot!(argv_base, 7, event, argc);
+    }
+    event.argc = argc;
     entry.submit(0);
     Ok(())
 }
@@ -1565,13 +1937,18 @@ pub fn dispatch_connect(ctx: ProbeContext) -> u32 {
 
 #[inline(always)]
 fn try_dispatch_connect(regs: *const u8) -> Result<(), i64> {
-    if is_comm_allowed(1) || is_cgroup_allowed() {
+    // InnerWarden's own outbound connects (agent → k8s API / Azure IMDS / cloud
+    // for tenancy + cloud detection) are self-noise — drop them. Safe before the
+    // IMDS parse: SELF_CGROUP is our non-forgeable own cgroup, an attacker cannot
+    // enter it, so a real IMDS-SSRF from any other cgroup still surfaces.
+    if is_self_cgroup() {
         return Ok(());
     }
+    // Parse the destination BEFORE the comm allowlist gate so a renamed process
+    // cannot suppress an IMDS connect (see is_imds below). The 8-byte sockaddr
+    // read is cheap and connect is far lower frequency than openat.
     let addr_ptr: *const u8 = unsafe { syscall_arg_at!(regs, 1)? as *const u8 };
-    let sa_buf = unsafe {
-        bpf_probe_read_user(addr_ptr as *const [u8; 8]).unwrap_or([0u8; 8])
-    };
+    let sa_buf = unsafe { bpf_probe_read_user(addr_ptr as *const [u8; 8]).unwrap_or([0u8; 8]) };
     let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
     if family != 2 {
         return Ok(());
@@ -1579,6 +1956,15 @@ fn try_dispatch_connect(regs: *const u8) -> Result<(), i64> {
     let port = u16::from_be_bytes([sa_buf[2], sa_buf[3]]);
     let addr = u32::from_be_bytes([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
     if sa_buf[4] == 127 || addr == 0 {
+        return Ok(());
+    }
+    // Cloud instance-metadata endpoint (169.254.169.254 — AWS/GCP/Azure/OpenStack
+    // IMDS). A connect here is how cloud credentials are stolen (imds_ssrf). It is
+    // a hardcoded link-local IP (no DNS for dns_capture to surface) and otherwise
+    // legitimate (never in a threat feed), so NOTHING else backstops it — it must
+    // bypass the comm/cgroup allowlist or a renamed process steals creds silently.
+    let is_imds = sa_buf[4] == 169 && sa_buf[5] == 254 && sa_buf[6] == 169 && sa_buf[7] == 254;
+    if !is_imds && (is_comm_allowed(1) || is_cgroup_allowed()) {
         return Ok(());
     }
 
@@ -1752,8 +2138,61 @@ pub fn dispatch_kill(ctx: ProbeContext) -> u32 {
 // the entry pt_regs via the `syscall_arg!` macro (syscall-ABI position) and
 // mirrors the logic of its typed `innerwarden_*` counterpart.
 
+/// Bounded scan for a credential dir/file ANYWHERE in the path: `/.ssh/`,
+/// `/.aws/`, `/.kube/`, `/.gnupg/`, `/.env*`, `/.docker/`. Catches home/root
+/// private keys and cloud/k8s creds (`/home/u/.ssh/id_rsa`,
+/// `/root/.aws/credentials`, `/home/u/.kube/config`) plus the `.env`
+/// application-secret file and Docker registry auth — the credentials an AI
+/// coding agent touches most — read via an openat-allowlisted tool (`cat`/`head`)
+/// or an interpreter comm. These are high-value AND low-frequency-legit, so they
+/// must bypass the comm allowlist and the rate-limit like the /etc secrets do.
+///
+/// 2026-07-02 (agent cred-exfil blind spot, found by a live red-team): `.env`
+/// and `.docker/` were absent, so an interpreter comm (python/node/openclaw)
+/// reading `~/project/.env` then connecting out had its READ dropped by the
+/// openat comm-allowlist before the userspace data_exfil detector could see it —
+/// even though the detector's `SENSITIVE_PATHS` lists `.env`. The two layers
+/// disagreed; this aligns the kernel emit set with them.
+///
+/// Verifier-safe: one constant-bounded loop; the 3-byte discriminator only runs
+/// at a `/.` boundary. Matching 3 bytes means `/.env` (and `.env.local`,
+/// `.env.production`, direnv's `.envrc`) and `/.docker/` all count.
+#[inline(always)]
+fn contains_secret_dir(buf: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < 250 && i + 5 < buf.len() {
+        let b0 = buf[i];
+        if b0 == 0 {
+            break;
+        }
+        if b0 == b'/' && buf[i + 1] == b'.' {
+            let a = buf[i + 2];
+            let b = buf[i + 3];
+            let c = buf[i + 4];
+            // /.ssh/  /.aws/  /.kube/  /.gnupg/  /.env*  /.docker/
+            if (a == b's' && b == b's' && c == b'h')
+                || (a == b'a' && b == b'w' && c == b's')
+                || (a == b'k' && b == b'u' && c == b'b')
+                || (a == b'g' && b == b'n' && c == b'u')
+                || (a == b'e' && b == b'n' && c == b'v')
+                || (a == b'd' && b == b'o' && c == b'c')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 #[kprobe]
 pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
+    // InnerWarden's own file reads (incl. the integrity collector reading
+    // /etc/shadow etc.) are noise + would flood the ring — drop before the path
+    // read. Non-forgeable (own cgroup only); empty map → no-op until seeded.
+    if is_self_cgroup() {
+        return 0;
+    }
     // openat(dfd, filename, flags, mode): filename=arg1, flags=arg2
     let Ok(filename_ptr) = (unsafe { syscall_arg!(ctx, 1) }) else {
         return 0;
@@ -1773,12 +2212,16 @@ pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
             || (f[5] == b's' && f[6] == b'u') // sudoers
             || (f[5] == b'g' && f[6] == b's') // gshadow
             || (f[5] == b's' && f[6] == b's')); // ssh / ssl
-    // Broader sensitive telemetry: any /etc, /root, /home read. High volume on a
-    // live host, so rate-limited below (the kprobe now reads filenames correctly
-    // and would otherwise flood the ring buffer).
+                                                // Broader sensitive telemetry: any /etc, /root, /home read. High volume on a
+                                                // live host, so rate-limited below (the kprobe now reads filenames correctly
+                                                // and would otherwise flood the ring buffer).
+                                                // Credential dirs anywhere (/.ssh/, /.aws/, /.kube/, /.gnupg/) — home/root
+                                                // private keys + cloud/k8s creds. High value, low legit frequency.
+    let secret_dir = contains_secret_dir(f);
     let is_sensitive = etc
         || (f[0] == b'/' && f[1] == b'r' && f[2] == b'o' && f[3] == b'o' && f[4] == b't')
-        || (f[0] == b'/' && f[1] == b'h' && f[2] == b'o' && f[3] == b'm' && f[4] == b'e');
+        || (f[0] == b'/' && f[1] == b'h' && f[2] == b'o' && f[3] == b'm' && f[4] == b'e')
+        || secret_dir;
     // Kill-chain credential bit (CHAIN_SENSITIVE_READ -> DATA_EXFIL, which can
     // gate the LSM execve-block): ONLY genuine /etc secrets, NOT the broad
     // telemetry set. Previously this fired on EVERY /etc|/root|/home read, so
@@ -1796,14 +2239,28 @@ pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
     if is_chain_credential {
         chain_flag(pid, CHAIN_SENSITIVE_READ);
     }
-    if is_comm_allowed(2) || is_cgroup_allowed() {
+    // Genuinely-secret reads must NOT be dropped by the openat comm/cgroup
+    // allowlist. `cat`/`head`/`less` are on the openat allowlist bit (volume
+    // control for noisy readers), so before this an attacker reading a secret via
+    // any allowlisted tool returned 0 here and the event never reached SIGMA-004 /
+    // the userspace sensitive-read / data_exfil detectors — a rename-free in-kernel
+    // evasion. The bypass set is narrow and high-value / low-legit-frequency:
+    //   - /etc/shadow|sudoers|gshadow (is_chain_credential)
+    //   - /etc/ssh host keys (etc + "ssh", distinguished from /etc/ssl by f[7]=='h')
+    //   - /.ssh/ /.aws/ /.kube/ /.gnupg/ anywhere (home/root keys, cloud/k8s creds)
+    // Deliberately EXCLUDED: /etc/passwd (world-readable, nss) and /etc/ssl certs
+    // (read on every TLS handshake) — bypassing those would flood the ring buffer.
+    let etc_ssh = etc && f[5] == b's' && f[6] == b's' && f[7] == b'h';
+    let is_secret_read = is_chain_credential || etc_ssh || secret_dir;
+    if !is_secret_read && (is_comm_allowed(2) || is_cgroup_allowed()) {
         return 0;
     }
     if !is_sensitive {
         return 0;
     }
-    // Always surface credential-file reads; rate-limit the broad remainder.
-    if !is_credential && is_rate_limited(pid) {
+    // Always surface credential reads (incl. the secret dirs); rate-limit the
+    // broad /etc|/root|/home telemetry remainder.
+    if !is_credential && !secret_dir && is_rate_limited(pid) {
         return 0;
     }
     let uid = bpf_get_current_uid_gid() as u32;
@@ -1834,8 +2291,7 @@ pub fn dispatch_bind(ctx: ProbeContext) -> u32 {
     let Ok(addr_ptr) = (unsafe { syscall_arg!(ctx, 1) }) else {
         return 0;
     };
-    let sa_buf =
-        unsafe { bpf_probe_read_user(addr_ptr as *const [u8; 8]).unwrap_or([0u8; 8]) };
+    let sa_buf = unsafe { bpf_probe_read_user(addr_ptr as *const [u8; 8]).unwrap_or([0u8; 8]) };
     let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
     if family != 2 {
         return 0;
@@ -2187,9 +2643,10 @@ pub fn dispatch_rename(ctx: ProbeContext) -> u32 {
         let _ = bpf_probe_read_user_str_bytes(newname_ptr as *const u8, &mut buf);
     }
     let f = &buf;
-    let is_sensitive = (f[0] == b'/' && f[1] == b'e' && f[2] == b't' && f[3] == b'c' && f[4] == b'/')
-        || (f[0] == b'/' && f[1] == b'u' && f[2] == b's' && f[3] == b'r')
-        || (f[0] == b'/' && f[1] == b'b' && f[2] == b'i' && f[3] == b'n');
+    let is_sensitive =
+        (f[0] == b'/' && f[1] == b'e' && f[2] == b't' && f[3] == b'c' && f[4] == b'/')
+            || (f[0] == b'/' && f[1] == b'u' && f[2] == b's' && f[3] == b'r')
+            || (f[0] == b'/' && f[1] == b'b' && f[2] == b'i' && f[3] == b'n');
     if !is_sensitive {
         return 0;
     }
@@ -2393,7 +2850,7 @@ fn try_io_uring_submit(ctx: &TracePointContext) -> Result<(), i64> {
         36 | // UNLINKAT
         45 | // SOCKET
         46 | // URING_CMD
-        53   // SEND_ZC
+        53 // SEND_ZC
     );
     if !is_relevant {
         return Ok(());
@@ -2595,9 +3052,7 @@ fn try_acpi_eval(ctx: &ProbeContext) -> Result<(), i64> {
 
     // Read ACPI method pathname from kernel memory.
     if !pathname_ptr.is_null() {
-        let _ = unsafe {
-            bpf_probe_read_kernel_str_bytes(pathname_ptr, &mut event.pathname)
-        };
+        let _ = unsafe { bpf_probe_read_kernel_str_bytes(pathname_ptr, &mut event.pathname) };
     }
 
     if let Ok(comm) = bpf_get_current_comm() {
@@ -2608,7 +3063,6 @@ fn try_acpi_eval(ctx: &ProbeContext) -> Result<(), i64> {
     entry.submit(0);
     Ok(())
 }
-
 
 /// LSM hook on bpf — monitors all BPF syscall operations.
 /// Detects unauthorized eBPF program loading (VoidLink rootkit defense).
@@ -2636,11 +3090,7 @@ fn try_lsm_bpf(ctx: &LsmContext) -> Result<i32, i64> {
     // Skip our own process.
     let comm = bpf_get_current_comm().map_err(|_| 1i64)?;
     // "innerwarden" starts with "in" + "ne" — quick check first 4 bytes.
-    if comm.len() >= 12
-        && comm[0] == b'i'
-        && comm[1] == b'n'
-        && comm[2] == b'n'
-        && comm[3] == b'e'
+    if comm.len() >= 12 && comm[0] == b'i' && comm[1] == b'n' && comm[2] == b'n' && comm[3] == b'e'
     {
         return Ok(0);
     }

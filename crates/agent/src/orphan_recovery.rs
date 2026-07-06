@@ -83,6 +83,7 @@ async fn retry_decide(
         ip_reputation: None,
         ip_geo: None,
         ip_dshield: None,
+        ip_dshield_attacker: false,
         host_posture: None,
         prior_decisions: None,
         graph_context: None,
@@ -375,6 +376,183 @@ pub(crate) async fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize 
             written,
             "orphan_recovery: swept abandoned incidents (Low/Med -> dismiss, High/Crit -> needs_review)"
         );
+    }
+    written
+}
+
+/// Cap on needs_review cases re-verified per sweep tick.
+const REVERIFY_LIMIT: usize = 1000;
+
+/// True for High / Critical severities (the only ones routed to needs_review
+/// rather than auto-dismissed — Spec 062).
+fn is_high_impact(severity: &str) -> bool {
+    matches!(
+        severity.trim().to_ascii_lowercase().as_str(),
+        "high" | "critical"
+    )
+}
+
+/// Pure: does the LIVE firewall dump (ufw `status` + iptables `-S`) currently
+/// drop `ip`? Mirrors the dashboard's `classify_kernel_state` "still_blocked"
+/// rule. Empty dumps (probe failed) → false, so a failed probe NEVER results in
+/// a spurious "contained" mark (fail-closed toward keeping the case visible).
+fn firewall_blocks(ufw_dump: &str, iptables_dump: &str, ip: &str) -> bool {
+    (!ufw_dump.is_empty() || !iptables_dump.is_empty())
+        && (ufw_dump.contains(ip) || iptables_dump.contains(ip))
+}
+
+/// One live firewall dump (ufw + iptables) via sudo. Best-effort: a backend that
+/// is absent / errors yields an empty string. Done ONCE per sweep then matched
+/// against every candidate IP (cheap), instead of probing per IP.
+async fn probe_firewall_once() -> (String, String) {
+    let run = |args: &'static [&'static str]| async move {
+        tokio::process::Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    };
+    let ufw = run(&["ufw", "status"]).await;
+    let iptables = run(&["iptables", "-S"]).await;
+    (ufw, iptables)
+}
+
+/// Re-verify already-decided `needs_review` cases against the LIVE firewall and
+/// flip the ones it is actually dropping to a truthful Contained decision.
+///
+/// ## The gap this closes (operator report 2026-06-13)
+/// Orphan-recovery's truthful-containment guard (#987) only runs at the FIRST
+/// decision. A High/Critical case decided `needs_review` while its IP was NOT
+/// yet blocked stays in "needs your attention" forever once the block lands
+/// later — the dashboard cries for action on an already-contained threat. Worse,
+/// the agent's in-memory `response_lifecycle` record can DIVERGE from the live
+/// firewall (an orphaned ufw rule the lifecycle forgot across a restart), so the
+/// record-based `is_ip_actively_blocked` reports "not blocked" while ufw is
+/// dropping the IP — exactly the case the operator hit.
+///
+/// ## Why it verifies the LIVE firewall (not the record)
+/// Per [[project_block_enforcement_verify_live]] / spec-076: never trust an
+/// internal is-blocked record as proof — verify live. This probes ufw+iptables
+/// directly, so a divergent / orphaned block is still recognised as containment.
+///
+/// ## Why it is hole-free (operator's "se passar o block e ele retornar" worry)
+/// - The Contained mark is **per-episode history**, not a standing promise. It is
+///   only written for a case whose IP the firewall is dropping **right now**.
+/// - If the block later lapses, a returning attacker raises a **new incident** →
+///   a fresh case that this sweep will NOT auto-contain (the probe shows the IP
+///   is no longer blocked), and the re-block path live-verifies the firewall
+///   (spec-076) so an expired block is re-applied — never a free pass.
+/// - **Active-harm detectors stay surfaced** even while blocked: the
+///   `is_block_mitigated_detector` gate means only recon-class threats (a
+///   firewall block fully mitigates) are auto-contained; reverse_shell, c2,
+///   data_exfil, ransomware, kill_chain ALWAYS remain in needs_review.
+/// - A failed probe contains nothing (`firewall_blocks` is fail-closed).
+pub(crate) async fn reverify_already_blocked_needs_review(
+    state: &AgentState,
+    data_dir: &Path,
+) -> usize {
+    let Some(store) = state.sqlite_store.clone() else {
+        return 0;
+    };
+    let now = Utc::now();
+    // `before_ts = now` returns EVERY current needs_review case (latest decision),
+    // not just timed-out ones — we want to re-verify all of them.
+    let cases = match store.find_timed_out_needs_review(&now.to_rfc3339(), REVERIFY_LIMIT) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "orphan_recovery: failed to query needs_review cases for re-verify");
+            return 0;
+        }
+    };
+
+    // Keep only High/Crit + block-mitigated (recon) cases that carry a target IP.
+    let candidates: Vec<(String, String)> = cases
+        .into_iter()
+        .filter(|(incident_id, severity, _ts, _data)| {
+            is_high_impact(severity)
+                && crate::incident_flow::is_block_mitigated_detector(incident_id)
+        })
+        .filter_map(|(incident_id, _severity, _ts, data)| {
+            extract_target_ip(&data).map(|ip| (incident_id, ip))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    // ONE live firewall dump, matched against every candidate IP.
+    let (ufw, iptables) = probe_firewall_once().await;
+    if ufw.is_empty() && iptables.is_empty() {
+        // Probe failed — do nothing rather than risk a spurious containment.
+        return 0;
+    }
+
+    let written =
+        contain_live_blocked_candidates(&store, data_dir, &candidates, &ufw, &iptables, now);
+    if written > 0 {
+        info!(
+            written,
+            "orphan_recovery: re-verified {written} needs_review case(s) as contained (live firewall already blocks the IP)"
+        );
+    }
+    written
+}
+
+/// Testable core of [`reverify_already_blocked_needs_review`]: given the
+/// pre-filtered `(incident_id, ip)` candidates and a live firewall dump, write a
+/// Contained decision for each IP the firewall is actually dropping. Pure of I/O
+/// except the decision append (driven by a real `Store` in tests). Returns the
+/// number of Contained decisions written.
+fn contain_live_blocked_candidates(
+    store: &std::sync::Arc<innerwarden_store::Store>,
+    data_dir: &Path,
+    candidates: &[(String, String)],
+    ufw: &str,
+    iptables: &str,
+    now: chrono::DateTime<Utc>,
+) -> usize {
+    let mut written = 0usize;
+    for (incident_id, ip) in candidates {
+        if !firewall_blocks(ufw, iptables, ip) {
+            continue;
+        }
+        let entry = DecisionEntry {
+            ts: now,
+            incident_id: incident_id.clone(),
+            host: hostname(),
+            ai_provider: ORPHAN_AI_PROVIDER.to_string(),
+            // Contained (block_ip + success execution_result) via threat_contract.
+            action_type: "block_ip".to_string(),
+            target_ip: Some(ip.clone()),
+            target_user: None,
+            skill_id: None,
+            confidence: 1.0,
+            // No new rule applied: we only verified an existing LIVE block.
+            auto_executed: false,
+            dry_run: false,
+            reason: format!(
+                "Re-verify: this needs_review case's IP {ip} is currently dropped by the LIVE \
+                 firewall (ufw/iptables probe), so the threat is already contained. Recorded as \
+                 contained instead of leaving it in 'needs your attention'. Verified live (not the \
+                 internal record), so a divergent/orphaned block still counts. No new rule applied."
+            ),
+            estimated_threat: "high".to_string(),
+            execution_result: "blocked (live firewall verified)".to_string(),
+            prev_hash: None,
+            decision_layer: Some("reverify_live_contained".to_string()),
+        };
+        match crate::decisions::append_chained(data_dir, &entry, Some(store)) {
+            Ok(()) => written += 1,
+            Err(e) => warn!(
+                incident_id = %incident_id,
+                error = %e,
+                "orphan_recovery: failed to write re-verify contained decision"
+            ),
+        }
     }
     written
 }
@@ -1165,5 +1343,138 @@ mod tests {
             vec!["old:orphan"],
             "only old + decisionless + non-allowlisted incidents qualify"
         );
+    }
+
+    // ── re-verify already-blocked needs_review (operator report 2026-06-13) ──
+
+    #[test]
+    fn is_high_impact_only_high_and_critical() {
+        assert!(is_high_impact("high"));
+        assert!(is_high_impact("CRITICAL"));
+        assert!(is_high_impact(" High "));
+        assert!(!is_high_impact("medium"));
+        assert!(!is_high_impact("low"));
+        assert!(!is_high_impact("info"));
+    }
+
+    #[test]
+    fn firewall_blocks_matches_ufw_or_iptables_and_fails_closed() {
+        let ufw = "Status: active\nAnywhere    DENY    1.2.3.4\n";
+        let ipt = "-A INPUT -s 9.9.9.9/32 -j DROP\n";
+        // present in ufw
+        assert!(firewall_blocks(ufw, "", "1.2.3.4"));
+        // present in iptables
+        assert!(firewall_blocks("", ipt, "9.9.9.9"));
+        // present in either of two dumps
+        assert!(firewall_blocks(ufw, ipt, "9.9.9.9"));
+        // absent from both non-empty dumps
+        assert!(!firewall_blocks(ufw, ipt, "8.8.8.8"));
+        // fail-closed: both dumps empty (probe failed) → never "blocked"
+        assert!(!firewall_blocks("", "", "1.2.3.4"));
+    }
+
+    #[test]
+    fn contain_core_writes_contained_only_for_live_blocked_ips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_state, store) = build_state_with_store(&tmp);
+        let now = chrono::Utc::now();
+        let candidates = vec![
+            (
+                "proto_anomaly:smb:1.2.3.4:t".to_string(),
+                "1.2.3.4".to_string(),
+            ),
+            (
+                "proto_anomaly:smb:9.9.9.9:t".to_string(),
+                "9.9.9.9".to_string(),
+            ),
+        ];
+        // ufw drops 1.2.3.4 only; 9.9.9.9 is NOT in the firewall.
+        let ufw = "Status: active\nAnywhere    DENY    1.2.3.4\n";
+        let written =
+            contain_live_blocked_candidates(&store, tmp.path(), &candidates, ufw, "", now);
+        assert_eq!(
+            written, 1,
+            "only the live-blocked IP gets a Contained decision"
+        );
+
+        // The blocked IP got a truthful block_ip / Contained decision.
+        let rows = store
+            .decisions_for_incident("proto_anomaly:smb:1.2.3.4:t")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(parsed["action_type"].as_str(), Some("block_ip"));
+        assert_eq!(parsed["ai_provider"].as_str(), Some(ORPHAN_AI_PROVIDER));
+        // No new firewall rule was applied — we only verified an existing block.
+        assert_eq!(parsed["auto_executed"].as_bool(), Some(false));
+        assert!(parsed["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("LIVE firewall"));
+
+        // The IP NOT in the firewall stays untouched (no decision) → still visible.
+        assert!(store
+            .decisions_for_incident("proto_anomaly:smb:9.9.9.9:t")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn contain_core_failed_probe_contains_nothing() {
+        // Empty dumps (probe failed) must NOT mark anything contained.
+        let tmp = tempfile::tempdir().unwrap();
+        let (_state, store) = build_state_with_store(&tmp);
+        let candidates = vec![(
+            "proto_anomaly:x:1.2.3.4:t".to_string(),
+            "1.2.3.4".to_string(),
+        )];
+        let written = contain_live_blocked_candidates(
+            &store,
+            tmp.path(),
+            &candidates,
+            "",
+            "",
+            chrono::Utc::now(),
+        );
+        assert_eq!(written, 0);
+        assert_eq!(store.decisions_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reverify_returns_zero_without_sqlite_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        state.sqlite_store = None;
+        assert_eq!(
+            reverify_already_blocked_needs_review(&state, tmp.path()).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn reverify_finds_needs_review_candidate_but_probe_empty_in_ci() {
+        // Insert a High proto_anomaly orphan → run_sweep records a needs_review
+        // decision (High + no AI + not live-blocked) → it is now a candidate.
+        // reverify queries + filters it in, then the firewall probe returns empty
+        // (no ufw/sudo in CI) so nothing is contained → 0. Exercises the query +
+        // filter + probe-empty path deterministically.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan_sev(
+                "proto_anomaly:smb:203.0.113.10:t",
+                two_hours_ago,
+                innerwarden_core::event::Severity::High,
+            ))
+            .unwrap();
+        // creates the needs_review decision
+        run_sweep(&mut state, tmp.path()).await;
+        let before = store.decisions_count().unwrap();
+
+        let written = reverify_already_blocked_needs_review(&state, tmp.path()).await;
+        assert_eq!(written, 0, "no live firewall in CI → nothing contained");
+        // re-verify wrote no decision when the probe could not confirm a block.
+        assert_eq!(store.decisions_count().unwrap(), before);
     }
 }

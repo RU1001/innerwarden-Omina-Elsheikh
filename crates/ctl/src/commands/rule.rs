@@ -35,6 +35,11 @@ const PLAYBOOK_BUILTINS: &[(&str, &str)] = &[
 ];
 const PLAYBOOK_RULES_DIR: &str = "/etc/innerwarden/rules/playbooks";
 
+// Execution Gate `allow_exec` rules (spec 077). Advanced users (and the agent's
+// "Trust Exec" action) drop YAML here; the paid `exec-gate watch` daemon
+// hot-reloads them into the kernel allowlist. CTL only lists/toggles them.
+const EXEC_GATE_RULES_DIR: &str = "/etc/innerwarden/rules/exec-gate";
+
 pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Result<()> {
     let rules_base = PathBuf::from("/etc/innerwarden/rules");
 
@@ -45,6 +50,7 @@ pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Res
         ("atr", "ATR"),
         ("correlation", "Correlation"),
         ("playbooks", "Playbooks"),
+        ("exec-gate", "Execution Gate"),
     ];
 
     let mut total = 0u32;
@@ -140,6 +146,34 @@ pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Res
                 total += rules.len() as u32;
                 println!();
             }
+        } else if *subdir == "exec-gate" {
+            let (rules, errors) = load_exec_gate_rules(Path::new(EXEC_GATE_RULES_DIR));
+            if !rules.is_empty() || !errors.is_empty() {
+                println!("{label} ({} rules, {} errors):", rules.len(), errors.len());
+                println!(
+                    "  {:<32} {:<8} {:<40} SOURCE",
+                    "RULE ID", "STATUS", "PATH(S)"
+                );
+                for rule in &rules {
+                    let status = if rule.disabled { "disabled" } else { "active" };
+                    let paths = rule.paths.join(", ");
+                    println!(
+                        "  {:<32} {:<8} {:<40} {}",
+                        rule.id,
+                        status,
+                        truncate(&paths, 40),
+                        rule.source_file,
+                    );
+                }
+                if !errors.is_empty() {
+                    println!("  Errors:");
+                    for (file, err) in &errors {
+                        println!("    {file}: {err}");
+                    }
+                }
+                total += rules.len() as u32;
+                println!();
+            }
         } else if dir.is_dir() {
             let count = count_yaml_rules(&dir, subdir);
             if count > 0 {
@@ -157,6 +191,96 @@ pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Res
 
     println!("Rules directory: {}", rules_base.display());
     Ok(())
+}
+
+/// One `allow_exec` rule as surfaced by `rule list`.
+struct ExecGateRow {
+    id: String,
+    paths: Vec<String>,
+    disabled: bool,
+    source_file: String,
+}
+
+/// Parse every `allow_exec` rule from the exec-gate rules dir. Lenient: a file
+/// that doesn't parse becomes an error row, not a hard failure. Mirrors the
+/// shape the paid `config-sign exec-gate` loader reads.
+fn load_exec_gate_rules(dir: &Path) -> (Vec<ExecGateRow>, Vec<(String, String)>) {
+    let mut rules = Vec::new();
+    let mut errors = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (rules, errors);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".yml") && !name.ends_with(".yaml") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let doc: serde_yaml::Value = match serde_yaml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push((name.clone(), e.to_string()));
+                continue;
+            }
+        };
+        let Some(rule_seq) = doc.get("rules").and_then(|v| v.as_sequence()) else {
+            continue;
+        };
+        for rule in rule_seq {
+            if rule.get("action").and_then(|v| v.as_str()) != Some("allow_exec") {
+                continue;
+            }
+            let id = rule
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no id)")
+                .to_string();
+            let disabled = rule
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let paths = rule
+                .get("paths")
+                .and_then(|v| v.as_sequence())
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            rules.push(ExecGateRow {
+                id,
+                paths,
+                disabled,
+                source_file: name.clone(),
+            });
+        }
+    }
+    rules.sort_by(|a, b| a.id.cmp(&b.id));
+    (rules, errors)
+}
+
+/// True when any YAML file in `dir` declares a rule with this `id`.
+fn dir_contains_rule_id(dir: &Path, rule_id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".yml") && !name.ends_with(".yaml") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            if content.contains(&format!("id: {rule_id}"))
+                || content.contains(&format!("id: \"{rule_id}\""))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -293,6 +417,11 @@ pub fn cmd_rule_disable(data_dir: &Path, sensor_config: &Path, rule_id: &str) ->
     if is_correlation_rule_id(rule_id) {
         return toggle_correlation_rule(Path::new(CORRELATION_RULES_DIR), rule_id, true);
     }
+    // Exec-gate (allow_exec) rules live in their own dir; disabling one stops the
+    // watch daemon importing it → the path is denied/observed again within a cycle.
+    if dir_contains_rule_id(Path::new(EXEC_GATE_RULES_DIR), rule_id) {
+        return toggle_rule(Path::new(EXEC_GATE_RULES_DIR), rule_id, true);
+    }
     let rules_dir = resolve_rules_dir(data_dir, sensor_config);
     toggle_rule(&rules_dir, rule_id, true)
 }
@@ -300,6 +429,9 @@ pub fn cmd_rule_disable(data_dir: &Path, sensor_config: &Path, rule_id: &str) ->
 pub fn cmd_rule_enable(data_dir: &Path, sensor_config: &Path, rule_id: &str) -> Result<()> {
     if is_correlation_rule_id(rule_id) {
         return toggle_correlation_rule(Path::new(CORRELATION_RULES_DIR), rule_id, false);
+    }
+    if dir_contains_rule_id(Path::new(EXEC_GATE_RULES_DIR), rule_id) {
+        return toggle_rule(Path::new(EXEC_GATE_RULES_DIR), rule_id, false);
     }
     let rules_dir = resolve_rules_dir(data_dir, sensor_config);
     toggle_rule(&rules_dir, rule_id, false)
@@ -1578,5 +1710,38 @@ steps:
     args: {ms: 1}
 "#;
         assert!(parse_playbook_yaml(yaml, "t").is_err());
+    }
+
+    #[test]
+    fn load_exec_gate_rules_parses_paths_and_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("70-operator-exec.yml"),
+            "version: 1\nrules:\n  - id: operator-exec--opt-app\n    action: allow_exec\n    paths: [\"/opt/app\", \"/opt/app2\"]\n  - id: off-rule\n    action: allow_exec\n    paths: [\"/x\"]\n    disabled: true\n",
+        )
+        .unwrap();
+        // a non-allow_exec rule must be ignored
+        std::fs::write(
+            dir.path().join("other.yml"),
+            "rules:\n  - id: nope\n    action: drop\n",
+        )
+        .unwrap();
+        let (rules, errors) = load_exec_gate_rules(dir.path());
+        assert!(errors.is_empty());
+        assert_eq!(rules.len(), 2);
+        // sorted by id: "off-rule" < "operator-exec..."
+        assert_eq!(rules[0].id, "off-rule");
+        assert!(rules[0].disabled);
+        assert_eq!(rules[1].paths, vec!["/opt/app", "/opt/app2"]);
+        assert!(!rules[1].disabled);
+        assert!(dir_contains_rule_id(dir.path(), "operator-exec--opt-app"));
+        assert!(!dir_contains_rule_id(dir.path(), "does-not-exist"));
+    }
+
+    #[test]
+    fn load_exec_gate_rules_missing_dir_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rules, errors) = load_exec_gate_rules(&dir.path().join("nope"));
+        assert!(rules.is_empty() && errors.is_empty());
     }
 }

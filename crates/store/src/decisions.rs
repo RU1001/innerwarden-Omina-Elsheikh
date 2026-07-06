@@ -53,6 +53,43 @@ pub struct HashChainResult {
     pub documented_breaks: u64,
 }
 
+/// A compact, publishable commitment to the decision log's current tip — the
+/// "anchor". The hash chain proves the log is internally CONSISTENT, but it
+/// cannot by itself detect the whole log being deleted, or rolled back to an
+/// earlier state and re-grown with a fresh (internally-consistent) chain — an
+/// attacker with write access can forge a clean chain from a new root. An
+/// operator periodically records an anchor somewhere OUTSIDE this host (a second
+/// box, a ticket, a transparency log); [`Store::verify_against_anchor`] later
+/// proves the log still contains that exact committed history.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecisionAnchor {
+    /// `id` of the tip (latest) decision row when the anchor was taken.
+    pub seq: i64,
+    /// `row_hash` of that tip row — the head of the committed chain. Because
+    /// each `row_hash = SHA-256(prev_hash || data)` chains back to genesis, this
+    /// single value commits to the entire prefix `[1..=seq]`.
+    pub row_hash: String,
+    /// Total decision rows at anchor time (informational; the strong check is
+    /// `row_hash` at `seq`).
+    pub count: u64,
+}
+
+/// Outcome of checking the live log against a previously-published
+/// [`DecisionAnchor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum AnchorVerdict {
+    /// The anchored tip row is present with the same `row_hash` — every decision
+    /// committed up to the anchor is still there, unchanged (newer rows may have
+    /// been appended since). No deletion or rollback.
+    Intact,
+    /// The anchored tip row is GONE — the log was truncated/rolled back past it,
+    /// or deleted and restarted. Tamper the internal chain cannot detect.
+    Truncated,
+    /// The anchored tip row exists but its `row_hash` differs — the committed
+    /// history was rewritten. Tamper.
+    Rewritten,
+}
+
 /// One registered chain break. Returned by `Store::list_chain_breaks`
 /// for audit display. Order is the order the breaks were registered.
 #[derive(Debug, Clone)]
@@ -334,6 +371,52 @@ impl Store {
             broken_at: None,
             intact: true,
             documented_breaks,
+        })
+    }
+
+    /// Compute a publishable [`DecisionAnchor`] over the current tip of the
+    /// decision log. `None` when the log is empty (nothing to anchor). The
+    /// operator records the returned anchor OUTSIDE this host; a later
+    /// [`Store::verify_against_anchor`] then detects deletion/rollback that the
+    /// hash chain alone cannot (a log rebuilt from a new root still verifies).
+    pub fn compute_anchor(&self) -> Result<Option<DecisionAnchor>> {
+        let conn = self.conn()?;
+        let tip: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, row_hash FROM decisions ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((seq, row_hash)) = tip else {
+            return Ok(None);
+        };
+        let count =
+            conn.query_row("SELECT COUNT(*) FROM decisions", [], |r| r.get::<_, i64>(0))? as u64;
+        Ok(Some(DecisionAnchor {
+            seq,
+            row_hash,
+            count,
+        }))
+    }
+
+    /// Verify the live log against a previously-published [`DecisionAnchor`].
+    /// [`AnchorVerdict::Intact`] proves the committed history is still present
+    /// and unchanged; `Truncated` / `Rewritten` prove tamper that the internal
+    /// chain (which a rebuilt-from-a-new-root log would still pass) cannot catch.
+    pub fn verify_against_anchor(&self, anchor: &DecisionAnchor) -> Result<AnchorVerdict> {
+        let conn = self.conn()?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT row_hash FROM decisions WHERE id = ?1",
+                params![anchor.seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match stored {
+            None => AnchorVerdict::Truncated,
+            Some(h) if h != anchor.row_hash => AnchorVerdict::Rewritten,
+            Some(_) => AnchorVerdict::Intact,
         })
     }
 
@@ -1348,5 +1431,95 @@ mod tests {
             .shape_dismissal_stats("imds_ssrf", ip, &[], ACTED)
             .unwrap();
         assert_eq!(s.genuine_dismissals, 2);
+    }
+
+    // ── anchor (whole-log deletion / rollback detection) ─────────────────
+
+    #[test]
+    fn empty_log_has_no_anchor() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.compute_anchor().unwrap().is_none());
+    }
+
+    #[test]
+    fn anchor_intact_after_appending_more_rows() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-1", "block_ip"))
+            .unwrap();
+        store
+            .insert_decision(&sample_decision("inc-2", "ignore"))
+            .unwrap();
+        let anchor = store.compute_anchor().unwrap().expect("non-empty → anchor");
+        // Appending new decisions must NOT invalidate the committed prefix.
+        store
+            .insert_decision(&sample_decision("inc-3", "monitor"))
+            .unwrap();
+        assert_eq!(
+            store.verify_against_anchor(&anchor).unwrap(),
+            AnchorVerdict::Intact
+        );
+    }
+
+    #[test]
+    fn anchor_detects_truncation_when_tip_row_deleted() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-1", "block_ip"))
+            .unwrap();
+        let id2 = store
+            .insert_decision(&sample_decision("inc-2", "ignore"))
+            .unwrap();
+        let anchor = store.compute_anchor().unwrap().unwrap();
+        assert_eq!(anchor.seq, id2);
+        // Roll the log back past the anchor (delete the anchored tip) — the
+        // internal chain would still verify, the anchor catches it.
+        store
+            .conn()
+            .unwrap()
+            .execute("DELETE FROM decisions WHERE id = ?1", params![id2])
+            .unwrap();
+        assert!(
+            store.verify_hash_chain().unwrap().intact,
+            "chain still self-consistent"
+        );
+        assert_eq!(
+            store.verify_against_anchor(&anchor).unwrap(),
+            AnchorVerdict::Truncated
+        );
+    }
+
+    #[test]
+    fn anchor_detects_rewrite_of_committed_history() {
+        let store = Store::open_memory().unwrap();
+        let id1 = store
+            .insert_decision(&sample_decision("inc-1", "block_ip"))
+            .unwrap();
+        let anchor = store.compute_anchor().unwrap().unwrap();
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                "UPDATE decisions SET row_hash = 'deadbeef' WHERE id = ?1",
+                params![id1],
+            )
+            .unwrap();
+        assert_eq!(
+            store.verify_against_anchor(&anchor).unwrap(),
+            AnchorVerdict::Rewritten
+        );
+    }
+
+    #[test]
+    fn anchor_json_round_trips() {
+        // The operator publishes the anchor off-host, so it must serialize.
+        let a = DecisionAnchor {
+            seq: 42,
+            row_hash: "abc123".into(),
+            count: 42,
+        };
+        let j = serde_json::to_string(&a).unwrap();
+        let back: DecisionAnchor = serde_json::from_str(&j).unwrap();
+        assert_eq!(a, back);
     }
 }

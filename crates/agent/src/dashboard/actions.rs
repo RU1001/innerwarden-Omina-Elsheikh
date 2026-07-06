@@ -1285,6 +1285,444 @@ pub(super) async fn api_action_triage_case(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Operator "Trust IP" — monitor-only allowlist (add / remove / list).
+//
+// Trusting an IP suppresses only the AUTOMATED response: the IP is still
+// detected, logged, and you are still notified (see operator_trust.rs). It does
+// NOT blind detection, and there is deliberately no "drop / suppress detection"
+// mode on this surface — a dashboard-authenticated attacker must not be able to
+// self-allowlist into silence. Entries can be time-boxed and expire on their
+// own. All three handlers ride the same auth+CSRF gate as the other actions.
+// ---------------------------------------------------------------------------
+
+/// POST /api/action/trust-ip — operator adds an IP/CIDR to the monitor-only
+/// trust list.
+pub(super) async fn api_action_trust_ip(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::TrustIpRequest>,
+) -> Json<ActionResponse> {
+    if state.insecure_http {
+        warn!("trust-ip executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    Json(trust_ip_inner(
+        std::path::Path::new(crate::operator_trust::DEFAULT_RULES_DIR),
+        &state.data_dir,
+        state.action_cfg.enabled,
+        state.action_cfg.dry_run,
+        &body.ip,
+        &body.reason,
+        body.ttl_hours,
+        Utc::now(),
+    ))
+}
+
+/// POST /api/action/untrust-ip — operator removes an IP/CIDR from the trust list.
+pub(super) async fn api_action_untrust_ip(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::UntrustIpRequest>,
+) -> Json<ActionResponse> {
+    if state.insecure_http {
+        warn!("untrust-ip executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    Json(untrust_ip_inner(
+        std::path::Path::new(crate::operator_trust::DEFAULT_RULES_DIR),
+        &state.data_dir,
+        state.action_cfg.enabled,
+        state.action_cfg.dry_run,
+        &body.ip,
+        &body.reason,
+    ))
+}
+
+/// GET /api/action/trusted-ips — list the current operator trust entries.
+pub(super) async fn api_action_trusted_ips(
+    State(_state): State<DashboardState>,
+) -> Json<serde_json::Value> {
+    Json(list_trusted_inner(
+        std::path::Path::new(crate::operator_trust::DEFAULT_RULES_DIR),
+        Utc::now(),
+    ))
+}
+
+// --- Execution Gate: operator "Trust Exec" (2FA-gated) ----------------------
+//
+// Authorising a binary to execute machine-wide is a SENSITIVE action — it is the
+// approve side of the Execution Gate. So unlike Trust IP, these handlers enforce
+// 2FA (when `[security].method = "totp"`) via the same `verify_dashboard_totp`
+// gate the orphan-resolution endpoints use. On success an `allow_exec` rule is
+// written (operator_exec_trust); the paid `exec-gate watch` daemon hot-reloads it
+// and the path executes. Without the paid daemon the rule is inert.
+// ---------------------------------------------------------------------------
+
+/// POST /api/action/trust-exec — operator authorises a binary path for the gate.
+pub(super) async fn api_action_trust_exec(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::TrustExecRequest>,
+) -> Json<ActionResponse> {
+    if state.insecure_http {
+        warn!("trust-exec executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    if let Err(e) = crate::dashboard::agent_api::verify_dashboard_totp(&state, &body.totp) {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("2FA required to authorise an exec path: {e}"),
+            skill_id: "operator_exec_trust".to_string(),
+        });
+    }
+    Json(trust_exec_inner(
+        std::path::Path::new(crate::operator_exec_trust::DEFAULT_EXEC_RULES_DIR),
+        &state.data_dir,
+        state.action_cfg.enabled,
+        state.action_cfg.dry_run,
+        &body.path,
+        &body.reason,
+    ))
+}
+
+/// POST /api/action/untrust-exec — operator revokes a previously trusted path.
+pub(super) async fn api_action_untrust_exec(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::UntrustExecRequest>,
+) -> Json<ActionResponse> {
+    if state.insecure_http {
+        warn!("untrust-exec executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    if let Err(e) = crate::dashboard::agent_api::verify_dashboard_totp(&state, &body.totp) {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("2FA required to revoke an exec path: {e}"),
+            skill_id: "operator_exec_untrust".to_string(),
+        });
+    }
+    Json(untrust_exec_inner(
+        std::path::Path::new(crate::operator_exec_trust::DEFAULT_EXEC_RULES_DIR),
+        &state.data_dir,
+        state.action_cfg.enabled,
+        state.action_cfg.dry_run,
+        &body.path,
+        &body.reason,
+    ))
+}
+
+/// GET /api/action/trusted-execs — list the current operator exec authorisations.
+pub(super) async fn api_action_trusted_execs(
+    State(_state): State<DashboardState>,
+) -> Json<serde_json::Value> {
+    Json(list_trusted_execs_inner(std::path::Path::new(
+        crate::operator_exec_trust::DEFAULT_EXEC_RULES_DIR,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn trust_ip_inner(
+    rules_dir: &Path,
+    data_dir: &Path,
+    enabled: bool,
+    dry_run: bool,
+    ip: &str,
+    reason: &str,
+    ttl_hours: Option<u64>,
+    now: chrono::DateTime<Utc>,
+) -> ActionResponse {
+    let skill_id = "operator_trust".to_string();
+    if !enabled {
+        return ActionResponse {
+            success: false,
+            dry_run,
+            message: "dashboard actions are disabled - set responder.enabled = true in agent.toml"
+                .to_string(),
+            skill_id,
+        };
+    }
+
+    let outcome = crate::operator_trust::add(rules_dir, ip, reason, ttl_hours, now);
+
+    let (success, message, expires_at) = match &outcome {
+        Ok(entry) => {
+            let expiry = entry
+                .expires_at
+                .map(|e| e.to_rfc3339())
+                .unwrap_or_else(|| "never".to_string());
+            let msg = if entry.expires_at.is_some() {
+                format!(
+                    "Now trusting {} (monitor-only): auto-block is suppressed, but it is still \
+                     detected, logged, and you are still notified. Trust expires {expiry}.",
+                    entry.value
+                )
+            } else {
+                format!(
+                    "Now trusting {} (monitor-only): auto-block is suppressed, but it is still \
+                     detected, logged, and you are still notified. Remove it any time.",
+                    entry.value
+                )
+            };
+            (true, msg, Some(expiry))
+        }
+        Err(e) => (false, e.clone(), None),
+    };
+
+    let mut audit = AdminActionEntry {
+        ts: Utc::now(),
+        operator: "dashboard:operator".to_string(),
+        source: "dashboard".to_string(),
+        action: "trust_ip".to_string(),
+        target: ip.trim().to_string(),
+        parameters: serde_json::json!({
+            "reason": reason,
+            "ttl_hours": ttl_hours,
+            "expires_at": expires_at,
+            "mode": "monitor_only",
+        }),
+        result: if success {
+            "success".to_string()
+        } else {
+            format!("failure: {message}")
+        },
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(data_dir, &mut audit) {
+        warn!("failed to write admin audit: {e:#}");
+    }
+
+    info!(ip = %ip.trim(), success, "dashboard action: trust-ip");
+    ActionResponse {
+        success,
+        dry_run,
+        message,
+        skill_id,
+    }
+}
+
+pub(super) fn untrust_ip_inner(
+    rules_dir: &Path,
+    data_dir: &Path,
+    enabled: bool,
+    dry_run: bool,
+    ip: &str,
+    reason: &str,
+) -> ActionResponse {
+    let skill_id = "operator_untrust".to_string();
+    if !enabled {
+        return ActionResponse {
+            success: false,
+            dry_run,
+            message: "dashboard actions are disabled - set responder.enabled = true in agent.toml"
+                .to_string(),
+            skill_id,
+        };
+    }
+
+    let (success, message) = match crate::operator_trust::remove(rules_dir, ip) {
+        Ok(true) => (
+            true,
+            format!(
+                "Removed {} from the trust list. Auto-response resumes within one slow-loop \
+                 tick (≤30 s).",
+                ip.trim()
+            ),
+        ),
+        Ok(false) => (false, format!("{} is not in the trust list", ip.trim())),
+        Err(e) => (false, e),
+    };
+
+    let mut audit = AdminActionEntry {
+        ts: Utc::now(),
+        operator: "dashboard:operator".to_string(),
+        source: "dashboard".to_string(),
+        action: "untrust_ip".to_string(),
+        target: ip.trim().to_string(),
+        parameters: serde_json::json!({ "reason": reason }),
+        result: if success {
+            "success".to_string()
+        } else {
+            format!("failure: {message}")
+        },
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(data_dir, &mut audit) {
+        warn!("failed to write admin audit: {e:#}");
+    }
+
+    info!(ip = %ip.trim(), success, "dashboard action: untrust-ip");
+    ActionResponse {
+        success,
+        dry_run,
+        message,
+        skill_id,
+    }
+}
+
+pub(super) fn list_trusted_inner(
+    rules_dir: &Path,
+    now: chrono::DateTime<Utc>,
+) -> serde_json::Value {
+    let file = crate::operator_trust::managed_file_in(rules_dir);
+    let entries: Vec<serde_json::Value> = crate::operator_trust::read_entries(&file)
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "value": e.value,
+                "reason": e.reason,
+                "id": e.id,
+                "expires_at": e.expires_at.map(|t| t.to_rfc3339()),
+                "expired": e.is_expired_at(now),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "count": entries.len(),
+        "trusted_ips": entries,
+        // Reminder the UI can surface so operators understand the semantics.
+        "note": "Trusted IPs are still detected, logged, and notified — only automated blocking is suppressed.",
+    })
+}
+
+/// Testable core of trust-exec: validate + write the `allow_exec` rule + audit.
+/// 2FA is verified by the async handler before this is called.
+pub(super) fn trust_exec_inner(
+    rules_dir: &Path,
+    data_dir: &Path,
+    enabled: bool,
+    dry_run: bool,
+    path: &str,
+    reason: &str,
+) -> ActionResponse {
+    let skill_id = "operator_exec_trust".to_string();
+    if !enabled {
+        return ActionResponse {
+            success: false,
+            dry_run,
+            message: "dashboard actions are disabled - set responder.enabled = true in agent.toml"
+                .to_string(),
+            skill_id,
+        };
+    }
+
+    let (success, message) = match crate::operator_exec_trust::add(rules_dir, path, reason) {
+        Ok(entry) => (
+            true,
+            format!(
+                "Authorised {} for the Execution Gate. It will be allowed to execute within one \
+                 watch cycle. Revoke any time.",
+                entry.path
+            ),
+        ),
+        Err(e) => (false, e),
+    };
+
+    let mut audit = AdminActionEntry {
+        ts: Utc::now(),
+        operator: "dashboard:operator".to_string(),
+        source: "dashboard".to_string(),
+        action: "trust_exec".to_string(),
+        target: path.trim().to_string(),
+        parameters: serde_json::json!({ "reason": reason, "two_factor": "enforced" }),
+        result: if success {
+            "success".to_string()
+        } else {
+            format!("failure: {message}")
+        },
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(data_dir, &mut audit) {
+        warn!("failed to write admin audit: {e:#}");
+    }
+
+    info!(path = %path.trim(), success, "dashboard action: trust-exec");
+    ActionResponse {
+        success,
+        dry_run,
+        message,
+        skill_id,
+    }
+}
+
+/// Testable core of untrust-exec: remove the `allow_exec` rule + audit.
+pub(super) fn untrust_exec_inner(
+    rules_dir: &Path,
+    data_dir: &Path,
+    enabled: bool,
+    dry_run: bool,
+    path: &str,
+    reason: &str,
+) -> ActionResponse {
+    let skill_id = "operator_exec_untrust".to_string();
+    if !enabled {
+        return ActionResponse {
+            success: false,
+            dry_run,
+            message: "dashboard actions are disabled - set responder.enabled = true in agent.toml"
+                .to_string(),
+            skill_id,
+        };
+    }
+
+    let (success, message) = match crate::operator_exec_trust::remove(rules_dir, path) {
+        Ok(true) => (
+            true,
+            format!(
+                "Revoked {} from the Execution Gate allowlist. It will be denied/observed again \
+                 within one watch cycle.",
+                path.trim()
+            ),
+        ),
+        Ok(false) => (
+            false,
+            format!("{} is not in the exec allowlist", path.trim()),
+        ),
+        Err(e) => (false, e),
+    };
+
+    let mut audit = AdminActionEntry {
+        ts: Utc::now(),
+        operator: "dashboard:operator".to_string(),
+        source: "dashboard".to_string(),
+        action: "untrust_exec".to_string(),
+        target: path.trim().to_string(),
+        parameters: serde_json::json!({ "reason": reason, "two_factor": "enforced" }),
+        result: if success {
+            "success".to_string()
+        } else {
+            format!("failure: {message}")
+        },
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(data_dir, &mut audit) {
+        warn!("failed to write admin audit: {e:#}");
+    }
+
+    info!(path = %path.trim(), success, "dashboard action: untrust-exec");
+    ActionResponse {
+        success,
+        dry_run,
+        message,
+        skill_id,
+    }
+}
+
+/// Testable core of the trusted-execs list endpoint.
+pub(super) fn list_trusted_execs_inner(rules_dir: &Path) -> serde_json::Value {
+    let file = crate::operator_exec_trust::managed_file_in(rules_dir);
+    let entries: Vec<serde_json::Value> = crate::operator_exec_trust::read_entries(&file)
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "path": e.path,
+                "reason": e.reason,
+                "id": e.id,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "count": entries.len(),
+        "trusted_execs": entries,
+        "note": "Authorised binary paths the Execution Gate allows to execute. Enforced only when the paid Active Defence watch daemon is running.",
+    })
+}
+
 /// Truncate a string to at most `max_chars` chars, appending an
 /// ellipsis when truncated. Used by override reason to bound the
 /// length of the original AI rationale included in the audit row.
@@ -2912,5 +3350,234 @@ mod tests {
             latest_action_type(&store, "i:9").as_deref(),
             Some("operator_reopen"),
         );
+    }
+
+    // ── Operator "Trust IP" (monitor-only allowlist) ──────────────────────
+
+    fn ts(s: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Read today's admin-actions audit file contents (empty string if absent).
+    fn read_admin_audit(data_dir: &std::path::Path) -> String {
+        let mut out = String::new();
+        if let Ok(rd) = std::fs::read_dir(data_dir) {
+            for e in rd.flatten() {
+                if e.file_name()
+                    .to_string_lossy()
+                    .starts_with("admin-actions-")
+                {
+                    if let Ok(c) = std::fs::read_to_string(e.path()) {
+                        out.push_str(&c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // The trust inner-fns take the event_pipeline RULES DIR (they write a
+    // managed suppress_response rule file into it). We use one tempdir as both
+    // the rules dir and the audit data_dir; the agent's YamlResponseRules reads
+    // the same dir, which is exactly the integration we want to assert.
+    fn trusted_active(rules_dir: &std::path::Path, now: chrono::DateTime<Utc>) -> Vec<String> {
+        crate::allowlist::YamlResponseRules::load_at(rules_dir, now).trusted_ips
+    }
+    fn trust_entries(rules_dir: &std::path::Path) -> Vec<crate::operator_trust::TrustEntry> {
+        crate::operator_trust::read_entries(&crate::operator_trust::managed_file_in(rules_dir))
+    }
+
+    #[test]
+    fn trust_ip_inner_adds_entry_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = ts("2026-06-13T10:00:00Z");
+        let resp = trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "203.0.113.10",
+            "office vpn",
+            None,
+            now,
+        );
+        assert!(resp.success, "{}", resp.message);
+        // end-to-end: the agent's hot-reload now treats it as trusted
+        assert_eq!(trusted_active(dir.path(), now), vec!["203.0.113.10"]);
+        let audit = read_admin_audit(dir.path());
+        assert!(audit.contains("trust_ip"));
+        assert!(audit.contains("monitor_only"));
+        assert!(audit.contains("success"));
+    }
+
+    #[test]
+    fn trust_ip_inner_disabled_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            false, // disabled
+            true,
+            "203.0.113.10",
+            "vpn",
+            None,
+            ts("2026-06-13T10:00:00Z"),
+        );
+        assert!(!resp.success);
+        assert!(resp.message.contains("disabled"));
+        assert!(trust_entries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn trust_ip_inner_rejects_slash_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "0.0.0.0/0",
+            "trust everything (should fail)",
+            None,
+            ts("2026-06-13T10:00:00Z"),
+        );
+        assert!(!resp.success);
+        assert!(trust_entries(dir.path()).is_empty());
+        // the rejected attempt is still recorded in the audit trail
+        assert!(read_admin_audit(dir.path()).contains("failure"));
+    }
+
+    #[test]
+    fn trust_ip_inner_ttl_reports_expiry_and_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = ts("2026-06-13T10:00:00Z");
+        let resp = trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "198.51.100.7",
+            "temporary",
+            Some(24),
+            now,
+        );
+        assert!(resp.success);
+        assert!(resp.message.contains("expires"));
+        // active now, gone two days later (driven by the YamlResponseRules TTL)
+        assert!(!trusted_active(dir.path(), now).is_empty());
+        assert!(trusted_active(dir.path(), ts("2026-06-15T10:00:00Z")).is_empty());
+    }
+
+    #[test]
+    fn untrust_ip_inner_removes_then_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = ts("2026-06-13T10:00:00Z");
+        trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "203.0.113.10",
+            "vpn",
+            None,
+            now,
+        );
+
+        let removed = untrust_ip_inner(dir.path(), dir.path(), true, false, "203.0.113.10", "done");
+        assert!(removed.success);
+        assert!(trusted_active(dir.path(), now).is_empty());
+
+        // removing again → not found, but not an error
+        let again = untrust_ip_inner(dir.path(), dir.path(), true, false, "203.0.113.10", "");
+        assert!(!again.success);
+        assert!(again.message.contains("not in the trust list"));
+    }
+
+    #[test]
+    fn list_trusted_inner_reports_entries_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = ts("2026-06-13T10:00:00Z");
+        trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "10.0.0.0/8",
+            "corp",
+            Some(24),
+            now,
+        );
+
+        let listed = list_trusted_inner(dir.path(), now);
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["trusted_ips"][0]["value"], "10.0.0.0/8");
+        assert_eq!(listed["trusted_ips"][0]["id"], "operator-trust-10-0-0-0-8");
+        assert_eq!(listed["trusted_ips"][0]["expired"], false);
+
+        // same entry, evaluated after expiry → flagged expired in the listing
+        let later = list_trusted_inner(dir.path(), ts("2026-06-15T10:00:00Z"));
+        assert_eq!(later["trusted_ips"][0]["expired"], true);
+    }
+
+    #[test]
+    fn trust_exec_inner_writes_and_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = trust_exec_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "/opt/app/server",
+            "runtime",
+        );
+        assert!(r.success, "trust-exec should succeed: {}", r.message);
+
+        let listed = list_trusted_execs_inner(dir.path());
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["trusted_execs"][0]["path"], "/opt/app/server");
+        assert_eq!(listed["trusted_execs"][0]["reason"], "runtime");
+    }
+
+    #[test]
+    fn trust_exec_inner_rejects_disabled_and_bad_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // disabled responder
+        let off = trust_exec_inner(dir.path(), dir.path(), false, false, "/opt/x", "r");
+        assert!(!off.success);
+        // bad path (glob)
+        let bad = trust_exec_inner(dir.path(), dir.path(), true, false, "/usr/bin/*", "r");
+        assert!(!bad.success);
+        // bad path (relative)
+        let rel = trust_exec_inner(dir.path(), dir.path(), true, false, "relative", "r");
+        assert!(!rel.success);
+        assert_eq!(list_trusted_execs_inner(dir.path())["count"], 0);
+    }
+
+    #[test]
+    fn untrust_exec_inner_removes_then_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        trust_exec_inner(dir.path(), dir.path(), true, false, "/opt/app/server", "r");
+        let rm = untrust_exec_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "/opt/app/server",
+            "done",
+        );
+        assert!(rm.success);
+        assert_eq!(list_trusted_execs_inner(dir.path())["count"], 0);
+        // removing again → not-found (success=false)
+        let again = untrust_exec_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "/opt/app/server",
+            "done",
+        );
+        assert!(!again.success);
     }
 }

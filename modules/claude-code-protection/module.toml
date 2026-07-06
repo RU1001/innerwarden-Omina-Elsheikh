@@ -1,0 +1,43 @@
+[module]
+id          = "claude-code-protection"
+name        = "Claude Code Protection"
+version     = "0.1.0"
+description = "Official integration for Anthropic's Claude Code CLI - an in-path PreToolUse command guard (fail-closed) plus kernel-level execution monitoring for the agent's shell activity"
+authors     = ["InnerWarden Contributors"]
+license     = "Apache-2.0"
+tier        = "open"
+builtin     = true
+min_innerwarden = "0.15.0"
+
+[provides]
+collectors = ["exec-audit", "journald", "integrity"]
+detectors  = ["execution-guard"]
+skills     = []   # observe mode for kernel detection; the in-path guard hook is the enforcing layer
+
+[requires]
+event_sources = ["exec_audit", "journald.sudo", "integrity"]
+
+# Two layers, both shipped:
+#
+# 1. ENFORCING (pre-execution): `innerwarden agent install-hook` writes a
+#    fail-closed PreToolUse hook into Claude Code's settings.json. Every shell
+#    command the agent proposes is POSTed to the loopback check-command brain
+#    BEFORE it runs and blocked when dangerous (or when the agent is
+#    unreachable). This is the primary, Claude-Code-specific integration.
+#
+# 2. OBSERVE (post-execution): the exec_audit + journald collectors feed the
+#    execution-guard detector, so anything that runs (including activity from a
+#    raw shell that bypasses the hook) is still recorded at the kernel level.
+#
+# Future (paid Active Defence): scope the in-kernel Execution Gate to the
+# Claude Code process tree (spec 083 EXEC_GATE_SCOPE) for true exec prevention.
+
+[security]
+allowed_commands        = []
+require_sudo_validation = false
+forbid_shell_expansion  = true
+
+[[preflights]]
+kind   = "binary_exists"
+value  = "/sbin/auditd"
+reason = "auditd must be running to generate EXECVE records for the exec_audit collector (observe layer)"

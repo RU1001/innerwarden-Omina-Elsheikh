@@ -103,6 +103,189 @@ pub(crate) fn looks_like_anthropic_key(key: &str) -> bool {
     key.starts_with("sk-ant-") && key.len() >= 20
 }
 
+/// Map an Execution Gate state to a single doctor [`Check`] (spec 080 G4 — the
+/// FREE read-only honesty surface). Pure: the divergence verdict comes from
+/// `innerwarden_core::execution_gate`. `fail` on real drift, `warn` when the
+/// signed config is present but the live map couldn't be read (run as root),
+/// `ok` when live matches intent.
+/// PURE: the informational doctor note printed above the Execution Gate check
+/// when `bpf` is definitively not in the kernel's active LSM stack. `None` when
+/// bpf is active or the list is unreadable (never cry wolf on an unreadable list).
+pub(crate) fn gate_lsm_inactive_note(bpf_lsm_active: Option<bool>) -> Option<String> {
+    if bpf_lsm_active == Some(false) {
+        Some(
+            "  note: `bpf` is NOT in the active kernel LSM stack (/sys/kernel/security/lsm) — \
+             a BPF-LSM gate cannot enforce here until you add `lsm=...,bpf` to the kernel cmdline and reboot."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+pub(crate) fn gate_doctor_check(
+    gate: &innerwarden_core::execution_gate::GateState,
+    bpf_lsm_active: Option<bool>,
+) -> Check {
+    use innerwarden_core::execution_gate::{evaluate_divergence_with_lsm, Divergence};
+    let signed = gate
+        .signed_count
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "no file".into());
+    let live = gate
+        .live_count
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unreadable".into());
+    match evaluate_divergence_with_lsm(gate, bpf_lsm_active) {
+        Divergence::ArmedButLsmInactive { mode } => Check::fail(
+            format!(
+                "Execution Gate is {} but the kernel BPF-LSM is NOT active (`bpf` missing from /sys/kernel/security/lsm) — it denies NOTHING",
+                mode.label()
+            ),
+            "The gate maps say armed but no BPF-LSM hook can run, so the agent is UNGATED. Add `lsm=...,bpf` to the kernel cmdline (GRUB_CMDLINE_LINUX) and reboot, then re-verify the gate blocks an unknown exec.",
+        ),
+        Divergence::ActiveButEmpty { mode, .. } => Check::fail(
+            format!(
+                "Execution Gate is {} but the live allowlist is EMPTY (signed {signed}, live {live})",
+                mode.label()
+            ),
+            "Run a FULL `config-sign exec-gate apply`; never leave it armed with an empty map (enforce = host brick).",
+        ),
+        Divergence::ApplyDrift { .. } => Check::fail(
+            format!(
+                "Execution Gate apply drift: signed {signed} (intent {}), live map {live}, live mode {}",
+                gate.intended_mode.map(|m| m.label()).unwrap_or("unknown"),
+                gate.live_mode.label()
+            ),
+            "Signed config not applied to the kernel. Run a FULL `config-sign exec-gate apply`, then re-check that live == signed.",
+        ),
+        Divergence::ScopeArmedButEmpty { mode } => Check::fail(
+            format!(
+                "Execution Gate is {} and agent-scoped (key 4 = 1) but EXEC_GATE_SCOPE is EMPTY — it protects NOTHING",
+                mode.label()
+            ),
+            "A scoped gate with an empty scope allows every exec. Write the protected agent's cgroup id into EXEC_GATE_SCOPE, or disarm (LSM_POLICY key 4 = 0).",
+        ),
+        Divergence::None => {
+            if gate.live_count.is_none()
+                && (gate.signed_count.is_some() || gate.intended_mode.is_some())
+            {
+                Check::warn(
+                    format!("Execution Gate signed config present (signed {signed}) but live map not readable"),
+                    "Re-run `innerwarden doctor` as root (CAP_BPF / bpftool) to verify the live kernel map matches the signed file.",
+                )
+            } else {
+                Check::ok(format!(
+                    "Execution Gate consistent (signed {signed}, live {live}, mode {})",
+                    gate.live_mode.label()
+                ))
+            }
+        }
+    }
+}
+
+/// True when an Execution Gate is present on this host (a signed file or a
+/// pinned map) — so `doctor` only shows the section where it's relevant.
+fn execution_gate_present() -> bool {
+    use innerwarden_core::execution_gate::{EXEC_ALLOWLIST_PIN, SIGNED_ALLOWLIST_FILE};
+    std::path::Path::new(SIGNED_ALLOWLIST_FILE).exists()
+        || std::path::Path::new(EXEC_ALLOWLIST_PIN).exists()
+}
+
+/// Read + parse the signed allowlist file for `doctor` (plain JSON read).
+fn read_signed_allowlist_for_doctor() -> (
+    Option<usize>,
+    Option<innerwarden_core::execution_gate::GateMode>,
+) {
+    use innerwarden_core::execution_gate::{parse_signed_allowlist, SIGNED_ALLOWLIST_FILE};
+    match std::fs::read_to_string(SIGNED_ALLOWLIST_FILE) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .map(|v| parse_signed_allowlist(&v))
+            .unwrap_or((None, None)),
+        Err(_) => (None, None),
+    }
+}
+
+/// Live `EXEC_ALLOWLIST` entry count via `bpftool` (ctl doesn't link aya).
+/// `None` when bpftool is missing / unprivileged / the pin is absent.
+fn bpftool_allowlist_count() -> Option<usize> {
+    use innerwarden_core::execution_gate::{count_bpftool_dump, EXEC_ALLOWLIST_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args(["map", "dump", "pinned", EXEC_ALLOWLIST_PIN])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(count_bpftool_dump(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Live gate mode via `bpftool map lookup` of LSM_POLICY key 3. `Unknown` when
+/// it can't be read (absent key / no privilege / no bpftool).
+fn bpftool_gate_mode() -> innerwarden_core::execution_gate::GateMode {
+    use innerwarden_core::execution_gate::{parse_bpftool_value_u32, GateMode, LSM_POLICY_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args([
+            "map",
+            "lookup",
+            "pinned",
+            LSM_POLICY_PIN,
+            "key",
+            "3",
+            "0",
+            "0",
+            "0",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            GateMode::from_policy_key(parse_bpftool_value_u32(&String::from_utf8_lossy(&o.stdout)))
+        }
+        _ => GateMode::Unknown,
+    }
+}
+
+/// Live scope mode via `bpftool map lookup` of LSM_POLICY key 4 (spec 083).
+/// `Some(true)` = agent-scoped, `Some(false)` = the key reads back not-1, `None`
+/// when it can't be read (absent key / no privilege / no bpftool) — treated as
+/// unknown so it never flags a scope problem it can't see.
+fn bpftool_scope_armed() -> Option<bool> {
+    use innerwarden_core::execution_gate::{parse_bpftool_value_u32, LSM_POLICY_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args([
+            "map",
+            "lookup",
+            "pinned",
+            LSM_POLICY_PIN,
+            "key",
+            "4",
+            "0",
+            "0",
+            "0",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_bpftool_value_u32(&String::from_utf8_lossy(&out.stdout)) == Some(1))
+}
+
+/// Live `EXEC_GATE_SCOPE` entry count via `bpftool` (spec 083). `None` when the
+/// map can't be read.
+fn bpftool_scope_count() -> Option<usize> {
+    use innerwarden_core::execution_gate::{count_bpftool_dump, EXEC_GATE_SCOPE_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args(["map", "dump", "pinned", EXEC_GATE_SCOPE_PIN])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(count_bpftool_dump(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// Heuristic check for Telegram bot tokens: `<digits>:<20+ alphanumeric>`.
 pub(crate) fn looks_like_telegram_token(token: &str) -> bool {
     if !token.contains(':') {
@@ -201,6 +384,21 @@ pub(crate) fn build_ai_provider_check(provider: &str, resolved_key: Option<&str>
             ),
         },
         "ollama" => Check::ok("Ollama provider configured (reachability is checked separately)"),
+        "azure_openai" | "azure" => match resolved_key {
+            None => Check::fail(
+                "AZURE_OPENAI_API_KEY not set (provider = \"azure_openai\")",
+                "Get the key + endpoint from your Azure OpenAI resource, then run:\n\n  innerwarden configure ai azure_openai --key <key> --model <deployment> --base-url https://<resource>.openai.azure.com",
+            ),
+            // Azure keys are 32-char hex or longer base64-ish strings with no
+            // stable prefix, so only emptiness is a meaningful format signal.
+            Some(k) if !k.trim().is_empty() => {
+                Check::ok("AZURE_OPENAI_API_KEY is set (provider = \"azure_openai\")")
+            }
+            Some(_) => Check::fail(
+                "AZURE_OPENAI_API_KEY is set but empty (provider = \"azure_openai\")",
+                "Run:\n  innerwarden configure ai azure_openai --key <key> --base-url https://<resource>.openai.azure.com",
+            ),
+        },
         // Default: openai (also handles unknown providers gracefully)
         _ => match resolved_key {
             None => Check::fail(
@@ -663,13 +861,42 @@ pub(crate) fn build_service_status_check_linux(
     }
 }
 
-/// Build the dashboard `--dashboard` flag-in-service check.
+/// Absolute path of the file that carries the agent's start command
+/// (`ExecStart` on systemd, `ProgramArguments` on launchd), per platform.
+/// The `--dashboard` flag lives here, so doctor must read the RIGHT one:
+/// reading the Linux systemd path on macOS always came back empty and produced
+/// a false "--dashboard is missing" warning even though the plist carried it
+/// (2026-07-01 macOS finding F5).
+pub(crate) fn agent_unit_file_path() -> &'static str {
+    agent_unit_file_path_for(cfg!(target_os = "macos"))
+}
+
+/// Pure inner (tested for both platforms on the Linux CI host).
+pub(crate) fn agent_unit_file_path_for(mac: bool) -> &'static str {
+    if mac {
+        "/Library/LaunchDaemons/com.innerwarden.agent.plist"
+    } else {
+        "/etc/systemd/system/innerwarden-agent.service"
+    }
+}
+
+/// Pure: the platform-correct "start the agent" hint shown when the dashboard is
+/// down and the agent is not running (launchd on macOS, systemd elsewhere).
+pub(crate) fn agent_start_hint(mac: bool) -> &'static str {
+    if mac {
+        "Start the agent:  sudo launchctl kickstart -k system/com.innerwarden.agent"
+    } else {
+        "Start the agent:  sudo systemctl start innerwarden-agent"
+    }
+}
+
+/// Build the dashboard `--dashboard` flag-in-unit check.
 pub(crate) fn build_dashboard_flag_check(flag_in_service: bool) -> Check {
     if flag_in_service {
-        Check::ok("--dashboard flag present in service ExecStart")
+        Check::ok("--dashboard flag present in the agent service definition")
     } else {
         Check::warn(
-            "--dashboard flag is missing from innerwarden-agent.service ExecStart",
+            "--dashboard flag is missing from the agent service definition",
             "Run: innerwarden configure dashboard  (it will add the flag automatically)",
         )
     }
@@ -706,19 +933,30 @@ pub(crate) fn build_dashboard_reachability_check(
     agent_alive: bool,
 ) -> Option<Check> {
     if reachable {
+        // The dashboard serves TLS by default (self-signed cert), so advertise
+        // https, not http (F5): a plain http:// URL just fails to connect.
         Some(Check::ok(
-            "Dashboard is reachable at http://YOUR_SERVER_IP:8787",
+            "Dashboard is reachable at https://YOUR_SERVER_IP:8787",
         ))
     } else if flag_in_service {
         let hint = if agent_alive {
-            "Agent is running; check the dashboard binding (port/TLS/listen address) — sudo journalctl -u innerwarden-agent -n 100 | grep -i dashboard"
+            "Agent is running; check the dashboard binding (port/TLS/listen address)"
         } else {
-            "Start the agent:  sudo systemctl start innerwarden-agent"
+            agent_start_hint(cfg!(target_os = "macos"))
         };
         Some(Check::warn("Dashboard port 8787 is not responding", hint))
     } else {
         None
     }
+}
+
+/// Scheme-agnostic reachability probe: is something accepting TCP connections
+/// on `addr`? Used as a fallback for the dashboard check because the dashboard
+/// is frequently HTTPS-only on prod, so a plain-HTTP probe gets connection
+/// refused and `doctor` would otherwise false-warn that it is down. A
+/// successful TCP connect means a listener is up regardless of HTTP vs HTTPS.
+fn tcp_port_listening(addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
 }
 
 /// Build the GeoIP reachability check from a pre-computed flag.
@@ -851,6 +1089,36 @@ pub(crate) fn doctor_resolve_agent_data_dir(agent_doc: Option<&toml_edit::Docume
         .and_then(|d| d.as_str())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/lib/innerwarden"))
+}
+
+/// Doctor lines for one enabled capability's sudoers drop-in, plus whether it
+/// is an issue. A capability whose drop-in is missing is non-functional (e.g.
+/// block-ip cannot run the firewall as the `innerwarden` user), so the fix
+/// hint points at `enable <cap> --force` — the command that actually re-applies
+/// the drop-in (plain `enable` no-ops on an already-enabled capability).
+pub(crate) fn capability_sudoers_status_lines(
+    cap_id: &str,
+    drop_in: Option<&str>,
+    present: bool,
+) -> (Vec<String>, bool) {
+    match drop_in {
+        None => (vec![format!("  [ok]   {cap_id} (enabled)")], false),
+        Some(_) if present => (
+            vec![format!(
+                "  [ok]   {cap_id} (enabled): sudoers drop-in present"
+            )],
+            false,
+        ),
+        Some(name) => (
+            vec![
+                format!(
+                    "  [warn] {cap_id} (enabled): sudoers drop-in missing (/etc/sudoers.d/{name})"
+                ),
+                format!("         → sudo innerwarden enable {cap_id} --force"),
+            ],
+            true,
+        ),
+    }
 }
 
 /// Map a Cli's configured paths to the sudoers drop-in for a given capability.
@@ -1919,13 +2187,15 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             ("innerwarden-sensor", "com.innerwarden.sensor"),
             ("innerwarden-agent", "com.innerwarden.agent"),
         ] {
-            let running = std::process::Command::new("launchctl")
-                .args(["list", plist])
-                .output()
-                .map(|o| {
-                    o.status.success() && String::from_utf8_lossy(&o.stdout).contains("\"PID\"")
-                })
-                .unwrap_or(false);
+            // Detect via process presence (systemd::service_status is pgrep-based
+            // on macOS), NOT `launchctl list <label>`: that queries the caller's
+            // launchd domain, so a non-root `doctor` cannot see the SYSTEM-domain
+            // daemons and falsely reported them "not running" while they were
+            // live (2026-07-01 retest residual — same class as F7).
+            let running = matches!(
+                systemd::service_status(label),
+                systemd::ServiceStatus::Active
+            );
             svc.push(build_service_running_check(label, running, true));
             // Note: macOS plist filename is per-domain (com.innerwarden.*),
             // so we use it for the remediation hint by adjusting the helper.
@@ -2035,10 +2305,10 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             )
         });
     } else {
-        let env_var = if provider == "anthropic" {
-            "ANTHROPIC_API_KEY"
-        } else {
-            "OPENAI_API_KEY"
+        let env_var = match provider.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "azure_openai" | "azure" => "AZURE_OPENAI_API_KEY",
+            _ => "OPENAI_API_KEY",
         };
         let key = resolve_key(env_var);
         cfg.push(build_ai_provider_check(&provider, key.as_deref()));
@@ -2100,6 +2370,33 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
     }
 
     run_section(cfg, &mut total_issues);
+
+    // ── Execution Gate (spec 080 G4) ──────────────────────
+    // FREE read-only honesty surface: compare the signed allowlist to the LIVE
+    // kernel maps so a paid gate that staged-but-never-applied (or armed with an
+    // empty map) is visible here. Section is shown only where a gate is present.
+    if execution_gate_present() {
+        println!("\nExecution Gate");
+        let (signed_count, intended_mode) = read_signed_allowlist_for_doctor();
+        let live_count = bpftool_allowlist_count();
+        let live_mode = bpftool_gate_mode();
+        let gate = innerwarden_core::execution_gate::GateState {
+            signed_count,
+            intended_mode,
+            live_count,
+            live_mode,
+            live_scope_armed: bpftool_scope_armed(),
+            live_scope_count: bpftool_scope_count(),
+        };
+        let bpf_lsm_active = innerwarden_core::execution_gate::read_bpf_lsm_active();
+        if let Some(note) = gate_lsm_inactive_note(bpf_lsm_active) {
+            println!("{note}");
+        }
+        run_section(
+            vec![gate_doctor_check(&gate, bpf_lsm_active)],
+            &mut total_issues,
+        );
+    }
 
     // ── Telegram ──────────────────────────────────────────
     // Only check Telegram when enabled = true in agent config.
@@ -2306,22 +2603,33 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             .any(|l| l.starts_with("INNERWARDEN_DASHBOARD_PASSWORD_HASH="))
             || std::env::var("INNERWARDEN_DASHBOARD_PASSWORD_HASH").is_ok();
 
-        // Check if --dashboard flag is in the service ExecStart
-        let service_content =
-            std::fs::read_to_string("/etc/systemd/system/innerwarden-agent.service")
-                .unwrap_or_default();
+        // Check if --dashboard flag is in the agent's start command. On macOS
+        // this is the launchd plist's ProgramArguments, not a systemd unit
+        // (F5): reading the wrong path returned empty and false-warned.
+        let service_content = std::fs::read_to_string(agent_unit_file_path()).unwrap_or_default();
         let dashboard_flag_in_service = service_content.contains("--dashboard");
 
         db.push(build_dashboard_flag_check(dashboard_flag_in_service));
         db.extend(build_dashboard_credentials_checks(has_user, has_hash));
 
-        // Check if the dashboard is actually reachable
+        // Check if the dashboard is actually reachable.
+        //
+        // The dashboard is frequently HTTPS-only (self-signed) on prod, so a
+        // plain-HTTP probe returns connection-refused and doctor used to warn
+        // "Dashboard port 8787 is not responding" even when the dashboard was
+        // serving HTTPS 200 (false negative observed on Azure prod). Fall back
+        // to a scheme-agnostic TCP connect: if something is listening on the
+        // port, the dashboard is up regardless of HTTP vs HTTPS.
         let dashboard_up = ureq::get("http://127.0.0.1:8787/api/status")
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(2)))
             .build()
             .call()
-            .is_ok();
+            .is_ok()
+            || tcp_port_listening(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 8787)),
+                std::time::Duration::from_secs(2),
+            );
         // Bug 3 (2026-05-06): pass agent-alive so the hint adapts
         // when the dashboard is unreachable but the agent itself is
         // running. `service_status::Active` is one signal; the
@@ -2385,20 +2693,16 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
         any_enabled = true;
 
         // Map capability → expected sudoers drop-in name
-        if let Some(name) = capability_sudoers_drop_in(cap.id()) {
-            let path = std::path::Path::new("/etc/sudoers.d").join(name);
-            if path.exists() {
-                println!("  [ok]   {} (enabled): sudoers drop-in present", cap.id());
-            } else {
-                println!(
-                    "  [warn] {} (enabled): sudoers drop-in missing (/etc/sudoers.d/{name})",
-                    cap.id()
-                );
-                println!("         → innerwarden enable {}", cap.id());
-                total_issues += 1;
-            }
-        } else {
-            println!("  [ok]   {} (enabled)", cap.id());
+        let drop_in = capability_sudoers_drop_in(cap.id());
+        let present = drop_in
+            .map(|name| std::path::Path::new("/etc/sudoers.d").join(name).exists())
+            .unwrap_or(false);
+        let (lines, has_issue) = capability_sudoers_status_lines(cap.id(), drop_in, present);
+        for line in lines {
+            println!("{line}");
+        }
+        if has_issue {
+            total_issues += 1;
         }
     }
 
@@ -3175,6 +3479,120 @@ mod tests {
     }
 
     #[test]
+    fn gate_doctor_check_fails_on_apply_drift_the_oracle_case() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: Some(0),
+            live_mode: GateMode::Inert,
+            live_scope_armed: None,
+            live_scope_count: None,
+        };
+        let check = gate_doctor_check(&gate, None);
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("apply drift"));
+        assert!(check.label.contains("1685"));
+    }
+
+    #[test]
+    fn gate_doctor_check_fails_critical_when_armed_and_empty() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(10),
+            intended_mode: Some(GateMode::Enforce),
+            live_count: Some(0),
+            live_mode: GateMode::Enforce,
+            live_scope_armed: None,
+            live_scope_count: None,
+        };
+        let check = gate_doctor_check(&gate, None);
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("EMPTY"));
+    }
+
+    #[test]
+    fn gate_doctor_check_ok_when_converged() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: Some(1685),
+            live_mode: GateMode::Observe,
+            live_scope_armed: None,
+            live_scope_count: None,
+        };
+        let check = gate_doctor_check(&gate, None);
+        assert_eq!(check.sev, Sev::Ok);
+        assert!(check.label.contains("consistent"));
+    }
+
+    #[test]
+    fn gate_doctor_check_fails_on_scope_armed_but_empty() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        // enforce + agent-scoped (key4=1) + empty scope map: the gate protects
+        // nothing while looking armed.
+        let gate = GateState {
+            signed_count: None,
+            intended_mode: None,
+            live_count: Some(50),
+            live_mode: GateMode::Enforce,
+            live_scope_armed: Some(true),
+            live_scope_count: Some(0),
+        };
+        let check = gate_doctor_check(&gate, None);
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("EXEC_GATE_SCOPE is EMPTY"));
+    }
+
+    #[test]
+    fn gate_lsm_inactive_note_only_when_bpf_off() {
+        assert!(gate_lsm_inactive_note(Some(false))
+            .unwrap()
+            .contains("lsm=...,bpf"));
+        // bpf active / unreadable -> no note (never cry wolf on an unreadable list).
+        assert!(gate_lsm_inactive_note(Some(true)).is_none());
+        assert!(gate_lsm_inactive_note(None).is_none());
+    }
+
+    #[test]
+    fn gate_doctor_check_fails_when_armed_but_bpf_lsm_inactive() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        // The Azure-6.17 OpenClaw finding: maps perfectly healthy (enforce, scoped,
+        // full allowlist) but `bpf` not in the active LSM stack -> gate is a no-op.
+        let gate = GateState {
+            signed_count: Some(3628),
+            intended_mode: Some(GateMode::Enforce),
+            live_count: Some(3628),
+            live_mode: GateMode::Enforce,
+            live_scope_armed: Some(true),
+            live_scope_count: Some(1),
+        };
+        // bpf active -> converged/ok; bpf inactive -> fail with remediation.
+        assert_eq!(gate_doctor_check(&gate, Some(true)).sev, Sev::Ok);
+        let check = gate_doctor_check(&gate, Some(false));
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("BPF-LSM is NOT active"));
+        assert!(check.hint.as_deref().unwrap().contains("lsm=...,bpf"));
+    }
+
+    #[test]
+    fn gate_doctor_check_warns_when_live_unreadable_but_signed_present() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: None, // bpftool unavailable / unprivileged
+            live_mode: GateMode::Unknown,
+            live_scope_armed: None,
+            live_scope_count: None,
+        };
+        let check = gate_doctor_check(&gate, None);
+        assert_eq!(check.sev, Sev::Warn);
+        assert!(check.label.contains("not readable"));
+    }
+
+    #[test]
     fn looks_like_anthropic_key_accepts_sk_ant_prefix() {
         assert!(looks_like_anthropic_key("sk-ant-abcdefghijklmno"));
         assert!(looks_like_anthropic_key(
@@ -3364,6 +3782,31 @@ mod tests {
     fn build_ai_provider_check_ollama_returns_ok() {
         let c = build_ai_provider_check("ollama", None);
         assert_eq!(c.sev, Sev::Ok);
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_missing_key_fails_with_azure_var() {
+        // Regression: azure used to fall through to the openai arm and report
+        // "OPENAI_API_KEY not set" — a confusing false fail for azure users.
+        let c = build_ai_provider_check("azure_openai", None);
+        assert_eq!(c.sev, Sev::Fail);
+        assert!(c.label.contains("AZURE_OPENAI_API_KEY"));
+        assert!(!c
+            .label
+            .contains("OPENAI_API_KEY not set (provider = \"openai\")"));
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_alias_with_key_is_ok() {
+        let c = build_ai_provider_check("azure", Some("8Y59hQabcdef0123456789"));
+        assert_eq!(c.sev, Sev::Ok);
+        assert!(c.label.contains("AZURE_OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_empty_key_fails() {
+        let c = build_ai_provider_check("azure_openai", Some("   "));
+        assert_eq!(c.sev, Sev::Fail);
     }
 
     #[test]
@@ -4228,6 +4671,29 @@ enabled = true
     }
 
     #[test]
+    fn capability_sudoers_status_lines_covers_present_missing_and_no_dropin() {
+        // Missing drop-in -> warn + the --force fix hint, and it IS an issue.
+        let (lines, issue) =
+            capability_sudoers_status_lines("block-ip", Some("innerwarden-block-ip"), false);
+        assert!(issue);
+        assert!(lines.iter().any(|l| l.contains("drop-in missing")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("innerwarden enable block-ip --force")));
+
+        // Present drop-in -> ok, no issue.
+        let (lines, issue) =
+            capability_sudoers_status_lines("block-ip", Some("innerwarden-block-ip"), true);
+        assert!(!issue);
+        assert!(lines.iter().any(|l| l.contains("drop-in present")));
+
+        // Capability with no drop-in -> plain ok, no issue.
+        let (lines, issue) = capability_sudoers_status_lines("ai", None, false);
+        assert!(!issue);
+        assert_eq!(lines, vec!["  [ok]   ai (enabled)".to_string()]);
+    }
+
+    #[test]
     fn build_service_running_check_running_is_ok() {
         let c = build_service_running_check("innerwarden-agent", true, false);
         assert_eq!(c.sev, Sev::Ok);
@@ -4262,6 +4728,47 @@ enabled = true
         assert!(c.hint.unwrap().contains("configure dashboard"));
     }
 
+    /// F5 anchor (2026-07-01): the flag-check message must not hardcode the
+    /// systemd unit name (`innerwarden-agent.service`) — it is shown on macOS
+    /// too, where the unit is a launchd plist.
+    #[test]
+    fn build_dashboard_flag_check_message_is_platform_neutral() {
+        assert!(!build_dashboard_flag_check(false)
+            .label
+            .contains("innerwarden-agent.service"));
+        assert!(!build_dashboard_flag_check(true).label.contains("ExecStart"));
+    }
+
+    /// F5 anchor: doctor reads the `--dashboard` flag from the launchd plist on
+    /// macOS and the systemd unit on Linux — never the wrong one.
+    #[test]
+    fn agent_unit_file_path_is_platform_correct() {
+        let p = agent_unit_file_path();
+        if cfg!(target_os = "macos") {
+            assert_eq!(p, "/Library/LaunchDaemons/com.innerwarden.agent.plist");
+        } else {
+            assert_eq!(p, "/etc/systemd/system/innerwarden-agent.service");
+        }
+    }
+
+    #[test]
+    fn agent_unit_file_path_for_both_platforms() {
+        assert_eq!(
+            agent_unit_file_path_for(true),
+            "/Library/LaunchDaemons/com.innerwarden.agent.plist"
+        );
+        assert_eq!(
+            agent_unit_file_path_for(false),
+            "/etc/systemd/system/innerwarden-agent.service"
+        );
+    }
+
+    #[test]
+    fn agent_start_hint_is_platform_specific() {
+        assert!(agent_start_hint(true).contains("launchctl kickstart"));
+        assert!(agent_start_hint(false).contains("systemctl start innerwarden-agent"));
+    }
+
     #[test]
     fn build_dashboard_credentials_checks_with_credentials_set() {
         let checks = build_dashboard_credentials_checks(true, true);
@@ -4292,14 +4799,41 @@ enabled = true
         assert_eq!(c.sev, Sev::Ok);
     }
 
+    #[test]
+    fn tcp_port_listening_detects_open_and_closed_ports() {
+        use std::time::Duration;
+        // A bound listener (any scheme, incl. an HTTPS-only dashboard) is
+        // detected as up — this is the false-negative fix: the old HTTP-only
+        // probe missed an HTTPS-only listener.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        assert!(
+            tcp_port_listening(addr, Duration::from_secs(1)),
+            "open port must be detected"
+        );
+
+        // A closed port (drop the listener first) is reported down.
+        drop(listener);
+        assert!(
+            !tcp_port_listening(addr, Duration::from_millis(300)),
+            "closed port must be reported down"
+        );
+    }
+
     /// Pre-Bug-3 behavior: agent down, dashboard down → "Start the agent".
+    /// The start command is platform-aware (F5): launchd on macOS, systemd
+    /// elsewhere.
     #[test]
     fn build_dashboard_reachability_check_agent_down_suggests_start() {
         let c = build_dashboard_reachability_check(false, true, false).unwrap();
         assert_eq!(c.sev, Sev::Warn);
         let hint = c.hint.unwrap();
-        assert!(hint.contains("systemctl start"));
         assert!(hint.contains("Start the agent"));
+        if cfg!(target_os = "macos") {
+            assert!(hint.contains("launchctl kickstart"));
+        } else {
+            assert!(hint.contains("systemctl start"));
+        }
     }
 
     /// Bug 3 anchor (2026-05-06): when agent IS alive but dashboard

@@ -548,7 +548,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     // Load config (optional - all fields have sensible defaults).
     // Done before dashboard check so action config can be wired in.
-    let cfg = match &cli.config {
+    // `mut` so the Telegram `/mode` command can flip the responder guardian
+    // mode live (applied to this owned cfg in the main loop, then persisted).
+    // Mutating cfg in place keeps it the single source of truth for every
+    // downstream `cfg.responder.*` enforcement read (no per-site override).
+    let mut cfg = match &cli.config {
         Some(path) => config::load(path)?,
         None => config::AgentConfig::default(),
     };
@@ -563,6 +567,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     // Initialize cloud provider IP safelist (Google, AWS, Azure, Cloudflare, etc.)
     cloud_safelist::init();
+    // Operator's own-infrastructure IPs (config-driven, empty by default): the
+    // operator's other boxes seen as a remote source are self-traffic, so they
+    // stay out of the operator + public feeds while detection continues.
+    cloud_safelist::init_operator_self_infra(&cfg.allowlist.self_infra_ips);
 
     // Deep security snapshot: shared between agent (updates) and dashboard (reads).
     let deep_security_snapshot = std::sync::Arc::new(std::sync::RwLock::new(
@@ -622,6 +630,38 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     // so the receiver can be used in the dispatch task spawned later.
     let (agent_alert_tx, mut agent_alert_rx) =
         tokio::sync::mpsc::channel::<dashboard::AgentGuardAlert>(64);
+
+    // Spec 081 — managed-agent coexistence. Build the agent-guard registry ONCE
+    // here and share the SAME `Arc<Mutex<Registry>>` between the dashboard (which
+    // mutates it via `agent connect`) and the main agent loop's response-side
+    // `managed_agent_guard` verifier (kernel PID-block + userspace IP-block). The
+    // registry rehydrates from the on-disk snapshot so a watchdog binary swap
+    // does not drop operator-vouched agents (missing snapshot = empty registry,
+    // corrupt = warn + empty). Built unconditionally because `AgentState` always
+    // needs it, even when the dashboard task is disabled.
+    let agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>> = {
+        let snapshot_path = cli.data_dir.join("agent-guard-registry.json");
+        let reg = match innerwarden_agent_guard::registry::Registry::restore_from(&snapshot_path) {
+            Ok(reg) => {
+                if reg.count_total() > 0 {
+                    info!(
+                        path = %snapshot_path.display(),
+                        agents = reg.count_agents(),
+                        tools = reg.count_tools(),
+                        "agent-guard registry restored from snapshot (shared with response gate)",
+                    );
+                }
+                reg
+            }
+            Err(e) => {
+                warn!(error = %e, path = %snapshot_path.display(), "failed to restore agent-guard registry; starting empty");
+                innerwarden_agent_guard::registry::Registry::new()
+            }
+        };
+        Arc::new(tokio::sync::Mutex::new(reg))
+    };
+    let signature_index: Arc<innerwarden_agent_guard::signatures::SignatureIndex> =
+        Arc::new(innerwarden_agent_guard::signatures::SignatureIndex::new());
 
     // Build the primary AI provider and capability router ONCE, before
     // the dashboard spawn. Both the dashboard task and the main agent
@@ -714,6 +754,17 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         None
     };
 
+    // Issue #71: create the shared bridge before the dashboard spawn so
+    // both the spawn closure and AgentState can each take a handle.
+    // Declared here (before the dashboard gate) so AgentState init at the
+    // bottom of this function can always reference them, even when the
+    // dashboard is disabled (the sender is simply dropped).
+    let dashboard_pending_map: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::telegram::PendingConfirmation>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let (dashboard_approval_tx, dashboard_approval_rx) =
+        tokio::sync::mpsc::channel::<crate::dashboard::state::DashboardApprovalOutcome>(32);
+
     // Dashboard spawn is gated by both the CLI flag AND the config
     // toggle. CLI `--dashboard` is the historical opt-in; the config
     // field (default `true`) lets the operator switch the dashboard
@@ -739,6 +790,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             honeypot_port: cfg.honeypot.port,
             telegram_enabled: cfg.telegram.enabled,
             slack_enabled: cfg.slack.enabled,
+            discord_enabled: cfg.discord.enabled,
             cloudflare_enabled: cfg.cloudflare.enabled,
             crowdsec_enabled: cfg.crowdsec.enabled,
             webhook_format: cfg.webhook.format.clone(),
@@ -766,7 +818,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             ai_personality: cfg.telegram.bot.personality.clone(),
         };
         let dashboard_data_dir = cli.data_dir.clone();
-        let dashboard_bind = cli.dashboard_bind.clone();
+        // Config-driven bind takes precedence over the `--dashboard-bind` CLI
+        // flag, so dashboard access is set in ONE place (`[dashboard] bind` in
+        // agent.toml via `innerwarden dashboard expose/local`) without editing
+        // the systemd unit. `None` = fall back to the flag (loopback default).
+        let dashboard_bind = cfg
+            .dashboard
+            .bind
+            .clone()
+            .unwrap_or_else(|| cli.dashboard_bind.clone());
         let web_push_pub_key = cfg.web_push.vapid_public_key.clone();
         let trusted_proxies = cfg.dashboard.trusted_proxies.clone();
         let session_timeout_minutes = cfg.dashboard.session_timeout_minutes;
@@ -788,6 +848,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         );
 
         let agent_alert_tx = agent_alert_tx.clone();
+        // Spec 081: hand the dashboard the SAME shared registry the response
+        // gate uses, so `agent connect` mutations are visible to the verifier.
+        let dashboard_registry = agent_registry.clone();
         let deep_security = deep_security_snapshot.clone();
         let dashboard_graph = shared_graph.clone();
         // Share the router built above with the dashboard. `AiRouter` is
@@ -801,6 +864,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         let tls_cert = cli.tls_cert.clone();
         let tls_key = cli.tls_key.clone();
         let insecure_no_tls = cli.insecure_no_tls;
+
         // PR #420 Wave 3: thread 2FA config into the dashboard so the
         // sensitive POST endpoints (orphan clear / mark-already-gone)
         // can gate on operator-provided TOTP codes. `[security]` is
@@ -844,7 +908,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             std::path::Path::new(crate::agent_discovery::PROD_DISCOVERY_DIR);
         match crate::agent_discovery::write_discovery(
             discovery_runtime_dir,
-            &cli.dashboard_bind,
+            &dashboard_bind,
             !cli.insecure_no_tls,
             env!("CARGO_PKG_VERSION"),
         ) {
@@ -854,6 +918,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             }
         }
 
+        // Clone the Arc before moving into the spawn closure so
+        // AgentState init below can still hold the original handle.
+        let dashboard_pending_for_serve = dashboard_pending_map.clone();
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -866,6 +933,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 max_sessions,
                 dashboard_advisory_cache,
                 rule_engine,
+                dashboard_registry,
                 agent_alert_tx,
                 deep_security,
                 dashboard_graph,
@@ -880,6 +948,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 insecure_no_tls,
                 dashboard_two_factor,
                 dashboard_playbook_sim,
+                dashboard_pending_for_serve,
+                dashboard_approval_tx,
             )
             .await
             {
@@ -1049,6 +1119,27 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         None
     };
 
+    let discord_client: Option<discord::DiscordClient> = if cfg.discord.enabled {
+        let url = cfg.discord.resolved_webhook_url();
+        if url.is_empty() {
+            warn!("discord.enabled = true but webhook_url not configured - disabling");
+            None
+        } else {
+            match discord::DiscordClient::new(&url) {
+                Ok(c) => {
+                    info!("Discord notifications enabled");
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!("failed to create Discord client: {e:#}");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // Create approval channel - polling task is spawned after state is built (continuous mode only)
     let (approval_tx, approval_rx_for_state) =
         tokio::sync::mpsc::channel::<telegram::ApprovalResult>(64);
@@ -1077,6 +1168,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         let wh_timeout = cfg.webhook.timeout_secs;
         let wh_format = cfg.webhook.format.clone();
         let alert_data_dir = cli.data_dir.clone();
+        // Also persist each alert as a dashboard incident so blocked/flagged
+        // AI-agent actions surface as Cases (not only jsonl + Telegram).
+        let alert_sqlite_store = sqlite_store.clone();
+        let alert_host = std::env::var("HOSTNAME")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+            .unwrap_or_else(|_| "unknown".to_string());
         tokio::spawn(async move {
             let sc = if !sc_url.is_empty() {
                 slack::SlackClient::new(&sc_url).ok()
@@ -1133,6 +1230,27 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             }
                         }
                         Err(e) => warn!(error = %e, "failed to serialize agent-guard alert"),
+                    }
+                }
+
+                // Dashboard case: persist the alert as an incident so the
+                // guardrail's actions show up in the Cases / live-feed UI, not
+                // only in the jsonl audit + chat notification. Idempotent
+                // (incident_id carries the alert ts; store does INSERT OR
+                // IGNORE). Blocking SQLite write → spawn_blocking.
+                if let Some(sq) = alert_sqlite_store.clone() {
+                    let incident = crate::dashboard::agent_guard_incident::alert_to_incident(
+                        &alert,
+                        &alert_host,
+                    );
+                    match tokio::task::spawn_blocking(move || sq.insert_incident(&incident)).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "failed to persist agent-guard incident")
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "agent-guard incident persist task join failed")
+                        }
                     }
                 }
 
@@ -1212,6 +1330,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         telegram_client,
         pending_confirmations: HashMap::new(),
         approval_rx: None, // set below in continuous mode
+        dashboard_pending: dashboard_pending_map.clone(),
+        dashboard_approval_rx: Some(dashboard_approval_rx),
         grouping_engine: notification_pipeline::GroupingEngine::new(&cfg.notifications),
         environment_profile: {
             // 2026-05-03: load auto-detected profile, then merge in
@@ -1302,6 +1422,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             None
         },
         slack_client,
+        discord_client,
         cloudflare_client: if cfg.cloudflare.enabled {
             let token = cloudflare::resolve_api_token(&cfg.cloudflare.api_token);
             if token.is_empty() || cfg.cloudflare.zone_id.is_empty() {
@@ -1377,6 +1498,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // read error (logged `warn!`), matching pre-PR behaviour in
         // the degraded case.
         xdp_block_times: store.load_xdp_block_times(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(
             &cli.data_dir,
             sqlite_store.as_deref(),
@@ -1457,6 +1579,13 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // dropped while the agent was down / a stale reloaded set, fast.
         last_block_enforcement_reconcile: std::time::Instant::now()
             - std::time::Duration::from_secs(4 * 60),
+        // Offset so the first agent-guard registry reconcile runs ~1 min after
+        // boot — re-registers a co-located agent that restarted (new pid) while
+        // the agent was down, before the next incident could sever it.
+        last_agent_registry_reconcile: std::time::Instant::now()
+            - std::time::Duration::from_secs(4 * 60),
+        pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
         dynamic_trusted_ips: Vec::new(),
         dynamic_trusted_users: Vec::new(),
@@ -1476,6 +1605,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        // Spec 081 — managed-agent coexistence: the SAME registry shared with the
+        // dashboard (built above), so the response gate sees `agent connect`s live.
+        agent_registry: agent_registry.clone(),
+        signature_index: signature_index.clone(),
     };
 
     // Spec 005 Phase 7: replay persisted feedback so demotions survive
@@ -1679,8 +1812,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // Activate approval channel and start Telegram polling task
         state.approval_rx = Some(approval_rx_for_state);
         if let Some(ref tg) = state.telegram_client {
-            // Register persistent command menu (fire-and-forget)
-            tg.set_commands().await;
+            // Register persistent command menu (fire-and-forget), scoped to the
+            // operator's profile so a lay user sees the tiny 5-command menu.
+            tg.set_commands(cfg.telegram.is_simple_profile()).await;
             let tg_clone = tg.clone();
             // Spec 036 PR-2: register the long-lived Telegram polling
             // loop in the agent's TaskGroup so SIGTERM-driven shutdown
@@ -1817,19 +1951,83 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             cfg.hypervisor.poll_secs.max(60),
         ));
 
-        // SIGTERM / SIGINT. Unix-only — the agent is not currently
-        // shipped on Windows (codename Phantom is "planned" not
-        // active per CLAUDE.md). The pre-cleanup duplicate
-        // `#[cfg(not(unix))]` slow-loop block was 142 lines of
-        // forward-compat scaffolding nobody exercised; deleted on
-        // PR #486 follow-up to stop tarpaulin counting it as
-        // "uncovered" and to drop the dead-code maintenance burden.
+        // Graceful-shutdown signal. On unix this is SIGTERM; on Windows
+        // (spec 085 Phantom-on-Windows Phase 0) it is CtrlShutdown
+        // (service-stop / logoff). Both expose `async fn recv(&mut self)`
+        // so the `sigterm.recv()` select arm below is platform-agnostic.
+        #[cfg(unix)]
         let mut sigterm = {
             use tokio::signal::unix::{signal, SignalKind};
             signal(SignalKind::terminate())?
         };
+        #[cfg(not(unix))]
+        let mut sigterm = tokio::signal::windows::ctrl_shutdown()?;
+
+        // Spec 084 P0 1C (hardening): refresh the Kubernetes pod -> tenant cache
+        // in a DEDICATED task. It previously lived in the narrative `select!`
+        // arm, where a heavy incident-processing tick (AI-triaging a flood
+        // backlog) starves the other arms — but a flood is exactly when
+        // per-tenant attribution must stay current (validated on test001: under
+        // a k3s + rogue flood the narrative arm never ran, so the cache stayed
+        // empty). A dedicated task is immune to the main loop's per-tick cost.
+        // Self-rate-limited (maybe_refresh checks refresh_secs) and inert unless
+        // `[tenancy] enabled`, so non-k8s hosts spawn nothing.
+        if cfg.tenancy.enabled {
+            let tcfg = cfg.tenancy.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                    tcfg.refresh_secs.clamp(15, 3600),
+                ));
+                loop {
+                    ticker.tick().await;
+                    crate::tenancy::maybe_refresh(&tcfg).await;
+                }
+            });
+        }
 
         loop {
+            // Apply a live `/mode` change requested via Telegram on the previous
+            // tick. Done here, in the loop that owns `cfg`, so the mutation is
+            // borrow-clean and every subsequent enforcement read sees the new
+            // mode. Also persist the two keys to agent.toml for restart
+            // durability (best-effort; the in-memory flip already took effect).
+            if let Some(mode) = crate::agent_context::take_and_apply_pending_mode(
+                &mut cfg,
+                &mut state.pending_mode_change,
+                cli.config.as_deref(),
+            ) {
+                info!(
+                    mode = ?mode,
+                    responder_enabled = cfg.responder.enabled,
+                    dry_run = cfg.responder.dry_run,
+                    "guardian mode changed live via Telegram /mode"
+                );
+            }
+            // Apply queued Settings changes (profile / sensitivity) the same way:
+            // mutate the owned cfg + persist, and re-register the command menu
+            // when the profile flips so the operator immediately sees the right
+            // (lay vs technical) menu.
+            if !state.pending_setting_changes.is_empty() {
+                let changes = std::mem::take(&mut state.pending_setting_changes);
+                let mut profile_flipped = false;
+                for change in &changes {
+                    if let Some(label) = crate::agent_context::apply_setting_change(
+                        &mut cfg,
+                        change,
+                        cli.config.as_deref(),
+                    ) {
+                        if matches!(change, crate::SettingChange::Profile(_)) {
+                            profile_flipped = true;
+                        }
+                        info!(change = %label, "Telegram setting applied live");
+                    }
+                }
+                if profile_flipped {
+                    if let Some(ref tg) = state.telegram_client {
+                        tg.set_commands(cfg.telegram.is_simple_profile()).await;
+                    }
+                }
+            }
             let shutdown = tokio::select! {
                 _ = incident_ticker.tick() => {
                     crate::loops::fast_loop::run_incident_tick(
@@ -1941,6 +2139,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     }
 
                     // Hot-reload response rules from /etc/innerwarden/rules/event_pipeline/.
+                    // This includes dashboard "Trust IP" entries: they are written
+                    // as ordinary suppress_response/scope:ip rules into the same
+                    // dir (see operator_trust.rs), so YamlResponseRules picks them
+                    // up here and drops expired ones via the expires_at check.
                     {
                         let rules_dir = std::path::Path::new("/etc/innerwarden/rules/event_pipeline");
                         let yaml_rules = crate::allowlist::YamlResponseRules::load(rules_dir);
@@ -2160,6 +2362,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             .map(|(ip, _)| ip.clone())
                             .collect();
                         for ip in &expired_ips {
+                            // Skip IPs whose cleanup keeps failing for a
+                            // NON-transient reason (e.g. the agent lacks the
+                            // privilege to run `sudo bpftool`). They sit in an
+                            // exponential backoff so we don't re-spawn sudo and
+                            // re-log every 30s tick. Without this a single stuck
+                            // entry produced 44k failed sudo-auths + 44k WARN
+                            // lines in 7 days on a non-root deploy.
+                            if let Some((_, next_retry)) = state.xdp_cleanup_backoff.get(ip) {
+                                if now_utc < *next_retry {
+                                    continue;
+                                }
+                            }
                             // Wave 4 (AUDIT-WAVE4-XDP-IPV6, Copilot review on
                             // PR #462): route through the shared helper so v4
                             // and v6 entries both reach the matching pin path.
@@ -2171,6 +2385,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 // avoid a poison entry; can't act on kernel.
                                 warn!(ip, "XDP cleanup: unparseable IP in xdp_block_times, dropping local entry");
                                 state.xdp_block_times.remove(ip);
+                                state.xdp_cleanup_backoff.remove(ip);
                                 // Spec 037 PR-1: mirror the remove in SQLite so
                                 // warm-cache on next boot does not resurrect the
                                 // poison entry.
@@ -2193,6 +2408,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             match output {
                                 Ok(out) if out.status.success() => {
                                     state.xdp_block_times.remove(ip);
+                                    state.xdp_cleanup_backoff.remove(ip);
                                     // Spec 037 PR-1: mirror remove in SQLite so
                                     // the warm-cache does not resurrect an
                                     // already-expired block on next boot.
@@ -2209,10 +2425,35 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                         || lower.contains("does not exist");
                                     if already_absent {
                                         state.xdp_block_times.remove(ip);
+                                        state.xdp_cleanup_backoff.remove(ip);
                                         // Spec 037 PR-1: same mirror reason.
                                         state.store.remove_xdp_block_time(ip);
                                         info!(ip, ttl_secs, "XDP cleanup: entry already absent in kernel map, local state cleared");
+                                    } else if crate::skills::builtin::is_xdp_privilege_failure(&lower) {
+                                        // Non-transient: the agent cannot run
+                                        // `sudo bpftool` (no sudoers rule / no
+                                        // tty / not root). Retrying every tick is
+                                        // futile and floods the log + pam auth.
+                                        // Back off exponentially and log only on
+                                        // the FIRST failure and again once the
+                                        // cap is reached — not every tick.
+                                        let entry = state.xdp_cleanup_backoff.entry(ip.clone()).or_insert((0, now_utc));
+                                        entry.0 = entry.0.saturating_add(1);
+                                        let backoff = crate::skills::builtin::xdp_cleanup_backoff_secs(entry.0);
+                                        entry.1 = now_utc + chrono::Duration::seconds(backoff);
+                                        if entry.0 == 1 || backoff >= 3600 {
+                                            warn!(
+                                                ip,
+                                                ttl_secs,
+                                                consecutive_failures = entry.0,
+                                                backoff_secs = backoff,
+                                                stderr = %stderr.trim(),
+                                                "XDP cleanup cannot proceed (agent lacks privilege to run bpftool) - backing off; entry kept for drift visibility. Block backend may be ufw/iptables, or run the agent as root for XDP TTL cleanup."
+                                            );
+                                        }
                                     } else {
+                                        // Transient kernel/map drift - keep local
+                                        // state and retry next tick as before.
                                         warn!(
                                             ip,
                                             ttl_secs,
@@ -2223,11 +2464,22 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(
-                                        ip,
-                                        error = %e,
-                                        "XDP cleanup: bpftool spawn failed - keeping local state to retry next tick"
-                                    );
+                                    // Spawn failure (e.g. bpftool/sudo binary
+                                    // missing) is also non-transient - back off
+                                    // instead of re-spawning every tick.
+                                    let entry = state.xdp_cleanup_backoff.entry(ip.clone()).or_insert((0, now_utc));
+                                    entry.0 = entry.0.saturating_add(1);
+                                    let backoff = crate::skills::builtin::xdp_cleanup_backoff_secs(entry.0);
+                                    entry.1 = now_utc + chrono::Duration::seconds(backoff);
+                                    if entry.0 == 1 || backoff >= 3600 {
+                                        warn!(
+                                            ip,
+                                            error = %e,
+                                            consecutive_failures = entry.0,
+                                            backoff_secs = backoff,
+                                            "XDP cleanup: bpftool spawn failed - backing off; entry kept for drift visibility"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2805,9 +3057,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 }
                                 notification_gate::NotificationVerdict::DailyBriefingOnly => {
                                     *state.telegram_deferred.entry("mesh".to_string()).or_insert(0) += 1;
-                                    if let Some(count) = state.notification_burst_tracker.record_contained() {
+                                    let category = notification_gate::burst_category("mesh");
+                                    if let Some(mut summary) = state
+                                        .notification_burst_tracker
+                                        .record_contained(category, Some(ip.as_str()))
+                                    {
+                                        let host = notification_gate::resolve_host_id(
+                                            &cfg.agent.tags,
+                                            &state.knowledge_graph,
+                                        );
+                                        summary.host = host.clone();
                                         if let Some(ref tg) = state.telegram_client {
-                                            let msg = notification_gate::format_burst_summary(count);
+                                            let msg = notification_gate::format_burst_summary(&host, &summary);
                                             let tg = tg.clone();
                                             tokio::spawn(async move {
                                                 let _ = tg.send_alert_html(&msg).await;
@@ -3371,36 +3632,47 @@ interaction = "reject"
         // tick, snapshot persist, allowlist hot-reload, operator IPs
         // refresh). Short enough that the overall workspace test
         // run is not noticeably slower.
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), run_agent(cli)).await;
-
-        // The loop is designed to run forever, so a timeout Err is
-        // the expected shape. If run_agent returned Ok within 8s
-        // something cut the loop short — likely a spawn-time panic
-        // in dry-run mode that should be surfaced.
-        assert!(
-            outcome.is_err(),
-            "run_agent must keep running until cancelled — got early Ok/Err: {outcome:?}"
-        );
-
-        // Useful behavioural assertions: the slow-loop must have
-        // executed at least one full tick AND persisted the
-        // operator-visible state-of-the-loop snapshot to disk.
-        // These were the operator-observable side effects the
-        // pre-PR run did NOT prove: the test ran the loop for 8s
-        // and only asserted "no panic", which is filler. The
-        // assertions below pin specific paths the slow-loop body
-        // wrote to disk.
-
-        // 1) `incident-groups.json` is written on every grouping-engine
-        //    tick (boot.rs:1527). Its presence proves the slow-loop
-        //    select! arm fired and the group-snapshot path executed
-        //    end-to-end.
+        // Run the agent loop until the grouping-engine tick produces its
+        // on-disk side effect, rather than sleeping a fixed budget.
+        // `run_agent` never returns on its own, so the old
+        // `timeout(8s, run_agent)` ALWAYS burned the full 8s AND was flaky
+        // on slower hardware where the slow-loop tick had not landed within
+        // that window (observed failing 2 of 3 runs in isolation on a slow
+        // box). Poll for the file and finish the instant it appears, with a
+        // generous 30s ceiling so a loaded CI box still passes
+        // deterministically. The loop is meant to run forever, so if
+        // `run_agent` returns/panics on its own first, that is the bug we
+        // surface.
+        //
+        // `incident-groups.json` is written on every grouping-engine tick
+        // (boot.rs:1527). Its presence proves the slow-loop select! arm
+        // fired and the group-snapshot path executed end-to-end.
         let groups_snapshot = data_dir.join("incident-groups.json");
-        assert!(
-            groups_snapshot.exists(),
-            "slow-loop must write incident-groups.json at least once during the 8s window — \
-             missing file means the grouping-engine tick never executed"
-        );
+        let poll_target = groups_snapshot.clone();
+        let wait_for_snapshot = async {
+            loop {
+                if poll_target.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        let outcome = tokio::select! {
+            biased;
+            r = run_agent(cli) => Err(format!("{r:?}")),
+            res = tokio::time::timeout(std::time::Duration::from_secs(30), wait_for_snapshot) => Ok(res.is_ok()),
+        };
+        match outcome {
+            Err(early) => {
+                panic!("run_agent must keep running until cancelled — got early return: {early}")
+            }
+            Ok(false) => panic!(
+                "slow-loop must write incident-groups.json within 30s — \
+                 missing file means the grouping-engine tick never executed"
+            ),
+            Ok(true) => {}
+        }
+
         let groups_body = std::fs::read_to_string(&groups_snapshot).expect("read snapshot");
         assert!(
             groups_body.starts_with('{') || groups_body.starts_with('['),

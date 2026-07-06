@@ -256,6 +256,7 @@ mod tests {
             signals: vec!["destructive".to_string()],
             atr_rule_ids: vec!["ATR-1".to_string()],
             explanation: "test alert".to_string(),
+            tenant: None,
         }
     }
 

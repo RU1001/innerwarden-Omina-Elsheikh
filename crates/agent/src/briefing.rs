@@ -48,9 +48,22 @@ impl BriefingCounters {
         let b = &snap.buckets;
         let attention_high = b.attention.severities.get("high").copied().unwrap_or(0);
         let attention_crit = b.attention.severities.get("critical").copied().unwrap_or(0);
+        // `contained` and `unresolved` are INCIDENT counts — they feed the
+        // "Operator-relevant incidents today" / "OBSERVING: N incidents" lines,
+        // which must agree with the Sensors HUD `total_incidents` and the
+        // Report total (all incident sums; anchored by
+        // consistency_incidents_today).
+        //
+        // `ignored`, on the other hand, must equal the Home tile "Filtered out"
+        // = `dismissed.unique_attackers` (data_api.rs:659). It previously used
+        // `dismissed.incidents + allowlisted.incidents`, which is what produced
+        // the operator's "Ignored 21 vs Filtered out 11" mismatch: one attacker
+        // fires many incidents (types.rs documents this "21 vs 10" confusion),
+        // and allowlisted is a separate operator-trust bucket that is NOT part
+        // of "flagged"/"filtered out".
         Self {
             contained: b.blocked.incidents + b.observing.incidents + b.honeypot.incidents,
-            ignored: b.dismissed.incidents + b.allowlisted.incidents,
+            ignored: b.dismissed.unique_attackers,
             unresolved: b.attention.incidents,
             unresolved_high_crit: attention_high + attention_crit,
             blocked_ips_count: b.blocked.unique_attackers,
@@ -596,14 +609,14 @@ mod tests {
         };
         let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
 
-        // Snapshot says: 5 blocked / 3 observing / 1 honeypot / 2
-        // dismissed / 1 allowlisted / 4 attention (2 critical, 1
-        // high). 7 unique blocked attackers. The briefing must paint
-        // those exact numbers — not the empty KG's zeros.
+        // Counts are by UNIQUE ATTACKER — the dashboard's basis. The fixture
+        // mirrors the operator-reported mismatch: dismissed has 21 INCIDENTS but
+        // 11 distinct IPs, and the briefing must paint 11 (the "Filtered out"
+        // tile), NOT 21 and NOT 21+allowlisted. blocked 4 / observing 2 /
+        // honeypot 1 / dismissed 11 / allowlisted 1 / attention 2 distinct IPs.
         let mut attention_severities = std::collections::BTreeMap::new();
-        attention_severities.insert("critical".to_string(), 2);
+        attention_severities.insert("critical".to_string(), 1);
         attention_severities.insert("high".to_string(), 1);
-        attention_severities.insert("medium".to_string(), 1);
         let snap = OverviewSnapshot {
             date: "2026-05-02".to_string(),
             generated_at: Utc::now(),
@@ -611,32 +624,32 @@ mod tests {
             buckets: OutcomeBuckets {
                 blocked: BucketStats {
                     incidents: 5,
-                    unique_attackers: 7,
+                    unique_attackers: 4,
                     severities: Default::default(),
                 },
                 observing: BucketStats {
                     incidents: 3,
-                    unique_attackers: 0,
+                    unique_attackers: 2,
                     severities: Default::default(),
                 },
                 honeypot: BucketStats {
                     incidents: 1,
-                    unique_attackers: 0,
+                    unique_attackers: 1,
                     severities: Default::default(),
                 },
                 dismissed: BucketStats {
-                    incidents: 2,
-                    unique_attackers: 0,
+                    incidents: 21,
+                    unique_attackers: 11,
                     severities: Default::default(),
                 },
                 allowlisted: BucketStats {
-                    incidents: 1,
-                    unique_attackers: 0,
+                    incidents: 6,
+                    unique_attackers: 3,
                     severities: Default::default(),
                 },
                 attention: BucketStats {
-                    incidents: 4,
-                    unique_attackers: 0,
+                    incidents: 3,
+                    unique_attackers: 2,
                     severities: attention_severities,
                 },
             },
@@ -650,30 +663,31 @@ mod tests {
 
         let context = build_briefing_context(&kg, Some(&snap));
 
-        // contained = blocked.incidents + observing.incidents + honeypot.incidents = 5+3+1 = 9
-        // ignored   = dismissed.incidents + allowlisted.incidents = 2+1 = 3
-        // unresolved = attention.incidents = 4
-        // unresolved_high_crit = attention.severities[critical]+attention.severities[high] = 2+1 = 3
-        // operator_incidents = contained + unresolved = 9+4 = 13
-        // blocked_ips_count = blocked.unique_attackers = 7
+        // contained  = blocked.incidents + observing.incidents + honeypot.incidents = 5+3+1 = 9
+        // ignored    = dismissed.unique_attackers = 11 (NOT 21 incidents, NOT + allowlisted)
+        // unresolved = attention.incidents = 3
+        // unresolved_high_crit = attention.severities[critical]+[high] = 1+1 = 2
+        // operator_incidents = contained + unresolved = 9+3 = 12
+        // blocked_ips_count = blocked.unique_attackers = 4
         assert!(
-            context.contains("Operator-relevant incidents today: 13"),
-            "operator_incidents must use snapshot counters; got: {context}"
+            context.contains("Operator-relevant incidents today: 12"),
+            "operator_incidents stays incident-based (HUD/Report agreement); got: {context}"
         );
         assert!(
-            context.contains("BLOCKED: 7 unique IPs"),
-            "blocked_ips count must come from snapshot; got: {context}"
+            context.contains("BLOCKED: 4 unique IPs"),
+            "blocked count is unique attackers; got: {context}"
         );
         assert!(
-            context.contains("OBSERVING: 4 incidents"),
-            "OBSERVING line emits snapshot.attention.incidents (4); got: {context}"
+            context.contains("OBSERVING: 3 incidents"),
+            "OBSERVING uses unresolved INCIDENTS (3); got: {context}"
         );
         assert!(
-            context.contains("IGNORED: 3 confirmed"),
-            "IGNORED uses dismissed+allowlisted from snapshot; got: {context}"
+            context.contains("IGNORED: 11 confirmed"),
+            "IGNORED must equal dashboard 'Filtered out' = dismissed.unique_attackers (11), \
+             not dismissed.incidents (21) and not + allowlisted; got: {context}"
         );
         assert!(
-            context.contains("3 high/critical items to review"),
+            context.contains("2 high/critical items to review"),
             "high/critical must use snapshot severities; got: {context}"
         );
     }

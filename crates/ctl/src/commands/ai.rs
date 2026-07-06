@@ -5,6 +5,11 @@ use anyhow::Result;
 
 use crate::{config_editor, prompt, require_sudo, restart_agent, systemd, write_env_key, Cli};
 
+/// Default Azure OpenAI `api-version` written by `configure ai azure_openai`.
+/// This is the stable chat-completions version the agent's azure provider
+/// targets; operators can override it by editing `[ai].api_version`.
+pub(crate) const AZURE_DEFAULT_API_VERSION: &str = "2024-12-01-preview";
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WizardProvider {
     pub(crate) name: &'static str,
@@ -449,6 +454,15 @@ fn cmd_configure_ai_with_restart(
     if !cli.dry_run {
         require_sudo(cli);
     }
+    // "azure" is the natural name a user types; the agent's provider id is
+    // "azure_openai". Alias it so the config that lands is actually usable
+    // instead of a silently-wrong `provider = "azure"` the agent can't load.
+    let provider = if provider.eq_ignore_ascii_case("azure") {
+        "azure_openai"
+    } else {
+        provider
+    };
+    let is_azure = provider == "azure_openai";
     let (default_model, key_var, default_base_url) =
         crate::commands::setup::ai_provider_defaults(provider);
     let model = model.unwrap_or(&default_model);
@@ -482,6 +496,16 @@ fn cmd_configure_ai_with_restart(
 
     let base_url = base_url.or(default_base_url.as_deref());
 
+    // Azure OpenAI has no fixed endpoint — it is per-resource. Without it the
+    // agent builds `/openai/deployments/<model>/chat/completions?...` against an
+    // empty host and every request 404s with no obvious cause. Fail loudly at
+    // configure-time instead of writing a config that silently never works.
+    if is_azure && base_url.is_none() {
+        anyhow::bail!(
+            "provider 'azure_openai' requires --base-url (your Azure resource endpoint).\nRun:\n  innerwarden configure ai azure_openai --key <key> --model <deployment> --base-url https://<resource>.openai.azure.com"
+        );
+    }
+
     if cli.dry_run {
         match base_url {
             Some(url) => println!(
@@ -493,12 +517,28 @@ fn cmd_configure_ai_with_restart(
                 cli.agent_config.display()
             ),
         }
+        if is_azure {
+            println!("  [dry-run] would set [ai] api_version={AZURE_DEFAULT_API_VERSION}");
+        }
     } else {
         config_editor::write_bool(&cli.agent_config, "ai", "enabled", true)?;
         config_editor::write_str(&cli.agent_config, "ai", "provider", provider)?;
         config_editor::write_str(&cli.agent_config, "ai", "model", model)?;
         if let Some(url) = base_url {
             config_editor::write_str(&cli.agent_config, "ai", "base_url", url)?;
+        }
+        // Azure's chat endpoint is versioned via a required `api-version` query
+        // param. The agent reads it from [ai].api_version; if we leave it empty
+        // the URL ends in `?api-version=` and Azure rejects it. Write a known-good
+        // default so a fresh `configure ai azure_openai` works with no extra step.
+        if is_azure {
+            config_editor::write_str(
+                &cli.agent_config,
+                "ai",
+                "api_version",
+                AZURE_DEFAULT_API_VERSION,
+            )?;
+            println!("  [ok] api_version set to {AZURE_DEFAULT_API_VERSION} (edit agent.toml to override)");
         }
         println!("  [ok] agent.toml updated (provider={provider}, model={model})");
     }
@@ -739,8 +779,23 @@ fn cmd_install_classifier_with_target(
 
     println!();
     println!("Done. Restart the agent to load the classifier:");
-    println!("  sudo systemctl restart innerwarden-agent");
+    println!("  {}", agent_restart_hint());
     Ok(())
+}
+
+/// Platform-correct "restart the agent" command line. macOS uses launchd, not
+/// systemd, so `systemctl restart` there is a no-op that misleads the user (F6).
+fn agent_restart_hint() -> &'static str {
+    agent_restart_hint_for(cfg!(target_os = "macos"))
+}
+
+/// Pure inner (tested for both platforms on the Linux CI host).
+fn agent_restart_hint_for(mac: bool) -> &'static str {
+    if mac {
+        "sudo launchctl kickstart -k system/com.innerwarden.agent"
+    } else {
+        "sudo systemctl restart innerwarden-agent"
+    }
 }
 
 fn confirm_install<R: std::io::BufRead>(yes: bool, input: &mut R) -> Result<bool> {
@@ -788,14 +843,27 @@ fn install_classifier_archive(url: &str, expected_sha: &str, target_dir: &str) -
     }
 
     println!("[3/3] Extracting into {target_dir}...");
-    let status = Command::new("tar")
+    // Capture stderr so we can drop the harmless macOS-xattr noise: the model
+    // tarball is packaged on macOS, which stamps `com.apple.provenance` extended
+    // headers that GNU tar on Linux doesn't recognise and warns about once per
+    // file ("Ignoring unknown extended header keyword 'LIBARCHIVE.xattr...'").
+    // The files extract fine; the warnings just look alarming. We filter only
+    // those lines and pass any real tar error through. Portable (no
+    // GNU-tar-only `--warning=` flag that would break bsdtar on macOS).
+    let output = Command::new("tar")
         .args(["-xzf"])
         .arg(&tmp)
         .args(["-C", target_dir])
-        .status()
+        .output()
         .map_err(|e| anyhow::anyhow!("spawn tar: {e}"))?;
-    if !status.success() {
-        anyhow::bail!("tar failed (exit {status})");
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if line.contains("Ignoring unknown extended header keyword") {
+            continue;
+        }
+        eprintln!("{line}");
+    }
+    if !output.status.success() {
+        anyhow::bail!("tar failed (exit {})", output.status);
     }
     let _ = std::fs::remove_file(&tmp);
     Ok(())
@@ -817,6 +885,25 @@ mod tests {
     use std::process::Command as ProcessCommand;
     use std::sync::{Mutex, OnceLock};
     use std::thread;
+
+    /// F6 anchor (2026-07-01): the post-install restart hint uses the host's
+    /// real service manager — launchd on macOS, systemd elsewhere.
+    #[test]
+    fn agent_restart_hint_matches_platform() {
+        let h = agent_restart_hint();
+        if cfg!(target_os = "macos") {
+            assert!(h.contains("launchctl"));
+            assert!(!h.contains("systemctl"));
+        } else {
+            assert!(h.contains("systemctl restart innerwarden-agent"));
+        }
+    }
+
+    #[test]
+    fn agent_restart_hint_for_both_platforms() {
+        assert!(agent_restart_hint_for(true).contains("launchctl kickstart"));
+        assert!(agent_restart_hint_for(false).contains("systemctl restart innerwarden-agent"));
+    }
     use tempfile::TempDir;
 
     fn install_archive_lock() -> &'static Mutex<()> {
@@ -1143,6 +1230,48 @@ mod tests {
 
         let env = std::fs::read_to_string(tmp.path().join("agent.env")).expect("read agent env");
         assert_eq!(env, "OPENAI_API_KEY=sk-test\n");
+    }
+
+    #[test]
+    fn cmd_configure_ai_azure_requires_base_url() {
+        // Azure has no fixed endpoint; configuring it without --base-url would
+        // write a config that silently 404s. Fail loudly instead.
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+
+        let err = cmd_configure_ai(&cli, "azure_openai", Some("k"), Some("dep"), None)
+            .expect_err("azure must require a base url");
+        assert!(err.to_string().contains("requires --base-url"));
+    }
+
+    #[test]
+    fn cmd_configure_ai_azure_alias_writes_api_version_and_provider() {
+        // `azure` is aliased to `azure_openai` and a working api_version default
+        // is written so the agent's chat endpoint is valid out of the box.
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), false);
+
+        cmd_configure_ai_with_restart(
+            &cli,
+            "azure",
+            Some("azure-key"),
+            Some("gpt-5.4-mini"),
+            Some("https://res.openai.azure.com"),
+            false,
+        )
+        .expect("azure configure should write temp config");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("provider = \"azure_openai\""));
+        assert!(agent.contains("model = \"gpt-5.4-mini\""));
+        assert!(agent.contains("base_url = \"https://res.openai.azure.com\""));
+        assert!(
+            agent.contains(&format!("api_version = \"{AZURE_DEFAULT_API_VERSION}\"")),
+            "azure config must persist a non-empty api_version: {agent}"
+        );
+
+        let env = std::fs::read_to_string(tmp.path().join("agent.env")).expect("read agent env");
+        assert_eq!(env, "AZURE_OPENAI_API_KEY=azure-key\n");
     }
 
     #[test]

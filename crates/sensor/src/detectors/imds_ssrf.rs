@@ -259,6 +259,20 @@ impl ImdsSsrfDetector {
             }
         }
 
+        // Cloud-platform guest-agent gate (NON-IP), covers the INTERPRETER case
+        // the exe-prefix list above misses: on Azure the guest agent runs as
+        // `python3 -u /usr/sbin/waagent` and its extension-handler children run
+        // a RELATIVE WALinuxAgent egg path, so `exe=/usr/bin/python3.12` is not
+        // a trusted prefix. `cloud_platform::is_guest_agent` resolves the real
+        // identity from the script arg (root-owned /usr/sbin/waagent) and the
+        // parent lineage. Gated on a detected cloud VM + uid 0; downgrade-only,
+        // so a webserver runtime (uid != 0) hitting IMDS still escalates to
+        // Critical below. Closes the Azure IMDS needs_review flood (869/7d,
+        // prod audit 2026-06-26).
+        if uid != u64::MAX && crate::cloud_platform::is_guest_agent(pid, uid as u32) {
+            return None;
+        }
+
         let now = event.ts;
         if let Some(&last) = self.alerted.get(comm) {
             if now - last < self.cooldown {

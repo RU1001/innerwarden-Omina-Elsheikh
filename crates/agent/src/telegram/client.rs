@@ -11,9 +11,9 @@ use tracing::{info, warn};
 use super::explain_detector;
 use super::formatting::{
     callback_data, country_flag_emoji, enforce_length, entity_summary, escape_html,
-    first_ip_entity, format_incident_message, format_simple_message, parse_callback, plain_action,
-    reputation_action_phrase, reputation_score_bar, reputation_tier_label, sanitize_url,
-    severity_label, source_icon, strip_bot_suffix,
+    first_ip_entity, format_incident_message, format_simple_message, host_tag, parse_callback,
+    plain_action, reputation_action_phrase, reputation_score_bar, reputation_tier_label,
+    sanitize_url, severity_label, source_icon, strip_bot_suffix,
 };
 use super::{ApprovalResult, GuardianMode};
 
@@ -243,7 +243,10 @@ impl TelegramClient {
                             }),
                             serde_json::json!({
                                 "text": "🙈 Ignore",
-                                "callback_data": "quick:ignore"
+                                // Carry the incident id so the tap records a real
+                                // false-positive signal (routed to __fp__ like the
+                                // fp: button), not just a toast that claims it did.
+                                "callback_data": callback_data("quick:ignore:", &incident.incident_id)
                             }),
                         ]);
 
@@ -283,13 +286,16 @@ impl TelegramClient {
         target: &str,
         incident_title: &str,
         confidence: f32,
-        _host: &str,
+        host: &str,
         dry_run: bool,
         reputation: Option<&crate::abuseipdb::IpReputation>,
         geo: Option<&crate::geoip::GeoInfo>,
         cloudflare_pushed: bool,
     ) -> Result<()> {
         let pct = (confidence * 100.0) as u32;
+        // Name the server this action was taken on (operator principle: every
+        // notification names the server). Empty for a blank/unknown host.
+        let host_tag = host_tag(host);
 
         // Build optional enrichment block
         let mut enrichment = String::new();
@@ -318,24 +324,24 @@ impl TelegramClient {
 
         let text = if dry_run {
             format!(
-                "\u{1f9ea} <b>Simulation</b>\n\
+                "\u{1f9ea} <b>Simulation</b>{host_tag}\n\
                  \n\
                  Would have {action_label} <code>{target}</code>\n\
                  {enrichment}\n\
                  <i>{incident_title}</i>\n\
                  \n\
-                 Confidence: {pct}% \u{2014} dry-run, no real action.\n\
+                 Confidence: {pct}%. Dry-run, no real action.\n\
                  <i>Enable live mode to let me handle these.</i>",
                 target = escape_html(target),
                 incident_title = escape_html(incident_title),
             )
         } else if action_label.to_lowercase().contains("ignore") {
             format!(
-                "\u{2705} <b>Analyzed &amp; cleared</b>\n\
+                "\u{2705} <b>Analyzed &amp; cleared</b>{host_tag}\n\
                  \n\
                  <i>{incident_title}</i>{enrichment}\n\
                  \n\
-                 Confidence: {pct}% \u{2014} no action needed.",
+                 Confidence: {pct}%. No action needed.",
                 incident_title = escape_html(incident_title),
             )
         } else {
@@ -346,12 +352,12 @@ impl TelegramClient {
                 _ => "Contained. Keeping watch.",
             };
             format!(
-                "\u{1f6e1}\u{fe0f} <b>Threat neutralized</b>\n\
+                "\u{1f6e1}\u{fe0f} <b>Threat neutralized</b>{host_tag}\n\
                  \n\
                  {action_label} <code>{target}</code>{enrichment}\n\
                  <i>{incident_title}</i>\n\
                  \n\
-                 Confidence: {pct}% \u{2014} {kill_quip}{cf_line}",
+                 Confidence: {pct}%. {kill_quip}{cf_line}",
                 target = escape_html(target),
                 incident_title = escape_html(incident_title),
             )
@@ -390,7 +396,7 @@ impl TelegramClient {
                 // Send one final warning, then stop
                 let warning = format!(
                     "\u{26a0}\u{fe0f} <b>Alert flood detected</b>\n\n\
-                     {} alerts this hour — pausing automated notifications.\n\
+                     {} alerts this hour. Pausing automated notifications.\n\
                      Check the dashboard for details. Alerts resume next hour.",
                     count
                 );
@@ -1188,25 +1194,46 @@ impl TelegramClient {
 
     /// Register the bot's persistent command menu (shown in the text input).
     /// Called once at startup.
-    pub async fn set_commands(&self) {
-        let body = serde_json::json!({
-            "commands": [
-                { "command": "status",       "description": "Guardian status - mode, AI, threat intel" },
+    /// Register the bot's persistent command menu, PROFILE-AWARE so a
+    /// non-technical operator (the "simple" profile) sees a tiny, obvious set
+    /// and is never confronted with admin jargon, while the technical profile
+    /// gets the full control surface. The audit found a flat 13-command menu
+    /// (with the lie-by-button /guard + /watch) was the main "confunde o
+    /// usuário" problem; this is the de-clutter. /guard + /watch are dropped
+    /// from the menu in favour of the actuating /mode (both still work if typed
+    /// for back-compat). `simple` comes from `cfg.telegram.is_simple_profile()`.
+    pub async fn set_commands(&self, simple: bool) {
+        let body = serde_json::json!({ "commands": Self::command_menu(simple) });
+        let _ = self.post_json("setMyCommands", &body).await;
+    }
+
+    /// The profile-aware command list (pure, so it is unit-testable). Lay menu =
+    /// 5 plain commands; technical menu = the 11-command control surface. Neither
+    /// carries the dropped lie-by-button /guard or /watch (replaced by /mode).
+    fn command_menu(simple: bool) -> serde_json::Value {
+        if simple {
+            serde_json::json!([
+                { "command": "status",  "description": "Is my server safe right now?" },
+                { "command": "threats", "description": "Who tried to attack, and what I did" },
+                { "command": "mode",    "description": "Turn auto-defend on or off" },
+                { "command": "ask",     "description": "Ask me anything about your server" },
+                { "command": "help",    "description": "What I can do" }
+            ])
+        } else {
+            serde_json::json!([
+                { "command": "status",       "description": "Guardian status: mode, AI, threat intel" },
                 { "command": "threats",      "description": "Recent intrusion attempts" },
                 { "command": "decisions",    "description": "Actions I've taken" },
                 { "command": "blocked",      "description": "Threat actors currently contained" },
-                { "command": "capabilities", "description": "List all capabilities and their status" },
-                { "command": "enable",       "description": "Enable a capability - /enable block-ip" },
-                { "command": "disable",      "description": "Disable a capability - /disable ai" },
+                { "command": "posture",      "description": "Live host posture: sshd, sudo, firewall" },
+                { "command": "mode",         "description": "Set defend mode: guard, watch, dryrun" },
+                { "command": "capabilities", "description": "List capabilities and their status" },
                 { "command": "doctor",       "description": "Full health check with fix hints" },
-                { "command": "guard",        "description": "Activate auto-defend mode" },
-                { "command": "watch",        "description": "Switch to passive monitor mode" },
-                { "command": "ask",          "description": "Ask me anything - I know my config" },
+                { "command": "ask",          "description": "Ask about config, incidents, posture" },
                 { "command": "undo",         "description": "Undo recent allowlist additions" },
                 { "command": "help",         "description": "Operator command playbook" }
-            ]
-        });
-        let _ = self.post_json("setMyCommands", &body).await;
+            ])
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1226,14 +1253,19 @@ impl TelegramClient {
     ///
     /// Telegram chat ids are always `i64`. When the configured `chat_id` is a
     /// numeric id (every real deployment) the sender's chat id MUST equal it or
-    /// the update is dropped. A non-numeric configured id only occurs on a
-    /// non-functional / misconfigured bot (Telegram rejects non-numeric ids for
-    /// outbound `sendMessage` too), and cannot be matched against an `i64`
-    /// sender, so it is not enforced rather than silently dropping every update.
+    /// the update is dropped.
+    ///
+    /// FAIL CLOSED: a non-numeric configured chat_id (a placeholder, a typo, an
+    /// unset env var) cannot be matched against an `i64` sender, so we drop ALL
+    /// updates rather than authorising every sender. Privileged commands now
+    /// reach root (`/enable`, `/disable`) and flip enforcement (`/mode`); a
+    /// misconfigured id must never become an open door. (A bot whose id is
+    /// non-numeric also cannot send outbound, so failing closed only makes an
+    /// already-broken bot inert, never less safe.)
     fn inbound_authorized(&self, chat_id: i64) -> bool {
         match self.chat_id.parse::<i64>() {
             Ok(allowed) => allowed == chat_id,
-            Err(_) => true,
+            Err(_) => false,
         }
     }
 
@@ -1339,12 +1371,38 @@ impl TelegramClient {
                                     if cb_chat_id != 0 {
                                         self.react(cb_chat_id, cb_msg_id, "\u{1f4a1}").await;
                                     }
-                                } else if data == "quick:ignore" {
-                                    // Just ack with toast - no further action needed
+                                } else if let Some(id) = data.strip_prefix("quick:ignore:") {
+                                    // Record a REAL false-positive signal: route the
+                                    // incident through __fp__ exactly like the fp:
+                                    // button so the feedback tracker learns from it.
+                                    // The toast only claims "logged" because it now is.
                                     let _ = self
                                         .answer_callback_toast(
                                             &callback.id,
                                             "👍 Logged as false positive. Keeping eyes on it.",
+                                        )
+                                        .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f44d}").await;
+                                    }
+                                    let result = ApprovalResult {
+                                        incident_id: format!("__fp__:{id}"),
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator.clone(),
+                                        chosen_action: String::new(),
+                                    };
+                                    if approval_tx.send(result).await.is_err() {
+                                        return;
+                                    }
+                                } else if data == "quick:ignore" {
+                                    // Legacy button (pre-id, still in old chat history):
+                                    // no incident id to attribute, so do NOT claim it
+                                    // was logged. Just dismiss honestly.
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            "👍 Dismissed. I'll keep watching.",
                                         )
                                         .await;
                                     if cb_chat_id != 0 {
@@ -1630,6 +1688,17 @@ impl TelegramClient {
                                     "__decisions__".to_string()
                                 } else if text == "/blocked" || text.starts_with("/blocked ") {
                                     "__blocked__".to_string()
+                                } else if text == "/mode" {
+                                    // Bare /mode → show current mode + options.
+                                    "__mode__:".to_string()
+                                } else if let Some(m) = text.strip_prefix("/mode ") {
+                                    // /mode guard|watch|dryrun → live mode change.
+                                    format!("__mode__:{m}")
+                                } else if text == "/unblock" {
+                                    "__unblock__:".to_string()
+                                } else if let Some(ip) = text.strip_prefix("/unblock ") {
+                                    // /unblock <ip> → reverse a containment (2FA).
+                                    format!("__unblock__:{ip}")
                                 } else if text == "/guard" || text.starts_with("/guard ") {
                                     "__guard__".to_string()
                                 } else if text == "/watch" || text.starts_with("/watch ") {
@@ -1648,6 +1717,12 @@ impl TelegramClient {
                                     || text.starts_with("/list ")
                                 {
                                     "__capabilities__".to_string()
+                                } else if text == "/enable" || text == "/disable" {
+                                    // Bare command with no capability argument: reply
+                                    // with usage instead of the generic "unknown
+                                    // command" hint (which makes the user feel they
+                                    // broke it). strip_prefix below needs the arg.
+                                    "__cap_usage__".to_string()
                                 } else if let Some(cap) = text.strip_prefix("/enable ") {
                                     format!("__enable__:{cap}")
                                 } else if let Some(cap) = text.strip_prefix("/disable ") {
@@ -2151,7 +2226,10 @@ mod tests {
 
         Ok(TelegramClient {
             bot_token: "test-token".to_string(),
-            chat_id: "chat-123".to_string(),
+            // Numeric chat id matching the `chat: { id: 99 }` the polling tests
+            // inject, so the (now fail-closed) inbound_authorized gate admits
+            // them. A non-numeric id is dropped by design (see inbound_authorized).
+            chat_id: "99".to_string(),
             dashboard_url: Some("https://dashboard.local".to_string()),
             dev_mode: false,
             http,
@@ -2242,6 +2320,55 @@ mod tests {
     }
 
     #[test]
+    fn command_menu_is_profile_aware_and_decluttered() {
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["command"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let lay = names(&TelegramClient::command_menu(true));
+        let tech = names(&TelegramClient::command_menu(false));
+
+        // Lay menu is tiny and jargon-free.
+        assert_eq!(lay.len(), 5, "lay menu must stay small: {lay:?}");
+        assert_eq!(
+            lay,
+            ["status", "threats", "mode", "ask", "help"],
+            "lay menu content"
+        );
+        // The lay menu's only control is /mode (auto-defend on/off), which is
+        // a real working command, so the menu carries no lie-by-button.
+
+        // Technical menu is the full surface, with /mode and /posture present.
+        assert_eq!(tech.len(), 11, "tech menu size: {tech:?}");
+        assert!(tech.contains(&"mode".to_string()), "tech has /mode");
+        assert!(
+            tech.contains(&"posture".to_string()),
+            "tech promotes /posture"
+        );
+
+        // The dropped lie-by-button commands appear in NEITHER menu.
+        for menu in [&lay, &tech] {
+            assert!(!menu.contains(&"guard".to_string()), "guard dropped");
+            assert!(!menu.contains(&"watch".to_string()), "watch dropped");
+        }
+        // No menu item description carries an em dash (house rule).
+        for v in [
+            TelegramClient::command_menu(true),
+            TelegramClient::command_menu(false),
+        ] {
+            for c in v.as_array().unwrap() {
+                assert!(
+                    !c["description"].as_str().unwrap().contains('\u{2014}'),
+                    "no em dash in menu copy"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn inbound_authorized_enforces_numeric_chat_id() {
         // Numeric operator chat_id (every real deployment): only that chat passes.
         let c = TelegramClient::new("tok", "88", None).expect("client");
@@ -2252,10 +2379,14 @@ mod tests {
             "missing/zero chat must be dropped"
         );
 
-        // Non-numeric configured id (misconfigured/test bot, can't send outbound
-        // either) is not enforced rather than dropping every update.
+        // Non-numeric configured id (placeholder/typo/unset) FAILS CLOSED: every
+        // update is dropped rather than authorising any sender for privileged
+        // commands (/mode, /enable). A misconfigured id is never an open door.
         let c2 = TelegramClient::new("tok", "chat-123", None).expect("client");
-        assert!(c2.inbound_authorized(42));
+        assert!(
+            !c2.inbound_authorized(42),
+            "non-numeric id must drop all senders"
+        );
     }
 
     #[test]
@@ -2334,7 +2465,7 @@ mod tests {
             .find(|r| r.path.ends_with("/sendMessage"))
             .expect("sendMessage request should be emitted");
         assert_eq!(send_message.method, "POST");
-        assert_eq!(send_message.body["chat_id"], "chat-123");
+        assert_eq!(send_message.body["chat_id"], "99");
         assert!(send_message.body["text"]
             .as_str()
             .unwrap_or("")
@@ -2390,7 +2521,7 @@ mod tests {
                         "id": "cb-1",
                         "from": { "first_name": "Alice" },
                         "data": "quick:block:1.2.3.4",
-                        "message": { "message_id": 1001, "chat": { "id": 42 } }
+                        "message": { "message_id": 1001, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2399,7 +2530,7 @@ mod tests {
                         "id": "cb-2",
                         "from": { "first_name": "Alice" },
                         "data": "hpot:monitor:2.2.2.2",
-                        "message": { "message_id": 1002, "chat": { "id": 42 } }
+                        "message": { "message_id": 1002, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2408,7 +2539,7 @@ mod tests {
                         "id": "cb-3",
                         "from": { "first_name": "Alice" },
                         "data": "allow:proc:sshd",
-                        "message": { "message_id": 1003, "chat": { "id": 42 } }
+                        "message": { "message_id": 1003, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2417,7 +2548,7 @@ mod tests {
                         "id": "cb-4",
                         "from": { "first_name": "Alice" },
                         "data": "allow:ip:10.0.0.1",
-                        "message": { "message_id": 1004, "chat": { "id": 42 } }
+                        "message": { "message_id": 1004, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2426,7 +2557,7 @@ mod tests {
                         "id": "cb-5",
                         "from": { "first_name": "Alice" },
                         "data": "fp:incident-123",
-                        "message": { "message_id": 1005, "chat": { "id": 42 } }
+                        "message": { "message_id": 1005, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2435,7 +2566,7 @@ mod tests {
                         "id": "cb-6",
                         "from": { "first_name": "Alice" },
                         "data": "autofp:yes:proc:sshd",
-                        "message": { "message_id": 1006, "chat": { "id": 42 } }
+                        "message": { "message_id": 1006, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2444,7 +2575,7 @@ mod tests {
                         "id": "cb-7",
                         "from": { "first_name": "Alice" },
                         "data": "undo:proc:sshd",
-                        "message": { "message_id": 1007, "chat": { "id": 42 } }
+                        "message": { "message_id": 1007, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2453,7 +2584,7 @@ mod tests {
                         "id": "cb-8",
                         "from": { "first_name": "Alice" },
                         "data": "enable2fa",
-                        "message": { "message_id": 1008, "chat": { "id": 42 } }
+                        "message": { "message_id": 1008, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2462,7 +2593,7 @@ mod tests {
                         "id": "cb-9",
                         "from": { "first_name": "Alice" },
                         "data": "menu:status",
-                        "message": { "message_id": 1009, "chat": { "id": 42 } }
+                        "message": { "message_id": 1009, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2471,7 +2602,7 @@ mod tests {
                         "id": "cb-10",
                         "from": { "first_name": "Alice" },
                         "data": "dismiss2fa",
-                        "message": { "message_id": 1010, "chat": { "id": 42 } }
+                        "message": { "message_id": 1010, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2480,7 +2611,7 @@ mod tests {
                         "message_id": 1011,
                         "text": "/enable ai",
                         "from": { "first_name": "Alice" },
-                        "chat": { "id": 42 }
+                        "chat": { "id": 99 }
                     }
                 },
                 {
@@ -2489,7 +2620,7 @@ mod tests {
                         "id": "cb-12",
                         "from": { "first_name": "Alice" },
                         "data": "review:dismiss:kill_chain:9.9.9.9:test",
-                        "message": { "message_id": 1012, "chat": { "id": 42 } }
+                        "message": { "message_id": 1012, "chat": { "id": 99 } }
                     }
                 }
             ]
@@ -2684,6 +2815,7 @@ mod tests {
             signals: vec!["dangerous_command".to_string()],
             atr_rule_ids: vec!["ATR-001".to_string()],
             explanation: "dangerous operation".to_string(),
+            tenant: None,
         };
         client.send_agent_guard_alert(&guard_alert).await?;
 
@@ -2754,7 +2886,8 @@ mod tests {
         client.react_eyes(42, 100).await;
         client.react(42, 101, "✅").await;
         client.send_typing().await;
-        client.set_commands().await;
+        client.set_commands(true).await;
+        client.set_commands(false).await;
 
         let dir = tempfile::tempdir()?;
         let allowlist_path = dir.path().join("allowlist.toml");
@@ -2899,6 +3032,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quick_ignore_records_fp_and_bare_enable_shows_usage() -> anyhow::Result<()> {
+        // quick:ignore:<id> must route a REAL false-positive (__fp__:<id>) to the
+        // feedback tracker (it previously only showed a toast claiming it did),
+        // and bare /enable / /disable must route to the usage sentinel instead of
+        // the generic unknown-command hint.
+        let updates = vec![json!({
+            "ok": true,
+            "result": [
+                {
+                    "update_id": 41,
+                    "callback_query": {
+                        "id": "cb-41",
+                        "from": { "first_name": "Bob" },
+                        "data": "quick:ignore:inc-99",
+                        "message": { "message_id": 4041, "chat": { "id": 99 } }
+                    }
+                },
+                {
+                    "update_id": 42,
+                    "message": {
+                        "message_id": 4042,
+                        "text": "/enable",
+                        "from": { "first_name": "Bob" },
+                        "chat": { "id": 99 }
+                    }
+                },
+                {
+                    "update_id": 43,
+                    "message": {
+                        "message_id": 4043,
+                        "text": "/disable",
+                        "from": { "first_name": "Bob" },
+                        "chat": { "id": 99 }
+                    }
+                }
+            ]
+        })];
+
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port, cert_dir.path())?);
+        let (tx, mut rx) = mpsc::channel::<ApprovalResult>(16);
+        let mut task = tokio::spawn(client.run_polling(tx));
+
+        let mut ids = Vec::new();
+        while let Ok(Some(r)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            ids.push(r.incident_id);
+            if ids.len() >= 3 {
+                break;
+            }
+        }
+        assert!(
+            ids.iter().any(|id| id == "__fp__:inc-99"),
+            "quick:ignore:<id> must record a real false positive (__fp__:<id>), got {ids:?}"
+        );
+        assert_eq!(
+            ids.iter()
+                .filter(|id| id.as_str() == "__cap_usage__")
+                .count(),
+            2,
+            "bare /enable and /disable must both route to __cap_usage__, got {ids:?}"
+        );
+
+        drop(rx);
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn get_updates_returns_empty_when_result_cannot_deserialize() -> anyhow::Result<()> {
         let updates = vec![json!({
             "ok": true,
@@ -2999,6 +3206,7 @@ mod tests {
             signals: vec![],
             atr_rule_ids: vec![],
             explanation: "needs operator review".to_string(),
+            tenant: None,
         };
         client.send_agent_guard_alert(&medium_review_alert).await?;
         let low_monitor_alert = crate::dashboard::AgentGuardAlert {
@@ -3011,6 +3219,7 @@ mod tests {
             signals: vec!["odd_file_access".to_string()],
             atr_rule_ids: vec![],
             explanation: "watching low-risk behavior".to_string(),
+            tenant: None,
         };
         client.send_agent_guard_alert(&low_monitor_alert).await?;
 
@@ -3121,7 +3330,7 @@ mod tests {
                     "id": "cb-301",
                     "from": { "first_name": "Dana" },
                     "data": "hpot:honeypot:3.3.3.3",
-                    "message": { "message_id": 3001, "chat": { "id": 77 } }
+                    "message": { "message_id": 3001, "chat": { "id": 99 } }
                 }
             }),
             json!({
@@ -3130,7 +3339,7 @@ mod tests {
                     "id": "cb-302",
                     "from": { "first_name": "Dana" },
                     "data": "hpot:block:4.4.4.4",
-                    "message": { "message_id": 3002, "chat": { "id": 77 } }
+                    "message": { "message_id": 3002, "chat": { "id": 99 } }
                 }
             }),
             json!({
@@ -3139,7 +3348,7 @@ mod tests {
                     "id": "cb-303",
                     "from": { "first_name": "Dana" },
                     "data": "hpot:ignore:5.5.5.5",
-                    "message": { "message_id": 3003, "chat": { "id": 77 } }
+                    "message": { "message_id": 3003, "chat": { "id": 99 } }
                 }
             }),
         ];
@@ -3169,7 +3378,7 @@ mod tests {
                     "message_id": 3100 + idx as i64,
                     "text": text_command,
                     "from": { "first_name": "Dana" },
-                    "chat": { "id": 77 }
+                    "chat": { "id": 99 }
                 }
             }));
         }

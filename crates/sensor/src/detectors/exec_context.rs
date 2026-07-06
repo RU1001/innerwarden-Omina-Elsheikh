@@ -234,6 +234,12 @@ pub fn classify_with_boot_window(event: &Event, in_boot_window: bool) -> ExecCon
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let uid = details.get("uid").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Controlling-terminal proof, populated by the execve emitter from the
+    // PARENT's /proc/<pid>/stat tty_nr. Missing ⇒ false (surface it). See below.
+    let has_tty = details
+        .get("has_tty")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if in_boot_window || is_motd_parent(parent_comm) {
         return ExecContext::BootOrMotd;
@@ -247,7 +253,17 @@ pub fn classify_with_boot_window(event: &Event, in_boot_window: bool) -> ExecCon
         return ExecContext::Automation;
     }
 
-    if uid > SYSTEM_UID_MAX && is_interactive_shell_parent(parent_comm) {
+    // OpInteractive (the discovery free-pass for "operator running whoami from
+    // their ssh shell") requires a REAL interactive session, not just a parent
+    // named like a shell. parent_comm is forgeable (`prctl(PR_SET_NAME,"bash")`)
+    // and even a genuine `bash -c` spawned by cron/systemd/an implant matches the
+    // name — so the name alone silenced the ENTIRE discovery tactic for any
+    // implant parented by a shell (evasion audit E3, re-opening the spec-050 gap).
+    // The controlling tty is the discriminator: an interactive ssh shell owns a
+    // pts (tty_nr ≠ 0); an implant / reverse shell / daemon-spawned shell has
+    // none. No tty ⇒ fall through to AttackerInferred and let the discovery
+    // detectors + their thresholds + AI triage decide.
+    if uid > SYSTEM_UID_MAX && is_interactive_shell_parent(parent_comm) && has_tty {
         return ExecContext::OpInteractive;
     }
 
@@ -300,6 +316,38 @@ pub fn proc_comm(pid: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Does `pid` have a controlling terminal? Reads `tty_nr` from
+/// `/proc/<pid>/stat` (nonzero ⇒ an attached tty/pts). This is the signal
+/// that distinguishes a REAL interactive operator shell (ssh session → pts,
+/// tty_nr ≠ 0) from a programmatic shell with no terminal — an implant, a
+/// reverse shell, a `bash -c` spawned by cron/systemd, a sandcat agent
+/// (tty_nr == 0). The execve emitter calls this on the PARENT pid (the
+/// long-lived shell, not the microsecond-lived recon child) and stashes the
+/// result as `has_tty` so the classifier stays I/O-free.
+///
+/// `/proc/<pid>/stat` layout: `pid (comm) state ppid pgrp session tty_nr …`.
+/// `comm` may contain spaces and parens, so fields are parsed after the LAST
+/// `)`; tty_nr is then the 5th whitespace field. Best-effort: a missing
+/// file / unparseable line returns false (the safe, surface-it default).
+pub fn proc_has_tty(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(idx) = stat.rfind(')') else {
+        return false;
+    };
+    // after ')': [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr
+    stat[idx + 1..]
+        .split_whitespace()
+        .nth(4)
+        .and_then(|t| t.parse::<i64>().ok())
+        .map(|tty_nr| tty_nr != 0)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +355,13 @@ mod tests {
     use innerwarden_core::event::Severity;
     use serde_json::json;
 
-    fn exec_event(comm: &str, parent_comm: &str, uid: u64, command: &str) -> Event {
+    fn exec_event_tty(
+        comm: &str,
+        parent_comm: &str,
+        uid: u64,
+        command: &str,
+        has_tty: bool,
+    ) -> Event {
         Event {
             ts: Utc::now(),
             host: "test".into(),
@@ -321,6 +375,7 @@ mod tests {
                 "ppid": 999,
                 "comm": comm,
                 "parent_comm": parent_comm,
+                "has_tty": has_tty,
                 "command": command,
                 "argv": [command],
                 "argc": 1,
@@ -328,6 +383,12 @@ mod tests {
             tags: vec![],
             entities: vec![],
         }
+    }
+
+    /// Default helper: an interactive session (has_tty = true). The non-tty
+    /// (implant) case uses `exec_event_tty(.., false)`.
+    fn exec_event(comm: &str, parent_comm: &str, uid: u64, command: &str) -> Event {
+        exec_event_tty(comm, parent_comm, uid, command, true)
     }
 
     #[test]
@@ -339,6 +400,44 @@ mod tests {
         let ctx = classify_with_boot_window(&ev, false);
         assert_eq!(ctx, ExecContext::OpInteractive);
         assert!(ctx.is_benign());
+    }
+
+    /// Regression anchor (evasion audit E3, 2026-06-20): an implant parented by
+    /// a shell — either a renamed parent (`prctl(PR_SET_NAME,"bash")`) or a real
+    /// `bash -c` spawned by cron/systemd/a reverse shell — has uid > 999 and a
+    /// shell-named parent, so the NAME-only check granted it OpInteractive and
+    /// silenced the ENTIRE discovery tactic (re-opening the spec-050 gap). With no
+    /// controlling tty it must now classify AttackerInferred so the discovery
+    /// detectors run. The operator's live interactive shell (has_tty) is unchanged.
+    #[test]
+    fn shell_parented_implant_without_tty_is_attacker_inferred() {
+        let ev = exec_event_tty("whoami", "bash", 1000, "whoami", false);
+        let ctx = classify_with_boot_window(&ev, false);
+        assert_eq!(
+            ctx,
+            ExecContext::AttackerInferred,
+            "a shell-named parent with NO controlling tty is not a real interactive \
+             session and must not get the discovery free-pass"
+        );
+        assert!(!ctx.is_benign());
+        // The same command WITH a tty (genuine operator ssh shell) stays benign.
+        let ev_tty = exec_event_tty("whoami", "bash", 1000, "whoami", true);
+        assert_eq!(
+            classify_with_boot_window(&ev_tty, false),
+            ExecContext::OpInteractive
+        );
+    }
+
+    /// A missing `has_tty` field (non-eBPF source, e.g. auditd) defaults to the
+    /// safe "surface it" direction — no OpInteractive free-pass on identity alone.
+    #[test]
+    fn missing_has_tty_defaults_to_not_op_interactive() {
+        let mut ev = exec_event_tty("whoami", "bash", 1000, "whoami", true);
+        ev.details.as_object_mut().unwrap().remove("has_tty");
+        assert_eq!(
+            classify_with_boot_window(&ev, false),
+            ExecContext::AttackerInferred
+        );
     }
 
     #[test]

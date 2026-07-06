@@ -73,6 +73,14 @@ pub(crate) fn process_event(
     let mut ev = ev;
     let persist = detectors.event_pipeline.should_persist(&mut ev);
 
+    // Record the in-flight event's container scope so every incident this event
+    // produces (at any of the ~80 detector emit sites) is attributed to its tenant
+    // by `write_incident` -> `stamp_tenancy`, without threading the event through
+    // each site. Overwritten each event; host events clear it to None. (spec 084)
+    let (container_id, pod_uid) = container_scope(&ev);
+    stats.current_container_id = container_id;
+    stats.current_pod_uid = pod_uid;
+
     // Per-event diagnostic at trace level: at prod's default INFO this logged
     // one line for *every* event (~27/s on a busy host => ~2.3M journald lines
     // /day), drowning real logs and bloating the journal. Keep it available
@@ -984,16 +992,73 @@ pub(crate) fn process_security_signal(
         seq = sig.seq,
         "emergency-lane security signal (prio saturated)"
     );
+    // The emergency lane dropped the full event, so there is no container scope
+    // to attribute (and a stale scope from a prior process_event must not leak).
+    stats.current_container_id = None;
+    stats.current_pod_uid = None;
     write_incident(sqlite, stats, incident, syslog, dedup_cache);
+}
+
+/// Extract the container scope (`container_id`, `pod_uid`) the eBPF collector
+/// stamped onto a container-scoped event's `details` (`attach_pod_runtime`).
+/// Empty strings are treated as absent. Host / non-container events yield
+/// `(None, None)`. Pure, so it is unit-testable independent of the dispatch loop.
+fn container_scope(ev: &innerwarden_core::event::Event) -> (Option<String>, Option<String>) {
+    let nonempty = |key: &str| {
+        ev.details
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    (nonempty("container_id"), nonempty("pod_uid"))
+}
+
+/// Spec 084: propagate the triggering event's Kubernetes container identity onto
+/// the incident so the agent's tenancy resolver can attribute it to a tenant.
+///
+/// The eBPF collector stamps `container_id` (+ `pod_uid`) onto container-scoped
+/// events; detectors hand-build their incidents and drop it (verified: reverse_shell
+/// / crypto_miner incidents carry no container_id). `process_event` records the
+/// in-flight event's scope on `WriteStats`, and we re-attach it here at the single
+/// sink chokepoint — so it is universal across all ~80 detectors WITHOUT threading
+/// the event through every emit site. The channel is the one `agent::tenancy::
+/// enrich_incident` reads that is independent of each detector's evidence shape:
+/// an `EntityType::Container` entity. The agent's pod cache resolves the tenant from
+/// the 12-char container id alone (`container_id -> pod_uid -> PodIdentity`), so
+/// `pod_uid` is not required for attribution; we still copy `pod_uid` into evidence
+/// opportunistically, but ONLY when evidence is already a JSON object (most detectors
+/// use an array, where a top-level key would be unreadable anyway — and we must never
+/// flip the shape, since many agent consumers require `evidence.as_array()`). Host /
+/// non-container events have an empty scope, so this is a no-op: no false tenancy.
+fn stamp_tenancy(incident: &mut innerwarden_core::incident::Incident, stats: &WriteStats) {
+    use innerwarden_core::entities::{EntityRef, EntityType};
+    if let Some(cid) = &stats.current_container_id {
+        let already = incident
+            .entities
+            .iter()
+            .any(|e| e.r#type == EntityType::Container && &e.value == cid);
+        if !already {
+            incident.entities.push(EntityRef::container(cid.clone()));
+        }
+    }
+    if let Some(pod) = &stats.current_pod_uid {
+        if let Some(obj) = incident.evidence.as_object_mut() {
+            obj.entry("pod_uid".to_string())
+                .or_insert_with(|| pod.clone().into());
+        }
+    }
 }
 
 fn write_incident(
     sqlite: &SqliteWriter,
     stats: &mut WriteStats,
-    incident: innerwarden_core::incident::Incident,
+    mut incident: innerwarden_core::incident::Incident,
     syslog: &mut Option<sinks::syslog_cef::SyslogCefWriter>,
     dedup_cache: &mut HashMap<u32, (chrono::DateTime<chrono::Utc>, u8)>,
 ) {
+    // Attribute to the in-flight event's container scope (recorded by process_event).
+    stamp_tenancy(&mut incident, stats);
     // Cross-detector dedup: if the same PID had an incident in the last 10s,
     // only keep the highest severity. This prevents duplicate alerts when
     // multiple detectors fire for the same activity.
@@ -1185,6 +1250,233 @@ mod tests {
         assert_eq!(
             stats.incidents_written, 2,
             "equal severity should be suppressed, but a later higher severity must be retained"
+        );
+    }
+
+    // ---- Spec 084: detector -> incident container/pod propagation ----
+
+    fn container_event(
+        container_id: &str,
+        pod_uid: Option<&str>,
+    ) -> innerwarden_core::event::Event {
+        let mut ev = test_event("ebpf.openat", innerwarden_core::event::Severity::High);
+        if let Some(obj) = ev.details.as_object_mut() {
+            obj.insert("container_id".to_string(), container_id.into());
+            if let Some(p) = pod_uid {
+                obj.insert("pod_uid".to_string(), p.into());
+            }
+        }
+        ev
+    }
+
+    /// A WriteStats carrying the in-flight container scope, as `process_event`
+    /// would have set it before reaching `write_incident`.
+    fn scoped_stats(container_id: Option<&str>, pod_uid: Option<&str>) -> WriteStats {
+        WriteStats {
+            current_container_id: container_id.map(str::to_string),
+            current_pod_uid: pod_uid.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn container_entities(incident: &innerwarden_core::incident::Incident) -> Vec<String> {
+        use innerwarden_core::entities::EntityType;
+        incident
+            .entities
+            .iter()
+            .filter(|e| e.r#type == EntityType::Container)
+            .map(|e| e.value.clone())
+            .collect()
+    }
+
+    #[test]
+    fn container_scope_extracts_and_filters_empty() {
+        // Container event -> both fields.
+        let ev = container_event("4858a7b75b55", Some("pod-123"));
+        assert_eq!(
+            container_scope(&ev),
+            (
+                Some("4858a7b75b55".to_string()),
+                Some("pod-123".to_string())
+            )
+        );
+        // Empty strings are treated as absent (no bogus scope).
+        let ev = container_event("", None);
+        assert_eq!(container_scope(&ev), (None, None));
+        // Host event (no container_id key at all) -> empty scope, no false tenancy.
+        let host = test_event(
+            "auth.login_failed",
+            innerwarden_core::event::Severity::Medium,
+        );
+        assert!(host.details.get("container_id").is_none());
+        assert_eq!(container_scope(&host), (None, None));
+    }
+
+    #[test]
+    fn stamp_tenancy_propagates_container_entity_from_scope() {
+        // A detector built an array-evidence incident (the common shape); the
+        // in-flight event's scope carries the container id.
+        let stats = scoped_stats(Some("4858a7b75b55"), None);
+        let mut incident = test_incident(7, innerwarden_core::event::Severity::High);
+        let before = incident.evidence.clone();
+
+        stamp_tenancy(&mut incident, &stats);
+
+        assert_eq!(
+            container_entities(&incident),
+            vec!["4858a7b75b55".to_string()],
+            "the container id must be re-attached as a Container entity (the channel the agent reads)"
+        );
+        // Evidence shape MUST be untouched: many agent consumers require an array.
+        assert_eq!(
+            incident.evidence, before,
+            "array evidence must not be mutated"
+        );
+        assert!(incident.evidence.is_array());
+    }
+
+    #[test]
+    fn stamp_tenancy_is_idempotent() {
+        // An incident that already carries the same container entity (the
+        // credential_harvest detector does this) must not gain a duplicate.
+        let stats = scoped_stats(Some("4858a7b75b55"), None);
+        let mut incident = test_incident(7, innerwarden_core::event::Severity::High);
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::container(
+                "4858a7b75b55",
+            ));
+
+        stamp_tenancy(&mut incident, &stats);
+
+        assert_eq!(
+            container_entities(&incident),
+            vec!["4858a7b75b55".to_string()],
+            "exactly one container entity — no duplicate"
+        );
+    }
+
+    // CROSS-TEST: a host / non-container event must NEVER attach a container entity.
+    // This is the no-false-tenancy invariant: a host process's incident must not be
+    // attributed to any tenant. If a future change drops the empty-scope guard this
+    // fails before it can ship.
+    #[test]
+    fn stamp_tenancy_host_scope_leaves_incident_unstamped() {
+        let stats = scoped_stats(None, None); // host event -> no scope
+        let mut incident = test_incident(7, innerwarden_core::event::Severity::High);
+        let before = incident.evidence.clone();
+
+        stamp_tenancy(&mut incident, &stats);
+
+        assert!(
+            container_entities(&incident).is_empty(),
+            "host incident must carry NO container entity (no false tenancy)"
+        );
+        assert_eq!(
+            incident.evidence, before,
+            "evidence byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn stamp_tenancy_sets_pod_uid_only_for_object_evidence() {
+        let pod = "13e125db-0000-4000-8000-000000000000";
+        let stats = scoped_stats(Some("4858a7b75b55"), Some(pod));
+
+        // (a) object evidence -> pod_uid is added.
+        let mut obj_incident = test_incident(7, innerwarden_core::event::Severity::High);
+        obj_incident.evidence = serde_json::json!({ "pid": 7, "comm": "curl" });
+        stamp_tenancy(&mut obj_incident, &stats);
+        assert_eq!(
+            obj_incident
+                .evidence
+                .get("pod_uid")
+                .and_then(|v| v.as_str()),
+            Some(pod),
+            "object evidence gains the pod_uid key"
+        );
+
+        // (b) array evidence -> evidence untouched (no shape flip, no panic).
+        let mut arr_incident = test_incident(7, innerwarden_core::event::Severity::High);
+        let before = arr_incident.evidence.clone();
+        stamp_tenancy(&mut arr_incident, &stats);
+        assert_eq!(
+            arr_incident.evidence, before,
+            "array evidence stays an array"
+        );
+        // ...but the container entity is still attached (the working channel).
+        assert_eq!(
+            container_entities(&arr_incident),
+            vec!["4858a7b75b55".to_string()]
+        );
+    }
+
+    // Integration: a container event driven through process_event records the
+    // scope (top of process_event) and promotes an incident through write_incident
+    // (where stamp_tenancy runs). The entity-attachment correctness itself is pinned
+    // by the stamp_tenancy unit tests; here we prove the scope actually flows from a
+    // real event to the sink for a container event vs a host event.
+    #[test]
+    fn process_event_records_container_scope_from_the_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteWriter::new(tmp.path(), true).expect("sqlite");
+        let mut detectors = quiet_detector_set(tmp.path());
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = seed_datasets(tmp.path());
+
+        // An LSM-blocked exec is promoted to an incident unconditionally (no detector
+        // needed), so it is a stable way to drive the write_incident path.
+        let mut ev = test_event(
+            "lsm.exec_blocked",
+            innerwarden_core::event::Severity::Critical,
+        );
+        if let Some(obj) = ev.details.as_object_mut() {
+            obj.insert("container_id".to_string(), "4858a7b75b55".into());
+            obj.insert("pod_uid".to_string(), "pod-xyz".into());
+            obj.insert("pid".to_string(), 4242.into());
+        }
+
+        process_event(
+            ev,
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+
+        assert_eq!(
+            stats.incidents_written, 1,
+            "the LSM block must promote one incident through write_incident"
+        );
+        assert_eq!(
+            stats.current_container_id.as_deref(),
+            Some("4858a7b75b55"),
+            "process_event recorded the in-flight container scope"
+        );
+        assert_eq!(stats.current_pod_uid.as_deref(), Some("pod-xyz"));
+
+        // A subsequent HOST event clears the scope, so its incident is not falsely
+        // attributed to the previous container (the reused-stats leak guard).
+        let host = test_event(
+            "lsm.exec_blocked",
+            innerwarden_core::event::Severity::Critical,
+        );
+        process_event(
+            host,
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+        assert_eq!(
+            stats.current_container_id, None,
+            "a host event must clear the container scope left by the prior event"
         );
     }
 

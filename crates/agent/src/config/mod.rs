@@ -7,8 +7,10 @@ use serde::Deserialize;
 // Spec 068: config sections relocated into submodules. Defaults,
 // validation helpers, load(), AgentConfig and tests stay here; the
 // section structs are re-exported so every `config::*` path is unchanged.
+mod agent_guard;
 mod ai;
 mod dashboard;
+mod dns_guard;
 mod environment;
 mod fleet;
 mod general;
@@ -24,8 +26,10 @@ mod retention;
 mod shield;
 mod signing;
 
+pub use agent_guard::*;
 pub use ai::*;
 pub use dashboard::*;
+pub use dns_guard::*;
 pub use environment::*;
 pub use fleet::*;
 pub use general::*;
@@ -62,6 +66,16 @@ pub struct AgentConfig {
     pub honeypot: HoneypotConfig,
     #[serde(default)]
     pub responder: ResponderConfig,
+    /// DNS Guard intel bridge: export the agent's malicious-domain intel to the
+    /// paid `innerwarden-dns-guard` resolver's denylist file. Default off.
+    #[serde(default)]
+    pub dns_guard: DnsGuardConfig,
+    /// Spec 081: managed-agent coexistence. Gates the slow-loop registry
+    /// reconciliation that auto-registers co-located AI agents (and prunes dead
+    /// pids) so the response-side verifier's `by_pid` hint survives agent
+    /// restarts. `auto_register` defaults ON.
+    #[serde(default)]
+    pub agent_guard: AgentGuardConfig,
     /// Spec 062: decision review + learned suppression. Absent `[learning]`
     /// section deserializes to safe defaults (shadow mode), so existing
     /// agent.toml files upgrade with no edits.
@@ -113,6 +127,8 @@ pub struct AgentConfig {
     pub threat_feeds: ThreatFeedsConfig,
     #[serde(default)]
     pub slack: SlackConfig,
+    #[serde(default)]
+    pub discord: DiscordConfig,
     #[serde(default)]
     pub cloudflare: CloudflareConfig,
     #[serde(default)]
@@ -186,6 +202,10 @@ pub struct AgentConfig {
     /// KG-derived decision modifiers and detectors (spec 043).
     #[serde(default)]
     pub kg: KgConfig,
+    /// Per-tenant attribution — resolve k8s pod_uid -> namespace/tenant from the
+    /// node's kubeconfig and stamp it on container-scoped incidents (spec 084 P0).
+    #[serde(default)]
+    pub tenancy: crate::tenancy::TenancyConfig,
 }
 
 pub(super) fn default_packed_binary_entropy_threshold() -> f32 {
@@ -2268,6 +2288,7 @@ enabled = true
             "zero_trust",
             "graph_only_detectors",
             "incident_flow",
+            "agent_guard",
         ];
         // Build a minimal TOML with every section header. None of the
         // sections gets unknown keys, so they all default-fill. If any

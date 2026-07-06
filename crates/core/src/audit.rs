@@ -45,8 +45,14 @@ pub struct AdminActionEntry {
 /// Opens the file, reads the last hash, writes the entry, and closes.
 /// Suitable for CLI commands that don't keep a writer open.
 pub fn append_admin_action(data_dir: &Path, entry: &mut AdminActionEntry) -> anyhow::Result<()> {
-    // Build a safe filename from the current date (only digits and hyphens)
-    let today = chrono::Local::now()
+    // Build a safe filename from the current date (only digits and hyphens).
+    // Use UTC, not local time: every other date-stamped file InnerWarden writes
+    // (events-/incidents-/decisions-*.jsonl) and reads (today_date_string) is
+    // UTC, so a local-time stamp put the admin-audit log on a DIFFERENT date
+    // than the rest of the system whenever local time and UTC straddled
+    // midnight (e.g. UK/BST after 00:00), which also broke the reader and the
+    // tune-audit test on that boundary.
+    let today = chrono::Utc::now()
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();

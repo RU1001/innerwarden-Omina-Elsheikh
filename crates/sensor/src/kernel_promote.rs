@@ -85,14 +85,26 @@ const JIT_RUNTIMES: &[&str] = &[
     "WebKitWebProc",
 ];
 
-/// Processes that legitimately use `memfd_create`.
+/// Processes that legitimately use `memfd_create`. This `comm` set is the FIRST
+/// FP layer; it is intentionally complemented by the NON-forgeable exe-path
+/// trust check ([`memfd_exe_is_trusted`]) so that a trusted on-disk binary whose
+/// thread comm is generic (e.g. a Rust runtime's `tokio-rt-worker`) is also
+/// cleared without widening this spoofable list to cover it.
 const MEMFD_LEGIT: &[&str] = &[
     "systemd",
     "systemd-udevd",
     "(sd-pam)",
+    // systemd's per-unit executor helper (PID 1 lineage); creates a memfd as
+    // part of normal unit startup. comm renders as `(sd-executor)`; `base`
+    // strips the parens, so the bare name is listed.
+    "sd-executor",
     "dbus-daemon",
     "dbus-broker",
     "snapd",
+    // fwupd's CLI/daemon stages firmware blobs through memfd. Legit Ubuntu/RHEL
+    // firmware-update tooling, not a fileless-payload actor.
+    "fwupdmgr",
+    "fwupd",
     "chrome",
     "chromium",
     "firefox",
@@ -259,6 +271,16 @@ fn is_kernel_thread(comm: &str) -> bool {
         )
 }
 
+/// NON-forgeable FP layer for `memfd_create`: true when the creating process's
+/// kernel-captured exe path (`details.exe_path`, the execve filename) lives
+/// under a package-managed system directory. A trusted on-disk binary creating a
+/// memfd is normal; only an absent / `/tmp` / deleted / memfd-backed exe stays
+/// promotable. Shares `path_trust` with `host_drift` so the two agree.
+fn memfd_exe_is_trusted(ev: &Event) -> bool {
+    let exe = text(ev, "exe_path");
+    !exe.is_empty() && crate::path_trust::is_trusted_system_path(exe)
+}
+
 /// The per-kind detector name used for incident-level suppression
 /// (`is_incident_suppressed`) so operators can tune each independently.
 pub(crate) fn suppression_name(kind: &str) -> &'static str {
@@ -390,8 +412,23 @@ pub(crate) fn kernel_syscall_incident(
             ))
         }
         "process.memfd_create" => {
+            // Three FP layers, all of which must miss before we promote:
+            //   1. forgeable `comm` allowlist (curated common-good actors),
+            //   2. per-server `allowlist.toml`,
+            //   3. NON-forgeable exe-path trust: a memfd created by a binary
+            //      that lives on disk under a package-managed system path is
+            //      normal (browsers, systemd's executor, fwupd, and Rust/tokio
+            //      services all do it). The exe path is the kernel-captured
+            //      execve filename, so unlike `comm` it cannot be spoofed from
+            //      `/tmp`. This is what clears generic thread comms like
+            //      `tokio-rt-worker` (the agent's own runtime) without adding a
+            //      spoofable comm any Rust payload could wear. The real fileless
+            //      signal (a deleted / memfd-backed exec) is explicitly NOT
+            //      trusted (see `path_trust::is_trusted_system_path`), and the
+            //      `fexecve`-from-memfd follow-up stays in the recommended checks.
             if MEMFD_LEGIT.contains(&base)
                 || allowlist.is_process_allowed(comm, Some("kernel_memfd"))
+                || memfd_exe_is_trusted(ev)
             {
                 return None;
             }
@@ -625,6 +662,77 @@ mod tests {
             &empty_allowlist()
         )
         .is_none());
+    }
+
+    #[test]
+    fn memfd_fwupdmgr_and_sd_executor_are_benign() {
+        // Prod FP (2026-06 audit): fwupd's CLI and systemd's per-unit executor
+        // legitimately create memfds. `(sd-executor)` strips to `sd-executor`.
+        for comm in ["fwupdmgr", "fwupd", "(sd-executor)"] {
+            assert!(
+                kernel_syscall_incident(
+                    &ev(
+                        "process.memfd_create",
+                        serde_json::json!({"pid":1,"name":"x","comm":comm})
+                    ),
+                    &empty_allowlist()
+                )
+                .is_none(),
+                "{comm} memfd must not promote"
+            );
+        }
+    }
+
+    #[test]
+    fn memfd_trusted_exe_path_clears_generic_thread_comm() {
+        // Prod FP: a Rust service's worker thread reports comm `tokio-rt-worker`
+        // (generic, NOT on the comm allowlist) but its exe lives on disk under a
+        // system path. The non-forgeable exe-path trust must clear it.
+        assert!(
+            kernel_syscall_incident(
+                &ev(
+                    "process.memfd_create",
+                    serde_json::json!({"pid":42,"name":"x","comm":"tokio-rt-worker","exe_path":"/usr/local/bin/innerwarden-agent"})
+                ),
+                &empty_allowlist()
+            )
+            .is_none(),
+            "trusted exe path must suppress the generic-comm memfd FP"
+        );
+    }
+
+    #[test]
+    fn memfd_untrusted_exe_path_still_promotes_anti_evasion() {
+        // Anti-evasion: the exe-path trust must NOT become a free pass. A Rust
+        // payload wearing `tokio-rt-worker` but running from /tmp (or with a
+        // deleted backing file) must STILL promote, exactly the fileless case.
+        for exe in ["/tmp/payload", "/usr/bin/python3 (deleted)", "memfd:evil"] {
+            assert!(
+                kernel_syscall_incident(
+                    &ev(
+                        "process.memfd_create",
+                        serde_json::json!({"pid":42,"name":"x","comm":"tokio-rt-worker","exe_path":exe})
+                    ),
+                    &empty_allowlist()
+                )
+                .is_some(),
+                "untrusted/volatile exe_path ({exe}) must still promote"
+            );
+        }
+    }
+
+    #[test]
+    fn memfd_missing_exe_path_falls_back_to_comm_gate() {
+        // No exe_path => the exe-trust layer abstains; an attacker-shaped comm
+        // with no on-disk anchor still promotes (current behaviour preserved).
+        assert!(kernel_syscall_incident(
+            &ev(
+                "process.memfd_create",
+                serde_json::json!({"pid":1,"name":"x","comm":"evil"})
+            ),
+            &empty_allowlist()
+        )
+        .is_some());
     }
 
     #[test]

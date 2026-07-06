@@ -112,6 +112,7 @@ Before opening a PR, confirm:
 - [ ] If your change affects detection or response capabilities, configuration, or operational safety guidance, the corresponding doc/wiki page is updated.
 - [ ] PR description references the issue (`Closes #123`) so it auto-closes on merge.
 - [ ] PR title uses Conventional Commits format.
+- [ ] Every commit is signed off (`git commit -s`) per the [DCO](DCO).
 
 ---
 
@@ -171,6 +172,18 @@ If you are unsure whether a change fits the project's current direction, open an
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE), the same as the rest of the project. The only in-tree crate under a different license is `crates/shield` (BUSL-1.1); every other crate is Apache-2.0.
+
+## Developer Certificate of Origin
+
+Every commit must carry a `Signed-off-by:` line certifying the [Developer Certificate of Origin](DCO) — the same lightweight mechanism the Linux kernel uses. It states that you wrote the change (or have the right to submit it) under the project's license. No CLA, no paperwork: just sign your commits.
+
+```bash
+git commit -s -m "feat(sensor): my change"      # adds Signed-off-by automatically
+git commit --amend -s                            # fix the last commit
+git rebase --signoff origin/main                 # fix a whole branch
+```
+
+The `DCO` CI check fails any PR containing a human-authored commit without a sign-off. Bot commits (dependabot etc.) are exempt.
 
 ---
 

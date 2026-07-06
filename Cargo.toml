@@ -13,6 +13,7 @@ members = [
   "crates/shield",
   "crates/store",
   "crates/supervisor",
+  "crates/guard-cli",
 ]
 exclude = ["crates/sensor-ebpf", "fuzz"]
 # crates/sensor-ebpf compiles to bpfel-unknown-none target (separate build).
@@ -22,7 +23,7 @@ exclude = ["crates/sensor-ebpf", "fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.15.10"
+version = "0.16.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/InnerWarden/innerwarden"

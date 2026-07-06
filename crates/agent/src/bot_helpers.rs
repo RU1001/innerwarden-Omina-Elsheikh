@@ -1144,6 +1144,129 @@ fn execute_verified_action(
                 }
             }
         }
+        two_factor::PendingActionType::ModeChange { ref mode } => {
+            apply_mode_change_request(state, operator, mode);
+        }
+        two_factor::PendingActionType::Unblock { ref ip } => {
+            request_unblock(state, data_dir, operator, ip);
+        }
+    }
+}
+
+/// Queue an operator unblock for `ip` (validated upstream). Writes the same
+/// `operator_unblock_request` decision row the dashboard does, so the slow-loop
+/// `operator_actions::run_unblock_drain` performs the REAL firewall revert
+/// through the response lifecycle (the only path that does not get re-applied by
+/// the spec-076 reconciler). Shared by the 2FA-off inline path and the post-TOTP
+/// path. Best-effort: a write failure is logged + reported to the operator.
+pub(crate) fn request_unblock(state: &mut AgentState, data_dir: &Path, operator: &str, ip: &str) {
+    let incident_id = format!("operator_unblock:{ip}");
+    let entry = decisions::DecisionEntry {
+        ts: chrono::Utc::now(),
+        incident_id: incident_id.clone(),
+        host: local_hostname_for_audit(),
+        ai_provider: format!("operator:telegram:{operator}"),
+        action_type: "operator_unblock_request".to_string(),
+        target_ip: Some(ip.to_string()),
+        target_user: None,
+        skill_id: Some("operator_unblock".to_string()),
+        confidence: 1.0,
+        auto_executed: false,
+        dry_run: false,
+        reason: format!("Telegram /unblock by {operator}"),
+        estimated_threat: "manual".to_string(),
+        execution_result: "queued".to_string(),
+        prev_hash: None,
+        decision_layer: Some("manual_operator".to_string()),
+    };
+    match decisions::append_chained(data_dir, &entry, state.sqlite_store.as_ref()) {
+        Ok(()) => {
+            write_telegram_triage_audit(
+                state,
+                &incident_id,
+                operator,
+                "unblock_request",
+                Some(ip.to_string()),
+                None,
+                format!("Operator {operator} queued unblock for {ip} (2FA verified)"),
+                format!("unblock_request:{ip}"),
+            );
+            tg_reply(
+                state,
+                format!(
+                    "\u{2705} Unblock queued for <code>{}</code>. I'll release it at the firewall \
+                     within ~30s and stop re-blocking it.",
+                    telegram::escape_html_pub(ip)
+                ),
+            );
+        }
+        Err(e) => {
+            tg_reply(
+                state,
+                format!(
+                    "\u{274c} Could not queue the unblock for <code>{}</code>: {}",
+                    telegram::escape_html_pub(ip),
+                    e.to_string().chars().take(160).collect::<String>()
+                ),
+            );
+        }
+    }
+}
+
+/// Parse a `/mode` argument and queue the guardian-mode change for the main
+/// loop (which owns `cfg` and applies + persists it). Shared by the 2FA-off
+/// inline path and the post-TOTP path so the actuation logic lives in one place.
+/// Unknown argument replies with usage and queues nothing.
+pub(crate) fn apply_mode_change_request(state: &mut AgentState, operator: &str, mode_arg: &str) {
+    let mode = match mode_arg.trim().to_ascii_lowercase().as_str() {
+        "guard" | "live" | "on" | "defend" => Some(telegram::GuardianMode::Guard),
+        "watch" | "monitor" | "passive" | "off" => Some(telegram::GuardianMode::Watch),
+        "dryrun" | "dry-run" | "dry_run" | "simulate" => Some(telegram::GuardianMode::DryRun),
+        _ => None,
+    };
+    match mode {
+        Some(m) => {
+            state.pending_mode_change = Some(m);
+            let (label, desc) = match m {
+                telegram::GuardianMode::Guard => {
+                    ("Guard", "auto-defend is ON. I block threats automatically.")
+                }
+                telegram::GuardianMode::Watch => (
+                    "Watch",
+                    "passive monitor. I alert you but take no action myself.",
+                ),
+                telegram::GuardianMode::DryRun => (
+                    "Dry-run",
+                    "I simulate the action and log what I would do, but change nothing.",
+                ),
+            };
+            write_telegram_triage_audit(
+                state,
+                "__mode__",
+                operator,
+                "mode_change",
+                None,
+                None,
+                format!("Operator {operator} switched guardian mode to {label}"),
+                format!("mode_change:{label}"),
+            );
+            tg_reply(
+                state,
+                format!(
+                    "\u{1f6e1}\u{fe0f} <b>Mode set to {label}</b>\n{desc}\nApplied now and saved for the next restart."
+                ),
+            );
+        }
+        None => {
+            tg_reply(
+                state,
+                format!(
+                    "Unknown mode <code>{}</code>. Use <code>/mode guard</code> (auto-defend), \
+                     <code>/mode watch</code> (monitor only), or <code>/mode dryrun</code> (simulate).",
+                    telegram::escape_html_pub(mode_arg)
+                ),
+            );
+        }
     }
 }
 
@@ -1414,6 +1537,63 @@ mod tests {
         assert_eq!(
             graph_last_decisions(&kg, 3),
             "⚖️ No decisions yet today - standing by."
+        );
+    }
+
+    #[test]
+    fn request_unblock_writes_operator_unblock_request_decision() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        request_unblock(&mut state, dir.path(), "op", "203.0.113.7");
+
+        // append_chained writes the decision JSONL even with no sqlite store; the
+        // slow-loop drain (which reads it back) does the real firewall revert.
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let jsonl = std::fs::read_to_string(dir.path().join(format!("decisions-{today}.jsonl")))
+            .expect("decisions file written");
+        assert!(
+            jsonl.contains("operator_unblock_request"),
+            "must queue an operator_unblock_request: {jsonl}"
+        );
+        assert!(jsonl.contains("203.0.113.7"), "must target the ip: {jsonl}");
+    }
+
+    #[test]
+    fn apply_mode_change_request_queues_valid_mode_and_rejects_garbage() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        // Each canonical word + an alias queues the right mode.
+        apply_mode_change_request(&mut state, "op", "guard");
+        assert!(matches!(
+            state.pending_mode_change,
+            Some(telegram::GuardianMode::Guard)
+        ));
+        apply_mode_change_request(&mut state, "op", "WATCH");
+        assert!(matches!(
+            state.pending_mode_change,
+            Some(telegram::GuardianMode::Watch)
+        ));
+        apply_mode_change_request(&mut state, "op", "dry-run");
+        assert!(matches!(
+            state.pending_mode_change,
+            Some(telegram::GuardianMode::DryRun)
+        ));
+        apply_mode_change_request(&mut state, "op", "off");
+        assert!(matches!(
+            state.pending_mode_change,
+            Some(telegram::GuardianMode::Watch)
+        ));
+
+        // Garbage must NOT queue a change (fail closed; the prior value stays).
+        state.pending_mode_change = None;
+        apply_mode_change_request(&mut state, "op", "destroy-everything");
+        assert!(
+            state.pending_mode_change.is_none(),
+            "an unknown mode must not queue any change"
         );
     }
 

@@ -12,7 +12,7 @@
 use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::{Event, Severity};
 use std::net::Ipv4Addr;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Embedded eBPF bytecode (compiled into the sensor binary).
 /// Built with: cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release
@@ -30,6 +30,26 @@ const EBPF_BYTECODE_EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const EBPF_OBJ_PATH: &str = "/usr/local/lib/innerwarden/innerwarden-ebpf";
 const EBPF_OBJ_PATH_DEV: &str =
     "crates/sensor-ebpf/target/bpfel-unknown-none/release/innerwarden-ebpf";
+
+/// Runtime count of eBPF programs this sensor actually attached, set by
+/// [`run`] after the attach phase. `usize::MAX` is the sentinel for "not
+/// attached yet / eBPF never started" (distinct from a real 0). This closes
+/// the gap the `build_ebpf_status` comment flagged: eBPF can be *available*
+/// (loads fine) yet attach 0 programs at runtime — e.g. under a restrictive
+/// systemd sandbox — leaving the sensor host-blind while it still reports
+/// "active". The health layer reads this to surface that state.
+static EBPF_ATTACHED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// How many eBPF programs the sensor attached at runtime. `None` until the
+/// attach phase has run (or if eBPF never started); `Some(0)` means eBPF
+/// loaded but nothing attached — the sensor is host-blind.
+pub fn ebpf_progs_attached() -> Option<usize> {
+    match EBPF_ATTACHED.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => None,
+        n => Some(n),
+    }
+}
 
 /// Check if eBPF is available on this system.
 pub fn is_ebpf_available() -> bool {
@@ -206,8 +226,25 @@ fn resolve_ppid_kernel_first(kernel_ppid: u32, pid: u32) -> u32 {
     }
 }
 
-/// Extract container ID from /proc/<pid>/cgroup. Returns None for host processes.
-/// Resolve a PID's container id, memoised per PID.
+/// Non-forgeable container + Kubernetes pod identity parsed from
+/// `/proc/<pid>/cgroup`. The kernel writes this cgroup path; a process inside a
+/// container cannot forge it. `container_id` is the 12-char runtime container
+/// id, `pod_uid` is the Kubernetes pod UID (present only for pods — the
+/// per-tenant anchor), and `runtime` is the container runtime inferred from the
+/// cgroup leaf/prefix.
+///
+/// Spec 084 P0: `pod_uid` + `runtime` are the missing hops that let the agent
+/// map an event to its owning pod -> namespace -> tenant **without trusting any
+/// process-supplied label**. The cgroup path is the non-forgeable root of the
+/// `cgroup_id -> container -> pod -> tenant` attribution chain.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ContainerIdentity {
+    pub container_id: String,
+    pub pod_uid: Option<String>,
+    pub runtime: Option<String>,
+}
+
+/// Resolve a PID's container/pod identity, memoised per PID.
 ///
 /// Spec 069: the eBPF ring reader calls this for ~15 event kinds, once per
 /// event. Without the cache it was a synchronous `/proc/<pid>/cgroup` read on
@@ -217,11 +254,14 @@ fn resolve_ppid_kernel_first(kernel_ppid: u32, pid: u32) -> u32 {
 /// surfaced tens of seconds late. Memoising collapses repeated lookups for the
 /// same PID to a map hit. Pid reuse can briefly serve a stale id; acceptable for
 /// container attribution and bounded by an 8192-entry cap.
-fn resolve_container_id(pid: u32) -> Option<String> {
+fn resolve_container_identity(pid: u32) -> Option<std::sync::Arc<ContainerIdentity>> {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     const CACHE_CAP: usize = 8192;
-    static CACHE: OnceLock<Mutex<HashMap<u32, Option<String>>>> = OnceLock::new();
+    // Cache the identity behind an `Arc` so a cache hit (every event on a
+    // container host) is a refcount bump, not a fresh clone of the whole
+    // `ContainerIdentity` (container_id + pod_uid + runtime Strings) per event.
+    static CACHE: OnceLock<Mutex<HashMap<u32, Option<Arc<ContainerIdentity>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     // Recover from a poisoned lock rather than branching on the error so the
     // happy path stays single-expression.
@@ -231,7 +271,7 @@ fn resolve_container_id(pid: u32) -> Option<String> {
             return v.clone();
         }
     }
-    let result = resolve_container_id_uncached(pid);
+    let result = resolve_container_identity_uncached(pid).map(Arc::new);
     let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
     if map.len() >= CACHE_CAP {
         map.clear();
@@ -240,41 +280,123 @@ fn resolve_container_id(pid: u32) -> Option<String> {
     result
 }
 
-fn resolve_container_id_uncached(pid: u32) -> Option<String> {
+fn resolve_container_identity_uncached(pid: u32) -> Option<ContainerIdentity> {
     let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    parse_container_id_from_cgroup(&content)
+    parse_container_identity_from_cgroup(&content)
 }
 
-/// Parse a 12-char container id out of `/proc/<pid>/cgroup` contents. Pure
-/// (no I/O) so the Docker/Podman/k8s formats are unit-testable without a real
-/// container.
-fn parse_container_id_from_cgroup(content: &str) -> Option<String> {
+/// Attach the Kubernetes pod UID + container runtime to an event's `details`.
+/// The 12-char `container_id` is already set by the per-event builders / inline
+/// sites; this adds the two extra non-forgeable hops uniformly. Best-effort:
+/// host processes and non-k8s containers simply omit the fields.
+fn attach_pod_runtime(details: &mut serde_json::Value, identity: Option<&ContainerIdentity>) {
+    if let Some(id) = identity {
+        if let Some(pod) = &id.pod_uid {
+            details["pod_uid"] = serde_json::Value::String(pod.clone());
+        }
+        if let Some(rt) = &id.runtime {
+            details["runtime"] = serde_json::Value::String(rt.clone());
+        }
+    }
+}
+
+/// Parse container + pod identity out of `/proc/<pid>/cgroup` contents. Pure
+/// (no I/O) so the Docker/Podman/CRI-O/k8s formats are unit-testable without a
+/// real container.
+///
+/// The container id is the cgroup LEAF identifier. It appears in several shapes
+/// depending on runtime + cgroup driver:
+///   cgroupfs:  0::/docker/<id>
+///              0::/kubepods/besteffort/pod<uuid>/<id>
+///   systemd:   0::/system.slice/docker-<id>.scope
+///              0::/kubepods.slice/.../kubepods-besteffort-pod<uuid>.slice/cri-containerd-<id>.scope
+///              0::/.../crio-<id>.scope
+///   podman:    0::/libpod-<id>.scope
+///
+/// Take the leaf path segment, drop a trailing ".scope", then take the last
+/// '-'-delimited token: the runtime prefixes (docker-, cri-containerd-, crio-,
+/// libpod-) are dash-joined alpha, while the id itself is hex with no '-'. A
+/// plain "<id>" leaf (cgroupfs) has no '-' and is returned whole. The pod UID
+/// (when present) is parsed from the `pod<uuid>` slice/segment higher in the
+/// path; the runtime is inferred from the leaf prefix or the path.
+fn parse_container_identity_from_cgroup(content: &str) -> Option<ContainerIdentity> {
     for line in content.lines() {
-        // Docker: 0::/docker/<container_id>
-        // Podman: 0::/libpod-<container_id>.scope
-        // k8s:    0::/kubepods/besteffort/pod<uuid>/<container_id>
-        if let Some(rest) = line.split("docker/").nth(1) {
-            let id = rest.split('/').next().unwrap_or(rest);
-            if id.len() >= 12 {
-                return Some(id[..12].to_string());
-            }
-        }
-        if let Some(rest) = line.split("libpod-").nth(1) {
-            let id = rest.split('.').next().unwrap_or(rest);
-            if id.len() >= 12 {
-                return Some(id[..12].to_string());
-            }
-        }
-        if line.contains("kubepods") {
-            // Last segment is the container ID
-            if let Some(id) = line.rsplit('/').next() {
-                if id.len() >= 12 {
-                    return Some(id[..12].to_string());
-                }
-            }
+        // cgroup v2: "0::/path"; v1: "12:pids:/path". The path is after the
+        // last ':' so both drivers share one code path.
+        let path = line.rsplit(':').next().unwrap_or(line);
+        let leaf = match path.rsplit('/').next() {
+            Some(l) => l,
+            None => continue,
+        };
+        let leaf = leaf.strip_suffix(".scope").unwrap_or(leaf);
+        let id = leaf.rsplit('-').next().unwrap_or(leaf);
+        if id.len() >= 12 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(ContainerIdentity {
+                container_id: id[..12].to_string(),
+                pod_uid: extract_pod_uid(path),
+                runtime: detect_runtime(path, leaf),
+            });
         }
     }
     None
+}
+
+/// Extract a Kubernetes pod UID from a cgroup path. The pod slice/segment
+/// carries the UID: the systemd driver escapes the UUID dashes to underscores
+/// (`kubepods-besteffort-pod<uid>.slice`), the cgroupfs driver keeps them
+/// (`/kubepods/besteffort/pod<uid>/`). Normalised to a canonical lowercase
+/// dashed UUID. Returns None for non-k8s containers and host processes.
+fn extract_pod_uid(path: &str) -> Option<String> {
+    for seg in path.split('/') {
+        let seg = seg.strip_suffix(".slice").unwrap_or(seg);
+        // A segment can contain "pod" twice ("kubepods-besteffort-pod<uid>");
+        // scan every occurrence and keep the first that yields a valid UID.
+        let mut start = 0;
+        while let Some(rel) = seg[start..].find("pod") {
+            let i = start + rel + 3;
+            let cand: String = seg[i..]
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == '-' || *c == '_')
+                .collect();
+            let norm = cand.replace('_', "-").to_lowercase();
+            if is_pod_uid(&norm) {
+                return Some(norm);
+            }
+            start = i;
+        }
+    }
+    None
+}
+
+/// A Kubernetes pod UID is a UUID: 32 hex digits, optionally dash-grouped
+/// 8-4-4-4-12. Accept both the dashed and undashed (32 raw hex) forms.
+fn is_pod_uid(s: &str) -> bool {
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Infer the container runtime from the cgroup leaf prefix (systemd driver) or
+/// the path (cgroupfs driver). Returns None for host processes.
+fn detect_runtime(path: &str, leaf: &str) -> Option<String> {
+    for (prefix, rt) in [
+        ("cri-containerd-", "containerd"),
+        ("containerd-", "containerd"),
+        ("docker-", "docker"),
+        ("crio-", "crio"),
+        ("libpod-", "podman"),
+    ] {
+        if leaf.starts_with(prefix) {
+            return Some(rt.to_string());
+        }
+    }
+    // cgroupfs driver: the leaf is the bare id, so infer from the path.
+    if path.contains("/docker/") {
+        Some("docker".to_string())
+    } else if path.contains("kubepods") {
+        Some("containerd".to_string())
+    } else {
+        None
+    }
 }
 
 /// Read full command-line arguments from /proc/PID/cmdline.
@@ -286,7 +408,7 @@ fn read_proc_cmdline(pid: u32, filename: &str) -> Vec<String> {
         Ok(data) if !data.is_empty() => data
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).to_string())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect(),
         _ => vec![filename.to_string()],
     }
@@ -342,18 +464,35 @@ fn execve_to_event(
     container_id: Option<&str>,
     comm: &str,
     filename: &str,
+    kernel_argv: Vec<String>,
     host: &str,
 ) -> Event {
-    // Read full argv from /proc/PID/cmdline (eBPF only gives us filename/argv[0])
-    let full_argv = read_proc_cmdline(pid, filename);
+    // Prefer the argv captured IN-KERNEL at execve entry (see the eBPF
+    // read_argv_slot! unroll): it is complete and reliable even for a
+    // short-lived process. /proc/PID/cmdline is only a fallback for when the
+    // kernel gave us nothing useful (an older sensor eBPF that zeroes argv, or a
+    // failed read) - and for a dead process it degrades to just [filename]
+    // anyway, which is exactly the blindness this replaces.
+    let full_argv = if kernel_argv.len() > 1 {
+        kernel_argv
+    } else {
+        read_proc_cmdline(pid, filename)
+    };
     let argc = full_argv.len();
     let command = full_argv.join(" ");
+    // Move each token into the JSON array instead of cloning it: `command` and
+    // `argc` are already computed above, so `full_argv` is no longer needed.
     let argv_json: Vec<serde_json::Value> = full_argv
-        .iter()
-        .map(|s| serde_json::Value::String(s.clone()))
+        .into_iter()
+        .map(serde_json::Value::String)
         .collect();
 
     let parent_comm = crate::detectors::exec_context::proc_comm(ppid).unwrap_or_default();
+    // Controlling-terminal proof for the exec_context classifier: read the
+    // PARENT's tty (the long-lived shell), not the microsecond-lived recon child
+    // whose /proc entry is often already gone. tty_nr != 0 ⇒ real interactive
+    // session; an implant / reverse shell / daemon-spawned shell has none.
+    let has_tty = crate::detectors::exec_context::proc_has_tty(ppid);
 
     let mut details = serde_json::json!({
         "pid": pid,
@@ -361,6 +500,7 @@ fn execve_to_event(
         "ppid": ppid,
         "comm": comm,
         "parent_comm": parent_comm,
+        "has_tty": has_tty,
         "command": command,
         "argv": argv_json,
         "argc": argc,
@@ -480,6 +620,7 @@ fn file_open_to_event(
     filename: &str,
     flags: u32,
     host: &str,
+    exe_path: Option<&str>,
 ) -> Event {
     let is_write = flags & 0x3 != 0; // O_WRONLY or O_RDWR
 
@@ -495,6 +636,15 @@ fn file_open_to_event(
     });
     if let Some(cid) = container_id {
         details["container_id"] = serde_json::Value::String(cid.to_string());
+    }
+    // Non-forgeable process identity (the execve-captured exe path, NOT the
+    // forgeable `comm`). data_exfil_ebpf uses it so an attacker who `cp`s a
+    // payload to `/tmp/sshd` (comm=sshd) cannot inherit sshd's blanket
+    // credential-read exemption — a comm-spoofed reader from an untrusted path
+    // is not exempt. Absent when the pid was not seen execve (a daemon that
+    // predates the sensor), in which case the detector falls back to comm.
+    if let Some(exe) = exe_path {
+        details["exe_path"] = serde_json::Value::String(exe.to_string());
     }
 
     let mut tags = vec!["ebpf".to_string(), "file".to_string()];
@@ -612,7 +762,34 @@ fn privesc_to_event(
 /// Extract a null-terminated string from a byte slice.
 fn bytes_to_string(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).to_string()
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// `ExecveEvent.argv[0]` lives at bytes 352..480 of the `#[repr(C)]` layout
+/// (after kind/pid/tgid/uid/gid/ppid = 24, cgroup_id = 8, comm = 64,
+/// filename = 256). The Execution Gate writes `b"EXEC_GATE"` there so its
+/// kind-6 blocks are distinguishable from the legacy full-hook / kill-chain /
+/// neural blocks — every other kind-6 emitter zeroes argv, so the marker is
+/// unambiguous. `filename` then carries the REAL attempted path (a denied exec
+/// leaves `/proc/<pid>` pointing at the old image, so the path is only
+/// recoverable from the event itself).
+const EXEC_GATE_MARKER: &[u8; 9] = b"EXEC_GATE";
+/// Observe-mode (spec 077 P2): the gate emits this marker instead of EXEC_GATE
+/// when LSM_POLICY key 3 == 2 — a would-block (exec was ALLOWED, logged only).
+const EXEC_OBSERVE_MARKER: &[u8; 9] = b"EXEC_OBSV";
+const EXECVE_ARGV0_OFFSET: usize = 352;
+
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+fn is_exec_gate_block(data: &[u8]) -> bool {
+    let end = EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len();
+    data.len() >= end && data[EXECVE_ARGV0_OFFSET..end] == EXEC_GATE_MARKER[..]
+}
+
+/// True when this kind-6 event is an OBSERVE-mode would-block (gate allowed it).
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+fn is_exec_gate_observe(data: &[u8]) -> bool {
+    let end = EXECVE_ARGV0_OFFSET + EXEC_OBSERVE_MARKER.len();
+    data.len() >= end && data[EXECVE_ARGV0_OFFSET..end] == EXEC_OBSERVE_MARKER[..]
 }
 
 /// Pin path for the XDP blocklist BPF map.
@@ -627,7 +804,7 @@ const XDP_ALLOWLIST_PIN: &str = "/sys/fs/bpf/innerwarden/allowlist";
 /// only created inside `attach_xdp`, which runs AFTER `attach_lsm`. So
 /// LSM/CGROUP/COMM pins always failed silently on first boot until
 /// `attach_xdp` ran. Operator-visible: `LSM: failed to pin policy map`
-/// + `CGROUP_CAPABILITIES: failed to pin` warnings during sensor
+/// plus `CGROUP_CAPABILITIES: failed to pin` warnings during sensor
 /// startup, with the (only) recovery path being a sensor restart.
 ///
 /// Returns `Ok(())` if the dir already exists or was created. Returns
@@ -664,6 +841,27 @@ const COMM_CAP_PIN: &str = "/sys/fs/bpf/innerwarden/comm_capabilities";
 /// Pin path for the BLOCKED_PIDS LRU map consulted by `innerwarden_lsm_exec_min`.
 /// The agent populates this via `agent::lsm_policy::register_blocked_pid`.
 const BLOCKED_PIDS_PIN: &str = "/sys/fs/bpf/innerwarden/blocked_pids";
+
+/// Pin path for the Execution Gate allowlist (FNV(path) -> 1). Pinned so the paid
+/// Active Defence `config-sign exec-gate` tooling can populate it from userspace.
+/// The map + gate ship free + INERT; only LSM_POLICY key 3 = 1 (license-gated
+/// arming) makes the `bprm_check_security` hook enforce against it.
+const EXEC_ALLOWLIST_PIN: &str = "/sys/fs/bpf/innerwarden/exec_allowlist";
+
+/// Pin path for the Execution Gate SCOPE (cgroup id -> 1). Populated by the paid
+/// `config-sign exec-gate` tooling with the AI agent's cgroup id(s). Consulted by
+/// the gate ONLY when `LSM_POLICY` key 4 = 1 (agent-scoped mode): enforce solely
+/// inside these cgroups, allow the rest of the host. Empty + scoped = the gate
+/// never fires (fail-open), so a wipe is safe, not a brick.
+const EXEC_GATE_SCOPE_PIN: &str = "/sys/fs/bpf/innerwarden/exec_gate_scope";
+
+/// Pin path for the Execution Gate trusted DIRECTORY-PREFIX map
+/// (FNV(dir-prefix-with-trailing-slash) -> 1). Populated by the paid
+/// `config-sign exec-gate` tooling with OS-maintenance dir prefixes so host-wide
+/// enforce does not deny per-kernel dpkg/initramfs maintainer scripts (the
+/// "managed installer" trust). Consulted by the gate after the exact-hash
+/// allowlist miss; empty + armed = no prefix trusted = unchanged behaviour.
+const EXEC_TRUSTED_PREFIX_PIN: &str = "/sys/fs/bpf/innerwarden/exec_trusted_prefix";
 
 /// Attach LSM execution policy and pin the policy map.
 /// Requires `lsm=...,bpf` in kernel boot cmdline.
@@ -703,6 +901,36 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
         }
         None => {
             info!("innerwarden_lsm_exec_min program not found in .o (sensor built without Spec 052 Phase 1?)");
+        }
+    }
+
+    // Execution Gate (Active Defence) — dedicated minimal LSM on bprm_check_security.
+    // Attaches alongside _min; inert unless LSM_POLICY key 3 = 1 (license-gated arm).
+    // Lives in its own program because the full innerwarden_lsm_exec fails the
+    // verifier on kernel ≥ 6.4, so a gate buried there never runs.
+    match bpf.program_mut("innerwarden_lsm_exec_gate") {
+        Some(prog) => {
+            let lsm_res: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_res {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("bprm_check_security", b) {
+                            warn!("innerwarden_lsm_exec_gate: failed to load: {:?}", e);
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_exec_gate: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_exec_gate → bprm_check_security (Execution Gate) ✅");
+                        }
+                    } else {
+                        info!("innerwarden_lsm_exec_gate: BTF not available; skipping");
+                    }
+                }
+                Err(e) => info!(error = %e, "innerwarden_lsm_exec_gate: not available as Lsm"),
+            }
+        }
+        None => {
+            info!("innerwarden_lsm_exec_gate program not found in .o");
         }
     }
 
@@ -891,7 +1119,7 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
                 }
             };
             let btf = aya::Btf::from_sys_fs().ok();
-            if let Err(e) = lsm.load("bpf", &btf.as_ref().unwrap()) {
+            if let Err(e) = lsm.load("bpf", btf.as_ref().unwrap()) {
                 info!(error = %e, "innerwarden_lsm_bpf: failed to load");
             } else if let Err(e) = lsm.attach() {
                 warn!(error = %e, "innerwarden_lsm_bpf: failed to attach");
@@ -907,24 +1135,93 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
     pin_lsm_policy(bpf);
 }
 
+/// Re-pin a PERSISTENT map across a sensor restart WITHOUT losing its entries.
+///
+/// Spec 080 P0: the old code did `remove_file(pin)` then `map.pin(pin)` for the
+/// persistent maps. The remove-first avoids `EEXIST` (the previous instance's
+/// pin still references a live map), but it makes the fresh empty map the pinned
+/// one and DROPS every entry — fatal for `EXEC_ALLOWLIST` (the Execution Gate
+/// allowlist the active-defence reconciler writes incrementally and never
+/// re-applies) and `LSM_POLICY` (which holds the arm bit). A sensor restart
+/// (e.g. a deploy) silently zeroed the live allowlist on prod.
+///
+/// Here we read the old pinned map's `(key, value)` pairs first, re-pin the
+/// fresh map, then write the saved pairs back, so the allowlist + policy survive
+/// a restart. Fail-open throughout (the sensor must never crash); a fresh box
+/// with no prior pin just restores nothing.
+#[cfg(feature = "ebpf")]
+fn repin_preserving<K, V>(bpf: &mut aya::Ebpf, name: &str, pin: &str)
+where
+    K: aya::Pod,
+    V: aya::Pod,
+{
+    let saved: Vec<(K, V)> = if std::path::Path::new(pin).exists() {
+        aya::maps::MapData::from_pin(pin)
+            .ok()
+            .and_then(|md| {
+                // aya's typed HashMap is built from a `Map`, not a raw
+                // `MapData`; wrap the pinned data in the HashMap variant.
+                let map = aya::maps::Map::HashMap(md);
+                aya::maps::HashMap::<_, K, V>::try_from(&map)
+                    .ok()
+                    .map(|old| old.iter().filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let Some(map) = bpf.map_mut(name) else {
+        return;
+    };
+    let _ = std::fs::remove_file(pin);
+    if let Err(e) = map.pin(pin) {
+        warn!(error = %e, "{name}: failed to pin");
+        return;
+    }
+    info!("eBPF: {name} pinned at {pin}");
+
+    if saved.is_empty() {
+        return;
+    }
+    if let Some(map) = bpf.map_mut(name) {
+        if let Ok(mut hm) = aya::maps::HashMap::<_, K, V>::try_from(map) {
+            let n = saved.len();
+            for (k, v) in &saved {
+                let _ = hm.insert(k, v, 0);
+            }
+            info!("eBPF: {name}: restored {n} entries across sensor restart");
+        }
+    }
+}
+
 #[cfg(feature = "ebpf")]
 fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // Pin the LSM_POLICY map so the agent can enable/disable enforcement.
-    // Remove stale pin first — on sensor restart, the old pin points to a dead
-    // map from the previous instance, causing map.pin() to fail with EEXIST.
-    if let Some(map) = bpf.map_mut("LSM_POLICY") {
-        let _ = std::fs::remove_file(LSM_POLICY_PIN);
-        if let Err(e) = map.pin(LSM_POLICY_PIN) {
-            warn!(error = %e, "LSM: failed to pin policy map");
-        } else {
-            info!("eBPF: LSM policy map pinned at {LSM_POLICY_PIN}");
-            info!("eBPF: LSM enforcement is OFF by default - enable via: bpftool map update pinned {LSM_POLICY_PIN} key 0 0 0 0 value 1 0 0 0");
-        }
-    }
+    // Spec 080 P0: preserve entries across restart — LSM_POLICY holds the
+    // exec-gate arm bit (key 3); EXEC_ALLOWLIST holds the signed allowlist.
+    repin_preserving::<u32, u32>(bpf, "LSM_POLICY", LSM_POLICY_PIN);
+    info!("eBPF: LSM enforcement is OFF by default - enable via: bpftool map update pinned {LSM_POLICY_PIN} key 0 0 0 0 value 1 0 0 0");
 
-    // Pin capability maps so the agent can grant per-cgroup/per-comm permissions.
-    // Spec 052 Phase 1: pin BLOCKED_PIDS alongside the existing capability maps
-    // so `agent::lsm_policy::register_blocked_pid` can open it via `MapData::from_pin`.
+    // Execution Gate allowlist — MUST survive restart (active-defence writes it
+    // incrementally and does not re-apply; a wipe = empty allowlist = brick on
+    // arm). u64 FNV(path) keys, u8 value.
+    repin_preserving::<u64, u8>(bpf, "EXEC_ALLOWLIST", EXEC_ALLOWLIST_PIN);
+
+    // Execution Gate SCOPE (cgroup id -> 1) — agent-scoped enforcement (spec 083).
+    // Preserve across restart like the allowlist so the agent stays scoped; a
+    // wipe is fail-open (empty scope = gate never fires) so it is not a brick.
+    repin_preserving::<u64, u8>(bpf, "EXEC_GATE_SCOPE", EXEC_GATE_SCOPE_PIN);
+
+    // Execution Gate trusted DIRECTORY-PREFIX map (managed-installer trust for
+    // host-wide enforce). Preserve across restart like the allowlist; empty +
+    // armed = no prefix trusted = fail-open, so a wipe is safe.
+    repin_preserving::<u64, u8>(bpf, "EXEC_TRUSTED_PREFIX", EXEC_TRUSTED_PREFIX_PIN);
+
+    // Capability + blocked-pid maps. These have the same restart-wipe behaviour
+    // (TODO spec 080 P0 follow-up: BLOCKED_PIDS is an LRU map + the capability
+    // maps use different value types; the agent re-registers BLOCKED_PIDS today,
+    // so they are lower-priority than the Execution Gate pair above).
     for (map_name, pin_path) in [
         ("CGROUP_CAPABILITIES", CGROUP_CAP_PIN),
         ("COMM_CAPABILITIES", COMM_CAP_PIN),
@@ -943,6 +1240,95 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // Populate INODE_SIZE map for overlayfs drift detection.
     // sizeof(struct inode) varies by kernel config; query BTF at runtime.
     populate_inode_size(bpf);
+
+    // Populate BPRM_OFFSETS (linux_binprm.filename byte offset) from BTF so the
+    // Execution Gate reads the right field across kernels (CO-RE).
+    populate_bprm_offset(bpf);
+
+    // Populate TASK_OFFSETS (task_struct.real_parent + .tgid byte offsets) from
+    // BTF so the execve handler can read the real parent PID in-kernel for
+    // short-lived execs (the /proc fallback misses those).
+    populate_task_offsets(bpf);
+}
+
+/// Query the `linux_binprm.filename` byte offset from kernel BTF and write it to
+/// the BPRM_OFFSETS map (key 0). The Execution Gate eBPF reads it so it works
+/// across kernels (the offset differs: 96 on 6.8). Falls back to the eBPF default
+/// (96) if BTF is unavailable.
+#[cfg(feature = "ebpf")]
+fn populate_bprm_offset(bpf: &mut aya::Ebpf) {
+    use aya::maps::HashMap as BpfHashMap;
+
+    let off = match std::fs::read("/sys/kernel/btf/vmlinux") {
+        Ok(btf) => crate::btf_offsets::member_offset(&btf, "linux_binprm", "filename"),
+        Err(e) => {
+            info!(error = %e, "BPRM_OFFSETS: no kernel BTF — Execution Gate uses default offset 96");
+            None
+        }
+    };
+    let Some(off) = off else {
+        info!("BPRM_OFFSETS: linux_binprm.filename not in BTF — Execution Gate uses default 96");
+        return;
+    };
+    if let Some(map) = bpf.map_mut("BPRM_OFFSETS") {
+        let mut hash: BpfHashMap<_, u32, u32> = match map.try_into() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "BPRM_OFFSETS: map type mismatch");
+                return;
+            }
+        };
+        if let Err(e) = hash.insert(0u32, off, 0) {
+            warn!(error = %e, "BPRM_OFFSETS: failed to write filename offset");
+        } else {
+            info!("eBPF: BPRM_OFFSETS linux_binprm.filename offset = {off} (from BTF)");
+        }
+    }
+}
+
+/// Query `task_struct.real_parent` + `.tgid` byte offsets from kernel BTF and
+/// write them to the TASK_OFFSETS map (key 0 = real_parent, key 1 = tgid). The
+/// execve eBPF handler reads them to capture the real parent PID in-kernel for
+/// short-lived execs (e.g. systemd's sealed-executor `fexecve`) whose
+/// `/proc/<pid>/status` is gone before the userspace ring reader can read it —
+/// without this their `ppid` stays 0. If BTF is unavailable or the members are
+/// absent, the map stays empty and the handler leaves `ppid = 0` (the userspace
+/// `/proc` fallback applies — unchanged behaviour, never a guessed offset).
+#[cfg(feature = "ebpf")]
+fn populate_task_offsets(bpf: &mut aya::Ebpf) {
+    use aya::maps::HashMap as BpfHashMap;
+
+    let btf = match std::fs::read("/sys/kernel/btf/vmlinux") {
+        Ok(b) => b,
+        Err(e) => {
+            info!(error = %e, "TASK_OFFSETS: no kernel BTF — execve ppid uses /proc fallback");
+            return;
+        }
+    };
+    let real_parent = crate::btf_offsets::member_offset(&btf, "task_struct", "real_parent");
+    let tgid = crate::btf_offsets::member_offset(&btf, "task_struct", "tgid");
+    let (Some(real_parent), Some(tgid)) = (real_parent, tgid) else {
+        info!("TASK_OFFSETS: task_struct.real_parent/tgid not in BTF — execve ppid uses /proc fallback");
+        return;
+    };
+    if let Some(map) = bpf.map_mut("TASK_OFFSETS") {
+        let mut hash: BpfHashMap<_, u32, u32> = match map.try_into() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "TASK_OFFSETS: map type mismatch");
+                return;
+            }
+        };
+        let ok0 = hash.insert(0u32, real_parent, 0);
+        let ok1 = hash.insert(1u32, tgid, 0);
+        if ok0.is_err() || ok1.is_err() {
+            warn!("TASK_OFFSETS: failed to write task_struct offsets");
+        } else {
+            info!(
+                "eBPF: TASK_OFFSETS task_struct.real_parent={real_parent} tgid={tgid} (from BTF)"
+            );
+        }
+    }
 }
 
 /// Query sizeof(struct inode) from kernel BTF and write it to the INODE_SIZE map.
@@ -1034,7 +1420,7 @@ fn attach_lsm(_bpf: &mut ()) {}
 /// Non-critical - if it fails, the sensor continues without XDP.
 #[cfg(feature = "ebpf")]
 fn attach_xdp(bpf: &mut aya::Ebpf) {
-    use aya::programs::{Xdp, XdpFlags};
+    use aya::programs::{Xdp, XdpMode};
 
     let iface = match detect_default_interface() {
         Some(i) => i,
@@ -1058,7 +1444,7 @@ fn attach_xdp(bpf: &mut aya::Ebpf) {
                 return;
             }
             // Use SKB mode (generic) for maximum compatibility.
-            // Native mode (XdpFlags::default()) is faster but requires driver support.
+            // Native mode (XdpMode::Driver) is faster but requires driver support.
             //
             // 2026-05-08: do NOT early-return on attach failure. The most
             // common cause is `EBUSY` because the previous sensor instance
@@ -1075,7 +1461,7 @@ fn attach_xdp(bpf: &mut aya::Ebpf) {
             // (the maps it references can still be updated by the agent)
             // until either the kernel reaps the orphaned link or the
             // operator triggers a clean detach + re-attach cycle.
-            let attach_outcome = xdp.attach(&iface, XdpFlags::SKB_MODE);
+            let attach_outcome = xdp.attach(&iface, XdpMode::Skb);
             match &attach_outcome {
                 Ok(_) => {
                     info!(iface = %iface, "eBPF: innerwarden_xdp → {iface} (XDP firewall) ✅");
@@ -1130,9 +1516,6 @@ fn attach_xdp(bpf: &mut aya::Ebpf) {
 #[cfg(not(feature = "ebpf"))]
 fn attach_xdp(_bpf: &mut ()) {}
 
-/// Start the eBPF collector. Loads programs, attaches tracepoints, reads ring buffer.
-///
-/// Events flow through the same mpsc channel as all other collectors.
 // ---------------------------------------------------------------------------
 // Kernel filter population - shared runtime allowlists
 // ---------------------------------------------------------------------------
@@ -1338,6 +1721,171 @@ fn populate_kernel_filters(bpf: &mut aya::Ebpf) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// InnerWarden self-suppression (keep our OWN syscalls out of the ring buffer)
+// ---------------------------------------------------------------------------
+//
+// The sensor, agent, watchdog and supervisor are heavy multi-threaded tokio
+// programs. Their worker threads run under comm="tokio-rt-worker", which the
+// comm-keyed COMM_ALLOWLIST cannot match (it only sees the process comm, e.g.
+// "innerwarden-age"). On a busy node — observed on a real k3s cloud box where
+// the agent's tokio threads were 75% of the captured eBPF stream — InnerWarden's
+// own syscalls flood the ring buffer and starve the real host + container signal
+// (events dropped at RingBuf::reserve before they are ever processed). The
+// userspace `comm.starts_with("innerwarden")` filter runs AFTER reserve, so it
+// cannot save the ring slot.
+//
+// Fix: suppress IN-KERNEL by CGROUP. All of a process's threads share one
+// cgroup, so a single id covers every tokio worker. We seed CGROUP_ALLOWLIST
+// (value 1 = skip non-critical events; the in-kernel `is_cgroup_allowed()` gate
+// already consults it, while genuine critical paths — credential reads, IMDS,
+// the kill-chain — still emit) with InnerWarden's own cgroups and refresh on a
+// timer so a service restart (which lands in a fresh cgroup) is followed.
+//
+// Identity is NON-FORGEABLE: a process is "InnerWarden" only when /proc/<pid>/exe
+// resolves to an `innerwarden-*` binary in the sensor's own install directory.
+// We deliberately do NOT trust comm (an attacker could set comm=innerwarden-x to
+// get its own cgroup suppressed and go invisible).
+
+/// Parse the cgroup-v2 relative path from `/proc/<pid>/cgroup` contents.
+/// v2 is a single `0::<path>` line. Returns the `<path>` (leading slash kept).
+#[allow(dead_code)]
+fn parse_cgroup_v2_rel_path(content: &str) -> Option<&str> {
+    content.lines().find_map(|l| l.strip_prefix("0::"))
+}
+
+/// True when `exe` is one of InnerWarden's own binaries — `innerwarden-*` living
+/// in `install_dir` (the sensor's own binary directory). Non-forgeable: keyed on
+/// the real binary behind `/proc/<pid>/exe`, never on comm.
+#[allow(dead_code)]
+fn is_innerwarden_exe(exe: &std::path::Path, install_dir: &std::path::Path) -> bool {
+    exe.parent() == Some(install_dir)
+        && exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("innerwarden-"))
+}
+
+/// Compute the (to_add, to_remove) delta for the self-cgroup allowlist: add ids
+/// newly seen, remove ids we previously added that are gone (e.g. a restarted
+/// service's stale cgroup). Pure set algebra so it is unit-testable.
+#[allow(dead_code)]
+fn cgroup_allowlist_delta(
+    current: &std::collections::BTreeSet<u64>,
+    previously_added: &std::collections::BTreeSet<u64>,
+) -> (Vec<u64>, Vec<u64>) {
+    let to_add = current.difference(previously_added).copied().collect();
+    let to_remove = previously_added.difference(current).copied().collect();
+    (to_add, to_remove)
+}
+
+/// Build the absolute cgroup-v2 directory path for a process from the contents
+/// of its `/proc/<pid>/cgroup` file: `<unified-mount>/<rel>`. Pure (no I/O) so
+/// the path-join logic is unit-testable independent of the host; the inode stat
+/// lives in `cgroup_id_of_pid`. `None` on cgroup v1 (no `0::` line).
+#[allow(dead_code)]
+fn cgroup_dir_path(cgroup_file: &str) -> Option<std::path::PathBuf> {
+    let rel = parse_cgroup_v2_rel_path(cgroup_file)?;
+    Some(std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+}
+
+/// Resolve the cgroup-v2 id of a pid: the inode of its cgroup directory under
+/// `/sys/fs/cgroup`, which is exactly what `bpf_get_current_cgroup_id()` returns
+/// for tasks in that cgroup. `None` if the process is gone or on cgroup v1.
+/// Thin I/O wrapper over the pure `cgroup_dir_path`; `allow(dead_code)` keeps the
+/// non-`ebpf` build (which still compiles the pure helpers + their tests) clean.
+#[cfg(unix)]
+#[allow(dead_code)]
+fn cgroup_id_of_pid(pid: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let abs = cgroup_dir_path(&content)?;
+    std::fs::metadata(abs).ok().map(|m| m.ino())
+}
+
+// cgroup ids are a Linux/proc concept. On Windows (spec 085 Phase 0) return
+// None; the eBPF run() that consumes this is Linux-only and feature-gated.
+#[cfg(not(unix))]
+#[allow(dead_code)]
+fn cgroup_id_of_pid(_pid: &str) -> Option<u64> {
+    None
+}
+
+/// Pure core of the self-cgroup scan: given `(exe, cgroup_id)` for each running
+/// process, keep only the cgroup ids whose exe is one of InnerWarden's own
+/// binaries in `install_dir`. No `/proc` I/O, so the non-forgeable exe filter
+/// (the no-regression invariant — a `/tmp/innerwarden-evil` or a plain `bash` is
+/// never selected) is unit-testable independent of the host. A `None` id (cgroup
+/// gone / v1) drops the entry.
+#[allow(dead_code)]
+fn select_self_cgroups<'a, I>(
+    procs: I,
+    install_dir: &std::path::Path,
+) -> std::collections::BTreeSet<u64>
+where
+    I: IntoIterator<Item = (&'a std::path::Path, Option<u64>)>,
+{
+    procs
+        .into_iter()
+        .filter(|(exe, _)| is_innerwarden_exe(exe, install_dir))
+        .filter_map(|(_, id)| id)
+        .collect()
+}
+
+/// Cgroup ids of every running InnerWarden process — the sensor itself plus the
+/// agent (whether a systemd service or a watchdog-spawned child), watchdog and
+/// supervisor — identified non-forgeably by exe path. One id per process covers
+/// all of its threads. Thin I/O wrapper: scans `/proc`, resolves each pid's exe,
+/// and defers the keep/drop decision to the pure `select_self_cgroups`. Only
+/// stats the cgroup of a pid whose exe already looks like ours (avoids a stat
+/// per host pid); `select_self_cgroups` re-validates so the invariant holds
+/// regardless. Only called from the feature-gated refresh task.
+#[allow(dead_code)]
+fn innerwarden_self_cgroup_ids(install_dir: &std::path::Path) -> std::collections::BTreeSet<u64> {
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return std::collections::BTreeSet::new();
+    };
+    let procs: Vec<(std::path::PathBuf, Option<u64>)> = rd
+        .flatten()
+        .filter_map(|ent| {
+            let fname = ent.file_name();
+            let pid = fname.to_str()?;
+            if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+            // Only stat the cgroup for our own binaries; the pure core re-checks.
+            if !is_innerwarden_exe(&exe, install_dir) {
+                return None;
+            }
+            Some((exe, cgroup_id_of_pid(pid)))
+        })
+        .collect();
+    select_self_cgroups(procs.iter().map(|(e, id)| (e.as_path(), *id)), install_dir)
+}
+
+/// Re-resolve InnerWarden's self-cgroups and reconcile the in-kernel
+/// CGROUP_ALLOWLIST: add the new ones, drop ones we previously added that have
+/// disappeared. Only touches ids it manages, so it never clobbers entries added
+/// for other reasons. `value 1` = "skip non-critical events" per the map.
+#[cfg(feature = "ebpf")]
+fn refresh_self_cgroup_allowlist(
+    map: &mut aya::maps::HashMap<aya::maps::MapData, u64, u32>,
+    install_dir: &std::path::Path,
+    previously_added: &mut std::collections::BTreeSet<u64>,
+) -> usize {
+    let current = innerwarden_self_cgroup_ids(install_dir);
+    let (to_add, to_remove) = cgroup_allowlist_delta(&current, previously_added);
+    for id in &to_add {
+        let _ = map.insert(id, 1u32, 0);
+    }
+    for id in &to_remove {
+        let _ = map.remove(id);
+    }
+    *previously_added = current;
+    previously_added.len()
+}
+
 /// Architecture syscall entry-wrapper symbol for a bare syscall name.
 /// On x86_64 the SYSCALL_DEFINE macro generates `__x64_sys_<name>`, on aarch64
 /// `__arm64_sys_<name>`. The wrapper takes a single `struct pt_regs *`, from
@@ -1367,23 +1915,25 @@ fn syscall_wrapper_symbol(syscall: &str) -> String {
 /// than one for syscalls with several entry points, e.g. dup2/dup3); each that
 /// resolves is attached to the same program.
 #[cfg(feature = "ebpf")]
-fn attach_syscall_kprobe(bpf: &mut aya::Ebpf, prog_name: &str, syscalls: &[&str]) {
+/// Returns the number of syscall wrappers this program successfully attached to
+/// (0 = not monitored). The caller sums these to detect a host-blind sensor.
+fn attach_syscall_kprobe(bpf: &mut aya::Ebpf, prog_name: &str, syscalls: &[&str]) -> usize {
     use aya::programs::KProbe;
 
     let Some(prog) = bpf.program_mut(prog_name) else {
         warn!("{prog_name}: kprobe program not found in bytecode");
-        return;
+        return 0;
     };
     let kp: &mut KProbe = match prog.try_into() {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "{prog_name}: not a KProbe program");
-            return;
+            return 0;
         }
     };
     if let Err(e) = kp.load() {
         warn!(error = %e, "{prog_name}: kprobe load (verifier) failed");
-        return;
+        return 0;
     }
     let mut attached = 0usize;
     for sc in syscalls {
@@ -1399,6 +1949,7 @@ fn attach_syscall_kprobe(bpf: &mut aya::Ebpf, prog_name: &str, syscalls: &[&str]
     if attached == 0 {
         warn!("{prog_name}: no syscall wrapper symbol resolved - syscall not monitored");
     }
+    attached
 }
 
 #[cfg(feature = "ebpf")]
@@ -1502,35 +2053,40 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
     // `sys_enter` raw_tracepoint dispatch, which fired on EVERY syscall and
     // flooded the EVENTS ring buffer, starving `reserve()` so events never
     // surfaced. Each attach is fail-open (missing symbol → warn + skip).
+    // Count successful attaches: 0 syscall kprobes = the sensor is host-blind
+    // (loaded but nothing attached, e.g. under a restrictive systemd sandbox),
+    // which the health layer must surface instead of reporting "active".
+    let mut attached_progs = 0usize;
     {
-        attach_syscall_kprobe(&mut bpf, "dispatch_execve", &["execve"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_connect", &["connect"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_openat", &["openat"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_ptrace", &["ptrace"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_setuid", &["setuid"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_bind", &["bind"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_mount", &["mount"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_memfd_create", &["memfd_create"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_init_module", &["init_module"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_execve", &["execve"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_connect", &["connect"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_openat", &["openat"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_ptrace", &["ptrace"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_setuid", &["setuid"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_bind", &["bind"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_mount", &["mount"]);
+        attached_progs +=
+            attach_syscall_kprobe(&mut bpf, "dispatch_memfd_create", &["memfd_create"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_init_module", &["init_module"]);
         // dup2 is x86_64-only; dup3 exists on both arches. Attach both candidates;
         // the absent one fails-open on aarch64.
-        attach_syscall_kprobe(&mut bpf, "dispatch_dup", &["dup3", "dup2"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_listen", &["listen"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_mprotect", &["mprotect"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_clone", &["clone"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_dup", &["dup3", "dup2"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_listen", &["listen"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_mprotect", &["mprotect"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_clone", &["clone"]);
         // Spec 070: setns(2) — privilege-provenance pivot (emit-only).
-        attach_syscall_kprobe(&mut bpf, "dispatch_setns", &["setns"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_unlink", &["unlinkat"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_rename", &["renameat2"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_kill", &["kill"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_prctl", &["prctl"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_accept", &["accept4"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_setns", &["setns"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_unlink", &["unlinkat"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_rename", &["renameat2"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_kill", &["kill"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_prctl", &["prctl"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_accept", &["accept4"]);
         // ioperm/iopl are x86_64-only (absent from the aarch64 bytecode →
         // fail-open skip there).
         #[cfg(target_arch = "x86_64")]
         {
-            attach_syscall_kprobe(&mut bpf, "dispatch_ioperm", &["ioperm"]);
-            attach_syscall_kprobe(&mut bpf, "dispatch_iopl", &["iopl"]);
+            attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_ioperm", &["ioperm"]);
+            attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_iopl", &["iopl"]);
         }
     }
 
@@ -1545,6 +2101,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     warn!(error = %e, "innerwarden_privesc: failed to attach to commit_creds");
                 } else {
                     info!("eBPF: innerwarden_privesc → commit_creds (privilege escalation) ✅");
+                    attached_progs += 1;
                 }
             }
         }
@@ -1563,6 +2120,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         warn!(error = %e, "innerwarden_process_exit: failed to attach");
                     } else {
                         info!("eBPF: innerwarden_process_exit → sched_process_exit (raw_tp) ✅");
+                        attached_progs += 1;
                     }
                 }
             }
@@ -1616,6 +2174,24 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
 
     // Attach XDP firewall (non-critical - continues without it)
     attach_xdp(&mut bpf);
+
+    // Record the runtime attach count so the health layer surfaces a
+    // host-blind sensor (bytecode loaded but 0 programs attached) instead of
+    // reporting "active". This is the runtime companion to the static
+    // `ebpf_unavailability_reason` check — see `build_ebpf_status`.
+    EBPF_ATTACHED.store(attached_progs, std::sync::atomic::Ordering::Relaxed);
+    if attached_progs == 0 {
+        error!(
+            "eBPF: 0 programs attached - the sensor is HOST-BLIND. The bytecode \
+             loaded but every attach failed, so kernel syscall detection is OFF \
+             and host telemetry will not flow. Check systemd sandboxing \
+             (RestrictNamespaces / a private mount namespace masking \
+             /sys/kernel/tracing), capabilities (CAP_BPF, CAP_PERFMON, \
+             CAP_SYS_ADMIN), and perf_event_paranoid."
+        );
+    } else {
+        info!("eBPF: attached {attached_progs} syscall/core programs");
+    }
 
     // Phase 2: Firmware security hooks (non-critical on ARM — some x86 only)
     // MSR write monitoring (x86 only — kprobe on native_write_msr)
@@ -1745,6 +2321,37 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
     // Populate kernel-level noise filters BEFORE taking ring buffer borrow
     populate_kernel_filters(&mut bpf);
 
+    // InnerWarden self-suppression: seed SELF_CGROUP with our own services'
+    // cgroups so their syscalls — including the integrity collector's credential
+    // reads — are dropped IN-KERNEL (via `is_self_cgroup()`) before
+    // RingBuf::reserve, instead of flooding the ring and starving real host +
+    // container signal. `take_map` hands ownership to this loop (no borrow
+    // conflict with the EVENTS ring below); the kernel map stays live and the
+    // in-kernel gate keeps consulting it. The refresh runs INLINE in the ring
+    // loop below (a `tokio::spawn`'d task did not get scheduled inside this eBPF
+    // collector); it re-resolves every 30s to follow service restarts.
+    let self_install_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin"));
+    let mut self_cgroup_map = bpf
+        .take_map("SELF_CGROUP")
+        .and_then(|m| aya::maps::HashMap::<_, u64, u32>::try_from(m).ok());
+    let mut self_cgroup_added = std::collections::BTreeSet::new();
+    let mut last_self_refresh = std::time::Instant::now();
+    match self_cgroup_map {
+        Some(ref mut map) => {
+            let n = refresh_self_cgroup_allowlist(map, &self_install_dir, &mut self_cgroup_added);
+            info!(
+                self_cgroups = n,
+                "eBPF: InnerWarden self-cgroup suppression seeded"
+            );
+        }
+        None => warn!(
+            "eBPF: SELF_CGROUP map absent - self-suppression disabled (ring may flood under load)"
+        ),
+    }
+
     // Spec 052 Phase 1d: small in-memory cache that lets the kind=35
     // (LsmDecisionEvent) dispatch arm enrich its event with the comm,
     // filename, and uid captured by the earlier kind=1 (ExecveEvent)
@@ -1833,6 +2440,16 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
     }
 
     loop {
+        // Refresh InnerWarden's own-cgroup suppression set every 30s, inline in
+        // the ring loop (a spawned task never got scheduled here). Follows service
+        // restarts (fresh cgroup) and picks up the agent when it starts after the
+        // sensor. Cheap: a /proc scan gated to once per 30s.
+        if let Some(ref mut map) = self_cgroup_map {
+            if last_self_refresh.elapsed() >= std::time::Duration::from_secs(30) {
+                refresh_self_cgroup_allowlist(map, &self_install_dir, &mut self_cgroup_added);
+                last_self_refresh = std::time::Instant::now();
+            }
+        }
         while let Some(item) = ring_buf.next() {
             let data: &[u8] = &item;
             if data.len() < 4 {
@@ -1867,6 +2484,27 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         continue;
                     }
 
+                    // argv[] captured in-kernel (struct offsets: argv 352..1376 =
+                    // 8 slots x 128 bytes, argc at 1376). Preferred over
+                    // /proc/PID/cmdline in execve_to_event because /proc is already
+                    // gone for a short-lived rm/find by the time this reader runs.
+                    // Older sensor eBPF zeroes argv -> argc 0 -> /proc fallback.
+                    let kernel_argv: Vec<String> = if data.len() >= 1380 {
+                        let argc = (read_u32!(data, 1376..1380) as usize).min(8);
+                        let mut v = Vec::with_capacity(argc);
+                        for i in 0..argc {
+                            let start = 352 + i * 128;
+                            let s = bytes_to_string(&data[start..start + 128]);
+                            if s.is_empty() {
+                                break;
+                            }
+                            v.push(s);
+                        }
+                        v
+                    } else {
+                        Vec::new()
+                    };
+
                     // Spec 052 Phase 1d: cache for join with LsmDecisionEvent
                     // (kind=35). Insert before any early-return below so a
                     // future LSM block on this pid has context to merge.
@@ -1892,9 +2530,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
-                    Some(execve_to_event(
+                    let mut ev = execve_to_event(
                         pid,
                         uid,
                         ppid,
@@ -1902,8 +2541,11 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         container_id.as_deref(),
                         &comm,
                         &filename,
+                        kernel_argv,
                         &host,
-                    ))
+                    );
+                    attach_pod_runtime(&mut ev.details, cident.as_deref());
+                    Some(ev)
                 }
                 // ConnectEvent layout (#[repr(C)]):
                 //   kind(4) pid(4) tgid(4) uid(4) ppid(4) _pad(4) cgroup_id(8) comm(64)
@@ -1934,10 +2576,11 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
-                    Some(connect_to_event(
+                    let mut ev = connect_to_event(
                         pid,
                         uid,
                         ppid,
@@ -1948,7 +2591,9 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         port,
                         &host,
                         exe_path.as_deref(),
-                    ))
+                    );
+                    attach_pod_runtime(&mut ev.details, cident.as_deref());
+                    Some(ev)
                 }
                 // FileOpenEvent layout (#[repr(C)]):
                 //   kind(4) pid(4) uid(4) ppid(4) cgroup_id(8) comm(64) filename(256) flags(4)
@@ -1968,9 +2613,11 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
+                    let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
 
-                    Some(file_open_to_event(
+                    let mut ev = file_open_to_event(
                         pid,
                         uid,
                         ppid,
@@ -1980,7 +2627,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &filename,
                         flags,
                         &host,
-                    ))
+                        exe_path.as_deref(),
+                    );
+                    attach_pod_runtime(&mut ev.details, cident.as_deref());
+                    Some(ev)
                 }
                 // FileWrite from LSM file_open hook (same layout as FileOpenEvent)
                 // Emitted when a non-allowlisted process writes to sensitive paths.
@@ -1999,9 +2649,11 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
+                    let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
 
-                    Some(file_open_to_event(
+                    let mut ev = file_open_to_event(
                         pid,
                         uid,
                         ppid,
@@ -2011,7 +2663,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &filename,
                         flags,
                         &host,
-                    ))
+                        exe_path.as_deref(),
+                    );
+                    attach_pod_runtime(&mut ev.details, cident.as_deref());
+                    Some(ev)
                 }
                 // PrivEscEvent layout (#[repr(C)]):
                 //   kind(4) pid(4) tgid(4) old_uid(4) new_uid(4) _pad(4) cgroup_id(8) comm(64) ts_ns(8)
@@ -2027,7 +2682,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         continue;
                     }
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     privesc_to_event(
                         pid,
@@ -2038,6 +2694,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &comm,
                         &host,
                     )
+                    .map(|mut ev| {
+                        attach_pod_runtime(&mut ev.details, cident.as_deref());
+                        ev
+                    })
                 }
                 // LSM blocked execution - uses ExecveEvent layout but kind=6
                 // Same offsets as ExecveEvent: kind(4) pid(4) tgid(4) uid(4) gid(4) ppid(4) cgroup_id(8) comm(64) filename(256)
@@ -2047,8 +2707,13 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
                     let filename = bytes_to_string(&data[96..352]);
+                    let gate = is_exec_gate_block(data);
+                    // Observe mode (spec 077 P2): the gate WOULD have blocked but
+                    // allowed the exec (learning). Logged only, never an incident.
+                    let observe = is_exec_gate_observe(data);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let mut details = serde_json::json!({
                         "pid": pid,
@@ -2056,27 +2721,67 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "comm": comm,
                         "filename": filename,
                         "cgroup_id": cgroup_id,
-                        "action": "blocked",
+                        "action": if observe { "would_block" } else { "blocked" },
                     });
-                    if let Some(ref cid) = container_id {
+                    if gate {
+                        details["blocked_by"] = serde_json::Value::String("exec_gate".to_string());
+                    } else if observe {
+                        details["would_block_by"] =
+                            serde_json::Value::String("exec_gate".to_string());
+                    }
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
-                    let mut tags =
-                        vec!["ebpf".to_string(), "lsm".to_string(), "blocked".to_string()];
+                    let mut tags = vec!["ebpf".to_string(), "lsm".to_string()];
+                    tags.push(if observe { "would_block" } else { "blocked" }.to_string());
+                    if gate || observe {
+                        tags.push("exec_gate".to_string());
+                    }
+                    if observe {
+                        tags.push("observe".to_string());
+                    }
                     let mut entities = vec![];
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         tags.push("container".to_string());
                         entities.push(EntityRef::container(cid));
                     }
+
+                    let (kind, summary, severity) = if observe {
+                        (
+                            "lsm.exec_gate_would_block".to_string(),
+                            format!(
+                                "Execution Gate (observe) would block: {comm} tried to run {filename} \
+                                 — allowed (learning). Approve to allowlist, or it is denied once armed."
+                            ),
+                            // Learning signal, not a block — keep it out of the
+                            // critical incident stream (onboarding can be noisy).
+                            Severity::Info,
+                        )
+                    } else if gate {
+                        (
+                            "lsm.exec_gate_blocked".to_string(),
+                            format!(
+                                "Execution Gate blocked unknown binary: {comm} tried to run {filename}"
+                            ),
+                            Severity::Critical,
+                        )
+                    } else {
+                        (
+                            "lsm.exec_blocked".to_string(),
+                            format!("LSM blocked execution: {comm} tried to run {filename}"),
+                            Severity::Critical,
+                        )
+                    };
 
                     Some(Event {
                         ts: chrono::Utc::now(),
                         host: host.to_string(),
                         source: "ebpf".to_string(),
-                        kind: "lsm.exec_blocked".to_string(),
-                        severity: Severity::Critical,
-                        summary: format!("LSM blocked execution: {comm} tried to run {filename}"),
+                        kind,
+                        severity,
+                        summary,
                         details,
                         tags,
                         entities,
@@ -2091,7 +2796,19 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let comm = bytes_to_string(&data[32..96]);
                     let filename = bytes_to_string(&data[96..352]);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
+
+                    let mut details = serde_json::json!({
+                        "pid": pid,
+                        "uid": uid,
+                        "comm": comm,
+                        "filename": filename,
+                        "cgroup_id": cgroup_id,
+                        "container_id": container_id.as_deref().unwrap_or(""),
+                        "overlay_upper": true,
+                    });
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2102,15 +2819,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         summary: format!(
                             "Container drift: {comm} executed {filename} (overlay upper layer)"
                         ),
-                        details: serde_json::json!({
-                            "pid": pid,
-                            "uid": uid,
-                            "comm": comm,
-                            "filename": filename,
-                            "cgroup_id": cgroup_id,
-                            "container_id": container_id.as_deref().unwrap_or(""),
-                            "overlay_upper": true,
-                        }),
+                        details,
                         tags: vec!["ebpf".to_string(), "container_drift".to_string()],
                         entities: vec![],
                     })
@@ -2142,7 +2851,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     // event's `ts` field is the JSONL-canonical UTC time so
                     // operators don't have to translate boot-relative ns.
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     // PR-A: the `reason` field at offset 12 was repurposed
                     // as `hook_id` (sensor-ebpf-types LSM_HOOK_*) so kind=35
@@ -2184,9 +2894,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "action": "blocked",
                         "source_program": source_program,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_deref());
                     if let Some(ctx) = exec_ctx {
                         details["filename"] = serde_json::Value::String(ctx.filename.clone());
                         details["comm"] = serde_json::Value::String(ctx.comm.clone());
@@ -2208,7 +2919,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         format!("hook:{hook_name}"),
                     ];
                     let mut entities = vec![];
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         tags.push("container".to_string());
                         entities.push(EntityRef::container(cid));
                     }
@@ -2280,16 +2991,18 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         0x4206 => "PTRACE_SEIZE",
                         _ => "UNKNOWN",
                     };
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "target_pid": target_pid,
                         "request": request, "request_name": request_name,
                         "comm": comm, "cgroup_id": cgroup_id,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     let mut tags = vec![
                         "ebpf".to_string(),
@@ -2323,14 +3036,16 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "target_uid": target_uid,
                         "comm": comm, "cgroup_id": cgroup_id,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2358,7 +3073,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let comm = bytes_to_string(&data[32..96]);
 
                     let ip = std::net::Ipv4Addr::from(addr_raw);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     // Low ports or INADDR_ANY are more suspicious
                     let severity = if port < 1024 || addr_raw == 0 {
@@ -2372,9 +3088,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "addr": format!("{ip}"), "family": family,
                         "comm": comm, "cgroup_id": cgroup_id,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2404,7 +3121,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let target = bytes_to_string(&data[344..600]);
                     let fs_type = bytes_to_string(&data[600..632]);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
                     let in_container = cgroup_id > 1;
 
                     let severity = if in_container {
@@ -2419,9 +3137,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "comm": comm, "cgroup_id": cgroup_id,
                         "in_container": in_container,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     let mut tags = vec!["ebpf".to_string(), "mount".to_string()];
                     if in_container {
@@ -2452,15 +3171,17 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let comm = bytes_to_string(&data[24..88]);
                     let name = bytes_to_string(&data[88..344]);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "flags": flags,
                         "name": name, "comm": comm, "cgroup_id": cgroup_id,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2520,6 +3241,11 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         2 => "stderr",
                         _ => "fd",
                     };
+                    // Resolve ppid so reverse_shell can correlate a fork()'d
+                    // reverse shell (connect in the parent, dup2 onto stdio in the
+                    // child — socat/python). Only for stdio redirects (newfd<=2,
+                    // the reverse-shell case); a non-stdio dup skips the /proc read.
+                    let ppid = if newfd <= 2 { resolve_ppid(pid) } else { 0 };
                     Some(Event {
                         ts: chrono::Utc::now(),
                         host: host.to_string(),
@@ -2529,7 +3255,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         summary: format!(
                             "{comm} (PID {pid}) redirected fd {oldfd} → {fd_name}({newfd})"
                         ),
-                        details: serde_json::json!({"pid": pid, "uid": uid, "oldfd": oldfd, "newfd": newfd, "comm": comm}),
+                        details: serde_json::json!({"pid": pid, "uid": uid, "oldfd": oldfd, "newfd": newfd, "comm": comm, "ppid": ppid}),
                         tags: vec!["ebpf".to_string(), "reverse_shell".to_string()],
                         entities: vec![],
                     })
@@ -3153,16 +3879,29 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
             return;
         }
 
-        // Wait for ring buffer readability via epoll, or fall back to 100ms poll
+        // Wait for ring buffer readability via epoll, but ALWAYS with a 100ms
+        // timeout so the ring is still drained on kernels where the ring-buffer
+        // epoll wakeup is not delivered reliably. Observed on Linux 7.0 (Azure):
+        // the kprobes fire (run_cnt climbs into the thousands) but
+        // `afd.readable().await` blocked forever after the initial drain, so
+        // every subsequent event accumulated in the ring unseen and userspace
+        // captured nothing. Polling on timeout makes the drain robust to
+        // wakeup-delivery differences across kernels while keeping the fast
+        // epoll-wakeup path on kernels that signal correctly.
         if let Some(ref afd) = async_fd {
-            // Wait until the kernel signals data is available on the ring buffer fd
-            match afd.readable().await {
-                Ok(mut guard) => {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), afd.readable()).await
+            {
+                Ok(Ok(mut guard)) => {
                     guard.clear_ready();
                 }
-                Err(_) => {
-                    // epoll error - fall back to short sleep this iteration
+                Ok(Err(_)) => {
+                    // epoll error - fall back to a short sleep this iteration
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    // No wakeup within 100ms: loop back and drain the ring
+                    // directly (poll fallback). This is the path that keeps
+                    // Linux 7.0 capturing.
                 }
             }
         } else {
@@ -3189,6 +3928,45 @@ pub async fn run(_tx: crate::event_channels::EbpfTx, _host: String) {
 mod tests {
     use super::*;
 
+    // Execution Gate: kind-6 events from the gate carry b"EXEC_GATE" in
+    // argv[0] (bytes 352..361) and the REAL attempted path in filename;
+    // legacy/kill-chain/neural kind-6 emitters zero argv. This anchor pins
+    // the marker offset against ExecveEvent layout drift.
+    #[test]
+    fn exec_gate_marker_detected_only_when_present() {
+        // Full-size ExecveEvent buffer, argv zeroed → NOT a gate block.
+        let mut data = vec![0u8; 1400];
+        assert!(!is_exec_gate_block(&data));
+        // Marker at argv[0] → gate block.
+        data[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len()]
+            .copy_from_slice(EXEC_GATE_MARKER);
+        assert!(is_exec_gate_block(&data));
+        // Marker must be exact — a prefix is not enough.
+        data[EXECVE_ARGV0_OFFSET + 8] = 0;
+        assert!(!is_exec_gate_block(&data));
+        // Buffer too short for argv (legacy 352-byte minimum) → never a gate block.
+        assert!(!is_exec_gate_block(&vec![0u8; 352]));
+        assert!(!is_exec_gate_block(b""));
+    }
+
+    // Spec 077 P2: observe mode emits EXEC_OBSV (would-block, allowed) — distinct
+    // from EXEC_GATE (real block). The two markers must not cross-detect.
+    #[test]
+    fn exec_observe_marker_distinct_from_block() {
+        let mut data = vec![0u8; 1400];
+        assert!(!is_exec_gate_observe(&data));
+        data[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_OBSERVE_MARKER.len()]
+            .copy_from_slice(EXEC_OBSERVE_MARKER);
+        assert!(is_exec_gate_observe(&data));
+        assert!(!is_exec_gate_block(&data)); // observe is NOT a block
+                                             // and a real block is not an observe
+        let mut blk = vec![0u8; 1400];
+        blk[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len()]
+            .copy_from_slice(EXEC_GATE_MARKER);
+        assert!(is_exec_gate_block(&blk));
+        assert!(!is_exec_gate_observe(&blk));
+    }
+
     // Spec 069: the syscall handlers attach as kprobes on the architecture
     // syscall ENTRY WRAPPER. The symbol must match the build-host arch.
     #[test]
@@ -3203,46 +3981,332 @@ mod tests {
         assert!(syscall_wrapper_symbol("openat").ends_with("sys_openat"));
     }
 
-    // Spec 069: resolve_container_id is memoised; a second lookup for the same
-    // PID must return the same value (PID 0 has no container → None, cached).
+    // Spec 069: resolve_container_identity is memoised; a second lookup for the
+    // same PID must return the same value (PID 0 has no container → None, cached).
     #[test]
-    fn resolve_container_id_is_memoised() {
-        let first = resolve_container_id(0);
-        let second = resolve_container_id(0);
+    fn resolve_container_identity_is_memoised() {
+        let first = resolve_container_identity(0);
+        let second = resolve_container_identity(0);
         assert_eq!(first, second);
         assert_eq!(first, None);
     }
 
     // Spec 069: the cgroup parser is pure; cover Docker/Podman/k8s + no-match.
+    // Convenience: the 12-char container id half of the parsed identity.
     #[test]
     fn parse_container_id_from_cgroup_formats() {
+        let cid = |s: &str| parse_container_identity_from_cgroup(s).map(|c| c.container_id);
         assert_eq!(
-            parse_container_id_from_cgroup("0::/docker/abcdef0123456789aa"),
+            cid("0::/docker/abcdef0123456789aa"),
             Some("abcdef012345".to_string())
         );
         assert_eq!(
-            parse_container_id_from_cgroup("0::/libpod-fedcba9876543210bb.scope"),
+            cid("0::/libpod-fedcba9876543210bb.scope"),
             Some("fedcba987654".to_string())
         );
         assert_eq!(
-            parse_container_id_from_cgroup("0::/kubepods/besteffort/pod1234/0011223344556677"),
+            cid("0::/kubepods/besteffort/pod1234/0011223344556677"),
+            Some("001122334455".to_string())
+        );
+        // systemd cgroup driver (the real k3s/k8s shape) — previously mis-parsed
+        // to the constant "cri-containe" for every pod.
+        assert_eq!(
+            cid(
+                "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pode2ad6fd3_524d.slice/cri-containerd-8317eb4a8dd5fbb4b3f663b25f6d39c943bb1cf0ba0c14b973c9ad069605f57f.scope"
+            ),
+            Some("8317eb4a8dd5".to_string())
+        );
+        // systemd-driver Docker + CRI-O.
+        assert_eq!(
+            cid("0::/system.slice/docker-abcdef0123456789aa.scope"),
+            Some("abcdef012345".to_string())
+        );
+        assert_eq!(
+            cid("0::/machine.slice/crio-001122334455667788.scope"),
             Some("001122334455".to_string())
         );
         // Short ids and unrelated lines yield nothing.
-        assert_eq!(parse_container_id_from_cgroup("0::/docker/short"), None);
-        assert_eq!(parse_container_id_from_cgroup("0::/user.slice"), None);
-        assert_eq!(parse_container_id_from_cgroup("0::/"), None);
+        assert_eq!(cid("0::/docker/short"), None);
+        assert_eq!(cid("0::/user.slice"), None);
+        assert_eq!(cid("0::/"), None);
+    }
+
+    // Spec 084 P0: the per-tenant attribution anchors — pod_uid (the k8s pod
+    // UID) and runtime — parsed from the cgroup path for BOTH cgroup drivers.
+    #[test]
+    fn parse_pod_identity_k8s_systemd_driver() {
+        // Real k3s/containerd systemd-driver shape: a full 32-hex pod UID is
+        // escaped with underscores inside the `kubepods-besteffort-pod<uid>.slice`
+        // segment; the container id lives in the `cri-containerd-<id>.scope` leaf.
+        let id = parse_container_identity_from_cgroup(
+            "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pode2ad6fd3_524d_4f6a_9b1c_0a1b2c3d4e5f.slice/cri-containerd-8317eb4a8dd5fbb4b3f663b25f6d39c943bb1cf0ba0c14b973c9ad069605f57f.scope"
+        )
+        .expect("k8s pod cgroup must parse");
+        assert_eq!(id.container_id, "8317eb4a8dd5");
+        assert_eq!(
+            id.pod_uid.as_deref(),
+            Some("e2ad6fd3-524d-4f6a-9b1c-0a1b2c3d4e5f")
+        );
+        assert_eq!(id.runtime.as_deref(), Some("containerd"));
+    }
+
+    #[test]
+    fn parse_pod_identity_k8s_cgroupfs_driver() {
+        // cgroupfs driver keeps the canonical dashed UUID and a bare-hex leaf.
+        let id = parse_container_identity_from_cgroup(
+            "0::/kubepods/burstable/pod3f5a8b2c-1d4e-4f5a-8b2c-9f0a1b2c3d4e/8317eb4a8dd5fbb4b3f663b25f6d39c943bb1cf0ba0c14b973c9ad069605f57f"
+        )
+        .expect("cgroupfs k8s pod must parse");
+        assert_eq!(id.container_id, "8317eb4a8dd5");
+        assert_eq!(
+            id.pod_uid.as_deref(),
+            Some("3f5a8b2c-1d4e-4f5a-8b2c-9f0a1b2c3d4e")
+        );
+        assert_eq!(id.runtime.as_deref(), Some("containerd"));
+    }
+
+    #[test]
+    fn parse_identity_runtime_inference() {
+        // systemd-driver Docker leaf → docker; bare cgroupfs docker path → docker.
+        assert_eq!(
+            parse_container_identity_from_cgroup(
+                "0::/system.slice/docker-abcdef0123456789aa.scope"
+            )
+            .and_then(|c| c.runtime),
+            Some("docker".to_string())
+        );
+        assert_eq!(
+            parse_container_identity_from_cgroup("0::/docker/abcdef0123456789aa")
+                .and_then(|c| c.runtime),
+            Some("docker".to_string())
+        );
+        // CRI-O leaf prefix → crio; podman libpod → podman.
+        assert_eq!(
+            parse_container_identity_from_cgroup("0::/machine.slice/crio-001122334455667788.scope")
+                .and_then(|c| c.runtime),
+            Some("crio".to_string())
+        );
+        assert_eq!(
+            parse_container_identity_from_cgroup("0::/libpod-fedcba9876543210bb.scope")
+                .and_then(|c| c.runtime),
+            Some("podman".to_string())
+        );
+        // A plain Docker container (no pod) has no pod_uid.
+        assert_eq!(
+            parse_container_identity_from_cgroup("0::/docker/abcdef0123456789aa")
+                .and_then(|c| c.pod_uid),
+            None
+        );
+    }
+
+    #[test]
+    fn pod_uid_validator_rejects_non_uuids() {
+        assert!(is_pod_uid("3f5a8b2c-1d4e-4f5a-8b2c-9f0a1b2c3d4e")); // dashed
+        assert!(is_pod_uid("3f5a8b2c1d4e4f5a8b2c9f0a1b2c3d4e")); // undashed 32 hex
+        assert!(!is_pod_uid("1234")); // too short
+        assert!(!is_pod_uid("g_not_hex_g_not_hex_g_not_hex_gg")); // non-hex
+        assert!(!is_pod_uid("")); // empty
+    }
+
+    // Spec 084 P0: GOLD fixtures captured LIVE from a real k3s v1.36.2+k3s1
+    // (containerd) node on 2026-06-29 — two pods in two tenant namespaces. The
+    // `pod_uid` asserted here is the exact value `kubectl get pod -o
+    // jsonpath='{.metadata.uid}'` returned, proving the cgroup-derived UID
+    // round-trips to the Kubernetes API object without any label trust. If a
+    // future containerd/k3s release changes the cgroup shape this test fails and
+    // the parser must be updated to keep per-tenant attribution at 100%.
+    #[test]
+    fn parse_real_k3s_v136_cgroups_gold() {
+        let a = parse_container_identity_from_cgroup(
+            "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podd729dbb9_5684_498d_9c5f_7244bfbba548.slice/cri-containerd-4858a7b75b55f36c13e0991cf8370fd2d05edbf33d7d813c06f4cb7a24318025.scope"
+        )
+        .expect("real k3s pod-a cgroup must parse");
+        assert_eq!(a.container_id, "4858a7b75b55");
+        assert_eq!(
+            a.pod_uid.as_deref(),
+            Some("d729dbb9-5684-498d-9c5f-7244bfbba548")
+        );
+        assert_eq!(a.runtime.as_deref(), Some("containerd"));
+
+        let b = parse_container_identity_from_cgroup(
+            "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podb9b2ae1e_9f07_4656_b1f5_71d0f7cb6191.slice/cri-containerd-1a0fb1e4f294cafd9e0da8c2e65de9310bccf1f6f6c950ecb09aa5f9343dfa1c.scope"
+        )
+        .expect("real k3s pod-b cgroup must parse");
+        assert_eq!(b.container_id, "1a0fb1e4f294");
+        assert_eq!(
+            b.pod_uid.as_deref(),
+            Some("b9b2ae1e-9f07-4656-b1f5-71d0f7cb6191")
+        );
+        assert_eq!(b.runtime.as_deref(), Some("containerd"));
+    }
+
+    // Spec 084 P0: directly exercise the pod/runtime enrichment that the ring
+    // decode arms apply to every container-scoped event. The decode arms
+    // themselves only run against a live kernel ring buffer (covered by the
+    // on-box live validation), so these cover the same logic via the helper +
+    // builders — the exact `let mut ev = builder(..); attach_pod_runtime(&mut
+    // ev.details, cident.as_deref())` shape used in every arm.
+    #[test]
+    fn attach_pod_runtime_adds_pod_and_runtime() {
+        let id = ContainerIdentity {
+            container_id: "4858a7b75b55".to_string(),
+            pod_uid: Some("d729dbb9-5684-498d-9c5f-7244bfbba548".to_string()),
+            runtime: Some("containerd".to_string()),
+        };
+        let mut details = serde_json::json!({"pid": 1});
+        attach_pod_runtime(&mut details, Some(&id));
+        assert_eq!(details["pod_uid"], "d729dbb9-5684-498d-9c5f-7244bfbba548");
+        assert_eq!(details["runtime"], "containerd");
+
+        // Host process (None) adds nothing.
+        let mut bare = serde_json::json!({"pid": 1});
+        attach_pod_runtime(&mut bare, None);
+        assert!(bare.get("pod_uid").is_none());
+        assert!(bare.get("runtime").is_none());
+
+        // A plain Docker container (no pod): runtime present, pod_uid absent.
+        let docker = ContainerIdentity {
+            container_id: "abcdef012345".to_string(),
+            pod_uid: None,
+            runtime: Some("docker".to_string()),
+        };
+        let mut d2 = serde_json::json!({});
+        attach_pod_runtime(&mut d2, Some(&docker));
+        assert_eq!(d2["runtime"], "docker");
+        assert!(d2.get("pod_uid").is_none());
+    }
+
+    // Zero-regression guard for the Arc-cached identity: a repeated lookup of
+    // the same pid must serve the SAME allocation (a refcount bump), not
+    // re-resolve or clone. In a non-container env (typical CI) both resolve to
+    // None; the assertion then only checks the cache stays consistent.
+    #[test]
+    fn resolve_container_identity_cache_shares_the_arc() {
+        let pid = std::process::id();
+        let a = resolve_container_identity(pid);
+        let b = resolve_container_identity(pid);
+        match (a, b) {
+            (Some(x), Some(y)) => assert!(
+                std::sync::Arc::ptr_eq(&x, &y),
+                "cache hit must share the Arc, not re-clone the identity"
+            ),
+            (None, None) => {}
+            _ => panic!("cache returned inconsistent Some/None for the same pid"),
+        }
+    }
+
+    #[test]
+    fn builders_then_attach_carry_full_pod_identity() {
+        let id = ContainerIdentity {
+            container_id: "4858a7b75b55".to_string(),
+            pod_uid: Some("d729dbb9-5684-498d-9c5f-7244bfbba548".to_string()),
+            runtime: Some("containerd".to_string()),
+        };
+        // execve
+        let mut ev = execve_to_event(
+            0,
+            0,
+            1,
+            99,
+            Some("4858a7b75b55"),
+            "bash",
+            "/usr/bin/id",
+            vec![],
+            "h",
+        );
+        attach_pod_runtime(&mut ev.details, Some(&id));
+        assert_eq!(ev.details["container_id"], "4858a7b75b55");
+        assert_eq!(
+            ev.details["pod_uid"],
+            "d729dbb9-5684-498d-9c5f-7244bfbba548"
+        );
+        assert_eq!(ev.details["runtime"], "containerd");
+        assert!(ev.tags.contains(&"container".to_string()));
+
+        // connect
+        let ip = Ipv4Addr::new(8, 8, 8, 8);
+        let mut ev = connect_to_event(
+            0,
+            0,
+            1,
+            99,
+            Some("4858a7b75b55"),
+            "curl",
+            ip,
+            443,
+            "h",
+            None,
+        );
+        attach_pod_runtime(&mut ev.details, Some(&id));
+        assert_eq!(
+            ev.details["pod_uid"],
+            "d729dbb9-5684-498d-9c5f-7244bfbba548"
+        );
+        assert_eq!(ev.details["runtime"], "containerd");
+
+        // file_open
+        let mut ev = file_open_to_event(
+            0,
+            0,
+            1,
+            99,
+            Some("4858a7b75b55"),
+            "cat",
+            "/etc/hostname",
+            0,
+            "h",
+            None,
+        );
+        attach_pod_runtime(&mut ev.details, Some(&id));
+        assert_eq!(ev.details["runtime"], "containerd");
+
+        // privesc inside a container is Critical; comm not in PRIVESC_ALLOWED.
+        let mut ev =
+            privesc_to_event(0, 1000, 0, 99, Some("4858a7b75b55"), "zz_attacker", "h").unwrap();
+        attach_pod_runtime(&mut ev.details, Some(&id));
+        assert_eq!(
+            ev.details["pod_uid"],
+            "d729dbb9-5684-498d-9c5f-7244bfbba548"
+        );
+        assert_eq!(ev.severity, Severity::Critical);
     }
 
     #[test]
     fn execve_event_maps_to_shell_command_exec() {
         // Use PID 0 to avoid reading /proc/<pid>/cmdline of a real process.
-        let event = execve_to_event(0, 0, 1, 0, None, "bash", "/usr/bin/curl", "test-host");
+        let event = execve_to_event(
+            0,
+            0,
+            1,
+            0,
+            None,
+            "bash",
+            "/usr/bin/curl",
+            vec![],
+            "test-host",
+        );
         assert_eq!(event.source, "ebpf");
         assert_eq!(event.kind, "shell.command_exec");
         assert!(event.summary.contains("curl"));
         assert_eq!(event.details["pid"], 0);
         assert_eq!(event.details["ppid"], 1);
+    }
+
+    #[test]
+    fn execve_prefers_kernel_argv_over_proc() {
+        // A short-lived rm exits before /proc can be read; the in-kernel argv is
+        // the only reliable source of `-rf` + the target. When the kernel gives us
+        // the full argv, it must be used verbatim (not the /proc[pid=0] fallback).
+        let kargv = vec![
+            "/usr/bin/rm".to_string(),
+            "-rf".to_string(),
+            "/home/user/data".to_string(),
+        ];
+        let event = execve_to_event(0, 0, 1, 0, None, "rm", "/usr/bin/rm", kargv, "h");
+        assert_eq!(event.details["argc"], 3);
+        assert_eq!(event.details["command"], "/usr/bin/rm -rf /home/user/data");
+        assert_eq!(event.details["argv"][1], "-rf");
+        assert_eq!(event.details["argv"][2], "/home/user/data");
     }
 
     #[test]
@@ -3255,6 +4319,7 @@ mod tests {
             Some("abc123def456"),
             "bash",
             "/usr/bin/curl",
+            vec![],
             "test-host",
         );
         assert_eq!(event.details["container_id"], "abc123def456");
@@ -3325,6 +4390,7 @@ mod tests {
             "/etc/shadow",
             0x1, // O_WRONLY
             "test-host",
+            None,
         );
         assert_eq!(event.kind, "file.write_access");
         assert_eq!(event.severity, Severity::High);
@@ -3343,9 +4409,33 @@ mod tests {
             "/etc/passwd",
             0x0, // O_RDONLY
             "test-host",
+            None,
         );
         assert_eq!(event.kind, "file.read_access");
         assert_eq!(event.severity, Severity::Info);
+        // No exe_path passed -> the field is absent (data_exfil then falls back to
+        // the comm exemption).
+        assert!(event.details.get("exe_path").is_none());
+    }
+
+    #[test]
+    fn file_open_event_carries_exe_path_when_present() {
+        // The non-forgeable exe path (from the execve cache) is stamped onto file
+        // read/write events so data_exfil_ebpf can reject a comm-spoofed daemon
+        // reading from an untrusted path (`cp evil /tmp/sshd`).
+        let event = file_open_to_event(
+            100,
+            1000,
+            1,
+            0,
+            None,
+            "sshd",
+            "/home/u/.aws/credentials",
+            0x0,
+            "test-host",
+            Some("/tmp/sshd"),
+        );
+        assert_eq!(event.details["exe_path"], "/tmp/sshd");
     }
 
     #[test]
@@ -3428,7 +4518,7 @@ mod tests {
         // Host process shouldn't have a container ID
         // (pid 1 is always the init process on the host)
         if cfg!(target_os = "linux") {
-            assert!(resolve_container_id(1).is_none());
+            assert!(resolve_container_identity(1).is_none());
         }
     }
 
@@ -3524,5 +4614,184 @@ mod tests {
         assert_eq!(resolve_target_comm(6, 0), ""); // SIGABRT (newly covered)
         assert_eq!(resolve_target_comm(40, 0), ""); // real-time signal
         assert_eq!(resolve_target_comm(19, 0), ""); // SIGSTOP
+    }
+
+    // ---- InnerWarden self-suppression (CGROUP_ALLOWLIST seeding) ----
+
+    #[test]
+    fn parse_cgroup_v2_rel_path_extracts_the_unified_path() {
+        // cgroup v2: single "0::<path>" line.
+        assert_eq!(
+            parse_cgroup_v2_rel_path("0::/system.slice/innerwarden-agent.service\n"),
+            Some("/system.slice/innerwarden-agent.service")
+        );
+        // Root cgroup.
+        assert_eq!(parse_cgroup_v2_rel_path("0::/\n"), Some("/"));
+        // cgroup v1 (no "0::" line) → None, we only handle v2.
+        assert_eq!(
+            parse_cgroup_v2_rel_path("12:devices:/\n11:memory:/system.slice\n"),
+            None
+        );
+        assert_eq!(parse_cgroup_v2_rel_path(""), None);
+    }
+
+    #[test]
+    fn is_innerwarden_exe_is_nonforgeable_and_dir_scoped() {
+        let dir = std::path::Path::new("/usr/local/bin");
+        // Our own binaries in the install dir → true.
+        for b in [
+            "innerwarden-sensor",
+            "innerwarden-agent",
+            "innerwarden-watchdog",
+            "innerwarden-supervisor",
+        ] {
+            assert!(is_innerwarden_exe(&dir.join(b), dir), "{b} should match");
+        }
+        // Right name, WRONG directory (a dropped/renamed copy) → false: an
+        // attacker can't drop /tmp/innerwarden-evil to get itself suppressed.
+        assert!(!is_innerwarden_exe(
+            std::path::Path::new("/tmp/innerwarden-evil"),
+            dir
+        ));
+        // In the dir but not one of ours → false.
+        assert!(!is_innerwarden_exe(&dir.join("bash"), dir));
+        // Prefix-only collision outside the family is still gated by the dir +
+        // the `innerwarden-` (with dash) prefix.
+        assert!(!is_innerwarden_exe(&dir.join("innerwardenX"), dir));
+    }
+
+    #[test]
+    fn cgroup_allowlist_delta_adds_new_and_drops_stale() {
+        use std::collections::BTreeSet;
+        // First run: nothing tracked yet → everything current is added.
+        let current: BTreeSet<u64> = [10, 20, 30].into_iter().collect();
+        let prev: BTreeSet<u64> = BTreeSet::new();
+        let (add, remove) = cgroup_allowlist_delta(&current, &prev);
+        assert_eq!(add, vec![10, 20, 30]);
+        assert!(remove.is_empty());
+
+        // Agent restarted: its old cgroup (20) is gone, a new one (40) appeared.
+        let prev: BTreeSet<u64> = [10, 20, 30].into_iter().collect();
+        let current: BTreeSet<u64> = [10, 30, 40].into_iter().collect();
+        let (add, remove) = cgroup_allowlist_delta(&current, &prev);
+        assert_eq!(add, vec![40], "the restarted service's new cgroup is added");
+        assert_eq!(remove, vec![20], "the stale cgroup is dropped, not leaked");
+
+        // Steady state: no churn → no map writes.
+        let (add, remove) = cgroup_allowlist_delta(&current, &current);
+        assert!(add.is_empty() && remove.is_empty());
+    }
+
+    #[test]
+    fn cgroup_dir_path_joins_unified_mount_with_the_relative_path() {
+        use std::path::Path;
+        // A normal service cgroup: <mount>/<rel> with the single leading slash
+        // collapsed (join would otherwise treat "/system.slice" as absolute and
+        // discard the mount).
+        assert_eq!(
+            cgroup_dir_path("0::/system.slice/innerwarden-agent.service\n"),
+            Some(Path::new("/sys/fs/cgroup/system.slice/innerwarden-agent.service").to_path_buf())
+        );
+        // Root cgroup → the mount itself.
+        assert_eq!(
+            cgroup_dir_path("0::/\n"),
+            Some(Path::new("/sys/fs/cgroup").to_path_buf())
+        );
+        // A nested k8s pod cgroup, the shape the tenancy resolver walks.
+        assert_eq!(
+            cgroup_dir_path("0::/kubepods/besteffort/pod13e125db/abc123\n"),
+            Some(Path::new("/sys/fs/cgroup/kubepods/besteffort/pod13e125db/abc123").to_path_buf())
+        );
+        // cgroup v1 (no "0::" line) → None: we never fabricate a path.
+        assert_eq!(cgroup_dir_path("11:memory:/system.slice\n"), None);
+    }
+
+    #[test]
+    fn select_self_cgroups_keeps_only_our_binaries_in_the_install_dir() {
+        use std::collections::BTreeSet;
+        use std::path::Path;
+        let dir = Path::new("/usr/local/bin");
+
+        let sensor = dir.join("innerwarden-sensor");
+        let agent = dir.join("innerwarden-agent");
+        let watchdog = dir.join("innerwarden-watchdog");
+        let bash = dir.join("bash");
+        let evil = Path::new("/tmp/innerwarden-evil");
+        let agent_no_cgroup = dir.join("innerwarden-supervisor");
+
+        let procs: Vec<(&Path, Option<u64>)> = vec![
+            (sensor.as_path(), Some(100)),
+            (agent.as_path(), Some(200)),
+            (watchdog.as_path(), Some(300)),
+            (bash.as_path(), Some(400)),       // not ours → dropped
+            (evil, Some(500)),                 // wrong dir → dropped (no evasion)
+            (agent_no_cgroup.as_path(), None), // ours but cgroup gone → dropped
+        ];
+
+        let got = select_self_cgroups(procs, dir);
+        let want: BTreeSet<u64> = [100, 200, 300].into_iter().collect();
+        assert_eq!(got, want);
+    }
+
+    // CROSS-TEST: the no-regression invariant. Self-suppression must NEVER hide a
+    // non-InnerWarden process — that is exactly the bug that would make a rogue
+    // tenant invisible. A renamed/dropped copy in the wrong dir, an ordinary host
+    // binary, and a same-prefix impostor must all be excluded; only the genuine
+    // install-dir binaries survive. If a future refactor widens the exe filter
+    // this test fails before the change can ship.
+    #[test]
+    fn self_suppression_never_selects_a_non_innerwarden_cgroup() {
+        use std::path::Path;
+        let dir = Path::new("/usr/local/bin");
+
+        // Every shape an attacker (or a regression) might use to sneak in.
+        let attacker_shapes = [
+            Path::new("/tmp/innerwarden-evil").to_path_buf(), // right name, wrong dir
+            Path::new("/home/user/innerwarden-agent").to_path_buf(), // copied elsewhere
+            dir.join("innerwardenX"),                         // prefix collision, no dash
+            dir.join("bash"),                                 // ordinary host tool
+            dir.join("sshd"),                                 // ordinary host daemon
+            Path::new("/usr/bin/python3").to_path_buf(),      // a rogue agent runtime
+        ];
+        for (i, exe) in attacker_shapes.iter().enumerate() {
+            let id = 900 + i as u64;
+            let got = select_self_cgroups(vec![(exe.as_path(), Some(id))], dir);
+            assert!(
+                got.is_empty(),
+                "{} must NOT be suppressed (would hide a real process)",
+                exe.display()
+            );
+        }
+
+        // Sanity floor: a genuine binary in the install dir IS selected, so the
+        // test above is proving exclusion, not just an always-empty function.
+        let real = dir.join("innerwarden-agent");
+        assert_eq!(
+            select_self_cgroups(vec![(real.as_path(), Some(42))], dir),
+            std::collections::BTreeSet::from([42])
+        );
+    }
+
+    // Integration smoke (Linux only): the live I/O path resolves a real cgroup id
+    // for our own pid (proc 0 alias) without panicking. This is the only test
+    // that touches /proc + /sys/fs/cgroup, so it is the thin wrapper's coverage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_id_of_pid_resolves_self_on_linux() {
+        // "self" is a valid /proc entry but not all-ascii-digits, so go through
+        // our real numeric pid the way the scanner does.
+        let pid = std::process::id().to_string();
+        // On a cgroup-v2 host this is Some(inode); on a v1-only or restricted
+        // host it is None. Either way it must not panic — that is the contract.
+        let _ = cgroup_id_of_pid(&pid);
+        // And the pure path builder agrees with what /proc/<pid>/cgroup says.
+        if let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+            if content.lines().any(|l| l.starts_with("0::")) {
+                assert!(
+                    cgroup_dir_path(&content).is_some(),
+                    "v2 host must yield a cgroup dir path"
+                );
+            }
+        }
     }
 }

@@ -8,6 +8,26 @@ use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
 pub struct BlockIpIptables;
 
+/// PURE: the `iptables` argv for blocking `ip`. `-I INPUT 1` (insert at top) so
+/// the DROP wins over any earlier ACCEPT for an open port — an appended `-A` DROP
+/// leaks. A function so a regression to `-A` is caught by a unit test.
+fn iptables_block_args(ip: &str) -> Vec<&str> {
+    vec![
+        "iptables",
+        "-I",
+        "INPUT",
+        "1",
+        "-s",
+        ip,
+        "-j",
+        "DROP",
+        "-m",
+        "comment",
+        "--comment",
+        "innerwarden",
+    ]
+}
+
 impl ResponseSkill for BlockIpIptables {
     fn id(&self) -> &'static str {
         "block-ip-iptables"
@@ -16,8 +36,11 @@ impl ResponseSkill for BlockIpIptables {
         "Block IP via iptables"
     }
     fn description(&self) -> &'static str {
-        "Blocks the attacking IP by appending a DROP rule to the INPUT chain using iptables. \
-         Requires: sudo iptables -A INPUT ... (configured in /etc/sudoers.d/innerwarden). \
+        "Blocks the attacking IP by INSERTING a DROP rule at the top of the INPUT chain \
+         (`iptables -I INPUT 1`) so it is evaluated before any ACCEPT for an already-open \
+         port (80/443/22) — an appended `-A` DROP would be skipped when an earlier ACCEPT \
+         matches first, silently leaking the block on open ports. \
+         Requires: sudo iptables -I INPUT ... (configured in /etc/sudoers.d/innerwarden). \
          Note: rules are lost on reboot unless persisted with iptables-save."
     }
     fn tier(&self) -> SkillTier {
@@ -55,27 +78,21 @@ impl ResponseSkill for BlockIpIptables {
             }
 
             if dry_run {
-                info!(ip, "DRY RUN: would execute: sudo iptables -A INPUT -s {ip} -j DROP -m comment --comment innerwarden");
+                info!(ip, "DRY RUN: would execute: sudo iptables -I INPUT 1 -s {ip} -j DROP -m comment --comment innerwarden");
                 return SkillResult {
                     success: true,
                     message: format!("DRY RUN: would block {ip} via iptables"),
                 };
             }
 
+            // `-I INPUT 1` (insert at top) — NOT `-A` (append). The INPUT chain is
+            // evaluated top-to-bottom and a matching ACCEPT terminates traversal;
+            // a web/hosting box ACCEPTs 80/443/22 early, so an APPENDED DROP below
+            // them is never reached and the attacker's flood is accepted. Inserting
+            // at position 1 puts the DROP above every ACCEPT (same fix as the ufw
+            // skill; found live 2026-07-02).
             let output = tokio::process::Command::new("sudo")
-                .args([
-                    "iptables",
-                    "-A",
-                    "INPUT",
-                    "-s",
-                    &ip,
-                    "-j",
-                    "DROP",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "innerwarden",
-                ])
+                .args(iptables_block_args(&ip))
                 .output()
                 .await;
 
@@ -135,6 +152,22 @@ mod tests {
         let result = BlockIpIptables.execute(&ctx, true).await;
         assert!(!result.success);
         assert!(result.message.contains("no target IP"));
+    }
+
+    #[test]
+    fn iptables_block_inserts_at_top_not_append() {
+        // Regression anchor: `-A` (append) leaks past an earlier ACCEPT for
+        // 80/443/22; the DROP must be inserted at INPUT position 1.
+        let args = iptables_block_args("1.2.3.4");
+        assert_eq!(
+            &args[0..4],
+            &["iptables", "-I", "INPUT", "1"],
+            "insert at INPUT 1"
+        );
+        assert!(!args.contains(&"-A"), "must NOT append");
+        assert!(
+            args.contains(&"DROP") && args.contains(&"1.2.3.4") && args.contains(&"innerwarden")
+        );
     }
 
     #[test]

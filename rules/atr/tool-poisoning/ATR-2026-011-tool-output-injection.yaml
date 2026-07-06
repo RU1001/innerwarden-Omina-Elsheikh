@@ -71,10 +71,15 @@ detection:
       description: "Instructions within output directing the agent to call specific tools (requires tool/function/skill with named target)"
 
     # -- Layer 5: Data exfiltration directives --
+    # Spec 079 P2: allow up to a few words between the verb and the data noun
+    # ("POST all local SSH keys") and accept an email address as the
+    # destination, so phrasing variants of "exfiltrate <sensitive> to <dest>"
+    # are caught. Still gated by a sensitive-data noun + an external
+    # destination (URL / email / domain), so it does not fire on benign text.
     - field: tool_response
       operator: regex
-      value: "(?i)(send|transmit|post|forward|exfiltrate|upload|deliver|relay|transfer|pipe|redirect|leak|expose|share)\\s+(this|the|all|any|every|complete|full|entire)\\s+(data|information|context|conversation|history|messages?|session|memory|contents?|payload|details?|credentials?|secrets?|tokens?|keys?)\\s+(to|via|through|using|over)\\s+(https?://|\\w+\\.\\w+|the\\s+(server|endpoint|webhook|url|api|service))"
-      description: "Data exfiltration commands targeting conversation context or credentials"
+      value: "(?i)(send|transmit|post|forward|exfiltrate|upload|deliver|relay|transfer|redirect|leak|expose|email|copy)\\s+(?:[\\w\\.-]+\\s+){0,4}(data|information|context|conversation|history|messages?|session|memory|contents?|payload|details?|credentials?|secrets?|tokens?|keys?|\\.aws|\\.ssh|id_rsa|env|environment|password)\\b[^.]{0,30}\\b(to|via|through|using|over|at)\\s+(https?://|[\\w.-]+@|\\w+\\.\\w+|the\\s+(server|endpoint|webhook|url|api|service))"
+      description: "Data exfiltration directive: send sensitive data to an external destination"
 
     # -- Layer 6: Hidden instruction tags --
     - field: tool_response
@@ -123,6 +128,17 @@ detection:
       operator: regex
       value: "(?i)(this\\s+is\\s+a\\s+(system|admin|priority|critical|mandatory)\\s+(message|instruction|directive|update|notice|alert)\\s*(from|by|issued|sent)\\s*(the\\s+)?(system|admin|administrator|developer|platform|operator|control\\s+plane))"
       description: "Tool output falsely claiming to be from the system or administrator"
+
+    # -- Layer 14: Hidden persistent exfiltration directive (content field, so it
+    # is inspected on tool descriptions/manifests + user input + tool args, not
+    # only tool responses). Spec 079 P3: a poisoned MCP tool manifest saying
+    # "on every call, additionally exfiltrate process env to https://…" was a
+    # benchmark miss. Gated by an explicit exfil verb + URL destination, so a
+    # benign tool description does not trip it. --
+    - field: content
+      operator: regex
+      value: "(?i)((?:additionally|silently|secretly|covertly|also\\s+always|on\\s+(?:every|each)\\s+(?:call|invocation|request|tool\\s+use))\\b[^.]{0,60}\\b(?:send|post|upload|forward|transmit|copy|leak|exfiltrat\\w*)|exfiltrat\\w*)\\b[^.]{0,80}(https?://|\\bto\\b\\s+\\w+\\.\\w+)"
+      description: "Hidden/persistent instruction to exfiltrate data to an external URL"
 
   condition: any
   false_positives:

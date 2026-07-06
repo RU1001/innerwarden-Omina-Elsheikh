@@ -5,7 +5,6 @@
 //! especially in suspicious paths (/tmp, /dev/shm).
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use chrono::Utc;
@@ -117,7 +116,7 @@ fn scan_dir_recursive(dir: &Path, results: &mut Vec<SuidBinary>, depth: u32) {
             continue;
         };
 
-        let mode = meta.permissions().mode();
+        let mode = meta_mode(&meta);
 
         // Check for SUID (0o4000) or SGID (0o2000)
         if mode & 0o6000 == 0 {
@@ -219,6 +218,20 @@ fn meta_uid(_meta: &std::fs::Metadata) -> u32 {
     0
 }
 
+// SUID/SGID bits are a unix file-mode concept. On Windows (spec 085 Phase 0)
+// there is no mode, so return 0 -> no file matches the 0o6000 mask -> the SUID
+// inventory is empty (safe no-op). Real Windows behaviour is a later phase.
+#[cfg(unix)]
+fn meta_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn meta_mode(_meta: &std::fs::Metadata) -> u32 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,8 +291,11 @@ mod tests {
         assert!(compute_sha256(&dir.path().join("missing.bin")).is_none());
     }
 
+    // SUID bits are unix-only (set_mode); the collector no-ops on Windows.
+    #[cfg(unix)]
     #[test]
     fn scan_dir_recursive_collects_suid_files_only() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let regular = dir.path().join("regular");
         let suid = dir.path().join("helper");

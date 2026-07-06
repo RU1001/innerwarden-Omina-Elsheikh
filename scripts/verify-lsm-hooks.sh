@@ -53,7 +53,7 @@ fi
 #   2. Update the EXPECTED_COUNT below.
 #   3. Update memory file project_lsm_aya_kernel_64.md.
 EXPECTED=(
-    "lsm.s/bprm_check_security:Spec 052 — exec block (innerwarden_lsm_exec_min)"
+    "lsm.s/bprm_check_security:Spec 052 — exec block (innerwarden_lsm_exec_min + innerwarden_lsm_exec_gate)"
     "lsm.s/userns_create:PR-A — container escape (innerwarden_lsm_create_user_ns)"
     "lsm/ptrace_access_check:PR-B — process injection (innerwarden_lsm_ptrace_access, NOT sleepable per kernel allow-list)"
     "lsm.s/bpf_prog:PR-C — VoidLink rootkit (innerwarden_lsm_bpf_prog_load)"
@@ -104,5 +104,46 @@ if [ "${1:-}" = "--strict" ]; then
     fi
 fi
 
+# ── Per-program FUNC symbol check ──────────────────────────────────────
+# bpf-linker FOLDS programs sharing a hook into ONE section (e.g.
+# innerwarden_lsm_exec, _exec_min and _exec_gate all live in
+# lsm.s/bprm_check_security), so the section check above cannot see a
+# dropped PROGRAM — only a dropped HOOK. The symbol table can: every LSM
+# program is a GLOBAL FUNC symbol. This pins the program surface itself.
+EXPECTED_FUNCS=(
+    "innerwarden_lsm_exec:full exec hook (kernels < 6.4 only; fails verifier on >= 6.4)"
+    "innerwarden_lsm_exec_min:Spec 052 — minimal exec block (BLOCKED_PIDS)"
+    "innerwarden_lsm_exec_gate:Execution Gate — allowlist pre-authz, inert unless LSM_POLICY key3=1"
+    "innerwarden_lsm_create_user_ns:PR-A — container escape"
+    "innerwarden_lsm_ptrace_access:PR-B — process injection"
+    "innerwarden_lsm_bpf_prog_load:PR-C — VoidLink rootkit"
+    "innerwarden_lsm_mmap_file:PR-D — real-time RWX"
+    "innerwarden_lsm_file_open:legacy"
+    "innerwarden_lsm_bpf:legacy"
+)
+
+ACTUAL_FUNCS=$(readelf -sW "$EBPF_OBJ" 2>/dev/null | awk '$4 == "FUNC" { print $NF }')
+
+MISSING_FUNCS=0
 echo
-echo "OK: ${#EXPECTED[@]} expected LSM hooks present in $EBPF_OBJ"
+echo "=== expected LSM program FUNC symbols in $EBPF_OBJ ==="
+for entry in "${EXPECTED_FUNCS[@]}"; do
+    func="${entry%%:*}"
+    note="${entry#*:}"
+    if echo "$ACTUAL_FUNCS" | grep -qFx "$func"; then
+        echo "  ✅ $func — $note"
+    else
+        echo "  ❌ MISSING: $func — $note" >&2
+        MISSING_FUNCS=$((MISSING_FUNCS + 1))
+    fi
+done
+
+if [ "$MISSING_FUNCS" -gt 0 ]; then
+    echo >&2
+    echo "FAIL: $MISSING_FUNCS expected LSM program symbol(s) missing from $EBPF_OBJ" >&2
+    echo "      Either restore them in crates/sensor-ebpf/src/main.rs OR update EXPECTED_FUNCS[] if intentional." >&2
+    exit 1
+fi
+
+echo
+echo "OK: ${#EXPECTED[@]} expected LSM hook sections + ${#EXPECTED_FUNCS[@]} program symbols present in $EBPF_OBJ"

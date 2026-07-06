@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| v0.15.x (latest release) | Yes |
-| v0.14.x | No |
+| v0.16.x (latest release) | Yes |
+| v0.15.x | No |
 | older releases | No |
 
 Always update to the latest release: `innerwarden upgrade`

@@ -26,6 +26,23 @@ use crate::agent_context::incident_detector;
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Provider label when `ip` is in the cloud / CDN / agent-service safelist and
+/// must NOT be auto-blocked by a correlation chain or the repeat-offender path.
+///
+/// Uses [`cloud_safelist::safelist_label`](crate::cloud_safelist::safelist_label)
+/// (the CIDR walk), NEVER `identify_provider` (the first-octet heuristic). The
+/// heuristic only matches a hardcoded set of first octets, so it silently MISSES
+/// safelisted CIDR ranges whose first octet it does not enumerate. 2026-05-08
+/// switched the repeat-offender + decision paths to `safelist_label`, but the
+/// correlation-chain path was missed and still used `identify_provider` - which
+/// let the `Data Exfiltration (eBPF Sequence)` chain ban Canonical
+/// `185.125.190.49` (`185.125.188.0/22`; first octet 185 is not in the
+/// heuristic) on the Hetzner box 2026-06-27, breaking apt / livepatch. Both
+/// correlation paths now share this one gate so they cannot drift apart again.
+fn safelisted_provider(ip: &str) -> Option<&'static str> {
+    crate::cloud_safelist::safelist_label(ip)
+}
+
 /// Process completed correlation chains and repeat-offender patterns.
 /// Called once per slow-loop tick (30s).
 pub(crate) async fn process_correlation_escalations(
@@ -92,7 +109,13 @@ async fn handle_completed_chain(
     // already guards at the executor, but short-circuiting here keeps the
     // ip_reputation counter, cooldown table, and knowledge-graph decision
     // edge from being polluted in the first place.
-    if let Some(provider) = crate::cloud_safelist::identify_provider(&ip) {
+    //
+    // 2026-06-27 (fix/correlation-chain-safelist-bypass): switched from
+    // `identify_provider` (first-octet heuristic) to the shared
+    // `safelisted_provider` (CIDR walk) - the same fix the repeat-offender path
+    // got on 2026-05-08 but this path was missed, so the `Data Exfiltration
+    // (eBPF Sequence)` chain banned Canonical 185.125.190.49 on Hetzner.
+    if let Some(provider) = safelisted_provider(&ip) {
         info!(
             chain_id = %chain.chain_id,
             rule = %chain.rule_id,
@@ -370,14 +393,14 @@ async fn check_repeat_offenders(
         // on legitimate outbound traffic.
         //
         // 2026-05-08 (fix/repeat-offender-safelist-bypass): switched
-        // from `identify_provider` (first-octet heuristic) to
-        // `safelist_label` (CIDR walk via `is_cloud_provider_ip`).
-        // The heuristic missed 208.95.112.0/24 (ip-api.com — the
+        // from `identify_provider` (first-octet heuristic) to the CIDR
+        // walk. The heuristic missed 208.95.112.0/24 (ip-api.com - the
         // agent's OWN GeoIP service, blocked 37x in prod),
         // 91.189.88.0/21 (Canonical archive, blocked 14x),
-        // 199.232.0.0/16 (Fastly, blocked 7x). The CIDR walk
-        // catches all of them.
-        if let Some(provider) = crate::cloud_safelist::safelist_label(&ip) {
+        // 199.232.0.0/16 (Fastly, blocked 7x). The CIDR walk catches
+        // all of them. Shares `safelisted_provider` with the chain path
+        // (2026-06-27) so they can't drift apart again.
+        if let Some(provider) = safelisted_provider(&ip) {
             info!(
                 ip = %ip,
                 provider,
@@ -1320,6 +1343,104 @@ mod tests {
              execute_decision. Correlation chains bypass the AI-router \
              decide path same as repeat-offender / multi-technique, so \
              the KG modifier hook needs to fire here too."
+        );
+    }
+
+    #[test]
+    fn safelisted_provider_uses_cidr_walk_not_first_octet_heuristic() {
+        // Hetzner 2026-06-27: the `Data Exfiltration (eBPF Sequence)` chain
+        // banned Canonical 185.125.190.49 (apt/livepatch) because the chain
+        // path still gated on `identify_provider` (first-octet heuristic) after
+        // the 2026-05-08 fix switched the sibling paths to the CIDR walk. This
+        // pins that the shared gate catches the CIDR-only ranges the heuristic
+        // misses, while real attackers stay blockable.
+        crate::cloud_safelist::init();
+
+        // Regression witness: the OLD gate (first-octet 185) returns None, which
+        // is exactly why the chain blocked Canonical.
+        assert!(
+            crate::cloud_safelist::identify_provider("185.125.190.49").is_none(),
+            "identify_provider misses 185.x - the bug's root cause"
+        );
+        // The fixed gate catches it (185.125.188.0/22 is in the safelist).
+        assert!(
+            safelisted_provider("185.125.190.49").is_some(),
+            "Canonical 185.125.190.49 must be safelisted via the CIDR walk"
+        );
+        // Other CIDR-only ranges the first-octet heuristic also misses.
+        assert!(
+            safelisted_provider("208.95.112.1").is_some(),
+            "ip-api.com (the agent's own GeoIP) must be safelisted"
+        );
+        assert!(
+            safelisted_provider("199.232.58.137").is_some(),
+            "Fastly must be safelisted"
+        );
+
+        // Anti-evasion: a real attacker outside every safelist range is still
+        // blockable by both correlation paths.
+        assert!(safelisted_provider("203.0.113.45").is_none());
+        assert!(safelisted_provider("45.148.10.121").is_none());
+    }
+
+    #[tokio::test]
+    async fn both_correlation_paths_skip_cloud_safelisted_ip() {
+        // Exercises the two call sites `safelisted_provider` feeds (the
+        // 2026-06-27 fix/correlation-chain-safelist-bypass), not just the
+        // helper in isolation: a cloud-provider IP reaching either the
+        // repeat-offender path or the completed-chain path must be purged
+        // from reputation state, never escalated to a block. Canonical
+        // 185.125.190.49 sits in the CIDR-only range (185.125.188.0/22) the
+        // old first-octet heuristic missed, so this also pins the fix.
+        crate::cloud_safelist::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config::AgentConfig::default();
+
+        // Path 1: repeat-offender (check_repeat_offenders).
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let mut rep = LocalIpReputation::new();
+        rep.total_blocks = 3; // qualifies for repeat-offender escalation
+        state
+            .ip_reputations
+            .insert("185.125.190.49".to_string(), rep);
+        check_repeat_offenders(tmp.path(), &cfg, &mut state).await;
+        assert!(
+            !state.ip_reputations.contains_key("185.125.190.49"),
+            "repeat-offender path must purge the cloud-safelisted IP, not escalate it"
+        );
+
+        // Path 2: completed correlation chain (handle_completed_chain).
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        state
+            .ip_reputations
+            .insert("185.125.190.49".to_string(), LocalIpReputation::new());
+        let chain = correlation_engine::AttackChain {
+            chain_id: "test-chain".to_string(),
+            rule_id: "CL-008".to_string(),
+            rule_name: "Data Exfiltration (eBPF Sequence)".to_string(),
+            start_ts: Utc::now(),
+            last_ts: Utc::now(),
+            events: vec![correlation_engine::CorrelationEvent {
+                ts: Utc::now(),
+                layer: correlation_engine::Layer::Network,
+                source: "detector".into(),
+                kind: "c2_callback".into(),
+                severity: innerwarden_core::event::Severity::High,
+                entities: vec![EntityRef::ip("185.125.190.49")],
+                details: serde_json::Value::Null,
+                incident_id: String::new(),
+            }],
+            stages_matched: 2,
+            stages_total: 2,
+            confidence: 1.0,
+            layers_involved: vec![correlation_engine::Layer::Network],
+            severity: innerwarden_core::event::Severity::High,
+            summary: "test".to_string(),
+        };
+        handle_completed_chain(&chain, tmp.path(), &cfg, &mut state).await;
+        assert!(
+            !state.ip_reputations.contains_key("185.125.190.49"),
+            "completed-chain path must purge the cloud-safelisted IP, not escalate it"
         );
     }
 }

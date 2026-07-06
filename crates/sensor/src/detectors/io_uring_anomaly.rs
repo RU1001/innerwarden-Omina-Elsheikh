@@ -114,7 +114,7 @@ impl IoUringAnomalyDetector {
         self.ring_creators.insert(pid, event.ts);
 
         // Skip allowlisted
-        if is_allowed(comm) {
+        if is_allowed(comm, pid) {
             return None;
         }
 
@@ -189,7 +189,7 @@ impl IoUringAnomalyDetector {
             .unwrap_or(0) as u32;
 
         // Skip allowlisted
-        if is_allowed(comm) {
+        if is_allowed(comm, pid) {
             return None;
         }
 
@@ -276,10 +276,18 @@ impl IoUringAnomalyDetector {
     }
 }
 
-fn is_allowed(comm: &str) -> bool {
-    ALLOWED_PROCESSES
-        .iter()
-        .any(|p| comm == *p || comm.starts_with(p))
+/// Is this io_uring user a verified-legitimate process?
+///
+/// io_uring is THE syscall-bypass evasion channel (the ARMO "curing" rootkit),
+/// so the allowlist MUST NOT be defeatable by naming the implant after an
+/// allowlisted server. The previous check compared only the forgeable `comm`
+/// (`prctl(PR_SET_NAME,"nginx")` or exec-as-`nginx` turned the whole detector
+/// off, and the `starts_with` even let `nodejs-evil` pass). We now require the
+/// `/proc/PID/exe` to resolve to a real system path via `is_verified_infra_process`
+/// — a forged-comm implant living in /tmp, /home, or /dev/shm fails the path
+/// check and is no longer exempted.
+fn is_allowed(comm: &str, pid: u32) -> bool {
+    crate::detectors::is_verified_infra_process(comm, pid, ALLOWED_PROCESSES)
 }
 
 fn opcode_to_name(opcode: u8) -> &'static str {
@@ -295,7 +303,14 @@ mod tests {
     use super::*;
     use innerwarden_core::event::Event;
 
-    fn create_event(comm: &str, sq_entries: u64) -> Event {
+    /// A pid guaranteed to be free (above the kernel pid_max ceiling 2^22), so
+    /// `is_verified_infra_process` reads no live `/proc/<pid>/exe` and the helper
+    /// deterministically takes the comm-match + unreadable-exe allow path. Using a
+    /// small live pid here would be flaky in CI (see RECURRING_BUGS.md: detectors
+    /// that read real /proc with a hardcoded pid).
+    const DEAD_PID: u64 = 4_000_000_001;
+
+    fn create_event_pid(comm: &str, sq_entries: u64, pid: u64) -> Event {
         Event {
             ts: Utc::now(),
             host: "test".to_string(),
@@ -304,7 +319,7 @@ mod tests {
             severity: Severity::Info,
             summary: format!("{comm} created io_uring"),
             details: serde_json::json!({
-                "comm": comm, "pid": 1234, "uid": 1000,
+                "comm": comm, "pid": pid, "uid": 1000,
                 "sq_entries": sq_entries, "cq_entries": sq_entries * 2,
                 "flags": 0, "ring_fd": 5,
             }),
@@ -313,7 +328,11 @@ mod tests {
         }
     }
 
-    fn submit_event(comm: &str, opcode: u8) -> Event {
+    fn create_event(comm: &str, sq_entries: u64) -> Event {
+        create_event_pid(comm, sq_entries, DEAD_PID)
+    }
+
+    fn submit_event_pid(comm: &str, opcode: u8, pid: u64) -> Event {
         Event {
             ts: Utc::now(),
             host: "test".to_string(),
@@ -322,12 +341,16 @@ mod tests {
             severity: Severity::Info,
             summary: format!("{comm} io_uring submit opcode {opcode}"),
             details: serde_json::json!({
-                "comm": comm, "pid": 1234, "uid": 1000,
+                "comm": comm, "pid": pid, "uid": 1000,
                 "opcode": opcode, "fd": 3, "sqe_flags": 0,
             }),
             tags: vec![],
             entities: vec![],
         }
+    }
+
+    fn submit_event(comm: &str, opcode: u8) -> Event {
+        submit_event_pid(comm, opcode, DEAD_PID)
     }
 
     #[test]
@@ -391,5 +414,40 @@ mod tests {
         assert_eq!(opcode_to_name(16), "CONNECT");
         assert_eq!(opcode_to_name(46), "URING_CMD");
         assert_eq!(opcode_to_name(99), "UNKNOWN");
+    }
+
+    /// Regression anchor (evasion audit E5, 2026-06-20): io_uring is the
+    /// syscall-bypass channel, so the allowlist must not be defeatable by naming
+    /// the implant after an allowlisted server. The old check trusted only the
+    /// forgeable `comm` (so `prctl(PR_SET_NAME,"nginx")` turned the detector off,
+    /// and the `starts_with` even let `nodejs-evil` pass). Now the exe path is
+    /// verified. We use the REAL test-process pid: its exe is the cargo test
+    /// binary under `target/`, which is NOT a system path, so an `nginx`-named
+    /// io_uring user at this pid is correctly NOT exempted and the critical
+    /// URING_CMD submit fires. Deterministic (own pid always resolvable, never a
+    /// system path). Linux-only: the exe-path verification reads `/proc/PID/exe`,
+    /// absent on macOS (there the Err fallback allows, by design).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spoofed_comm_with_nonsystem_exe_is_not_allowlisted() {
+        let mut det = IoUringAnomalyDetector::new("test", 300);
+        let own = std::process::id() as u64;
+        // comm forged to an allowlisted name, but exe is target/<...> (not /usr).
+        let ev = submit_event_pid("nginx", 46, own); // URING_CMD
+        let inc = det.process(&ev);
+        assert!(
+            inc.is_some(),
+            "an allowlisted comm whose /proc/exe is NOT a system path must NOT be \
+             exempted (comm-only spoof)"
+        );
+        assert_eq!(inc.unwrap().severity, Severity::Critical);
+
+        // And the prefix-spoof variant (nodejs-evil) is likewise caught.
+        let mut det2 = IoUringAnomalyDetector::new("test", 300);
+        let ev2 = create_event_pid("nodejs-evil", 256, own);
+        assert!(
+            det2.process(&ev2).is_some(),
+            "a prefix-spoofed comm with a non-system exe must NOT be exempted"
+        );
     }
 }

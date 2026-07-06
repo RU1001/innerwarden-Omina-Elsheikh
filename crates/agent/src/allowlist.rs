@@ -69,6 +69,16 @@ pub struct YamlResponseRules {
 
 impl YamlResponseRules {
     pub fn load(rules_dir: &Path) -> Self {
+        Self::load_at(rules_dir, chrono::Utc::now())
+    }
+
+    /// `load` with an injectable clock so time-boxed rules (`expires_at`) are
+    /// testable. A rule whose `expires_at` (RFC3339) is at/before `now` is
+    /// skipped — this is how the dashboard "Trust IP" TTL lapses on its own.
+    /// An unparseable `expires_at` is treated as "no expiry" (lenient, matching
+    /// the loader's skip-what-you-can't-parse style); the dashboard always
+    /// writes a valid RFC3339 timestamp.
+    pub fn load_at(rules_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Self {
         let mut rules = Self {
             trusted_ips: Vec::new(),
             trusted_users: Vec::new(),
@@ -108,6 +118,16 @@ impl YamlResponseRules {
                     .unwrap_or(false);
                 if disabled {
                     continue;
+                }
+
+                // Time-boxed rules: skip when expired so dashboard "Trust IP"
+                // TTL entries lapse on the next reload with no manual cleanup.
+                if let Some(exp) = rule_val.get("expires_at").and_then(|v| v.as_str()) {
+                    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(exp) {
+                        if now >= parsed.with_timezone(&chrono::Utc) {
+                            continue;
+                        }
+                    }
                 }
 
                 let action = rule_val
@@ -329,6 +349,52 @@ rules:
     fn yaml_rules_nonexistent_dir() {
         let rules = YamlResponseRules::load(std::path::Path::new("/nonexistent"));
         assert!(rules.trusted_ips.is_empty());
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn yaml_rules_expired_rule_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: operator-trust-temp
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["203.0.113.10"]
+    expires_at: "2026-06-13T10:00:00Z"
+"#;
+        std::fs::write(dir.path().join("70-operator-trust.yml"), yaml).unwrap();
+        // before expiry → present
+        let before = YamlResponseRules::load_at(dir.path(), at("2026-06-13T09:59:59Z"));
+        assert_eq!(before.trusted_ips, vec!["203.0.113.10"]);
+        // at/after expiry → gone
+        let after = YamlResponseRules::load_at(dir.path(), at("2026-06-13T10:00:00Z"));
+        assert!(after.trusted_ips.is_empty());
+    }
+
+    #[test]
+    fn yaml_rules_unparseable_expiry_is_lenient() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: bad-expiry
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["10.0.0.1"]
+    expires_at: "not-a-date"
+"#;
+        std::fs::write(dir.path().join("10-bad.yml"), yaml).unwrap();
+        let rules = YamlResponseRules::load_at(dir.path(), at("2026-06-13T10:00:00Z"));
+        assert_eq!(rules.trusted_ips, vec!["10.0.0.1"]);
     }
 
     #[test]

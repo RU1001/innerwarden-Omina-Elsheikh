@@ -183,6 +183,21 @@ impl C2CallbackDetector {
             return None;
         }
 
+        // Cloud-platform guest-agent gate (NON-IP). A cloud VM's own management
+        // agents (Azure waagent, AWS SSM/cloud-init, GCP guest agent, OCI cloud
+        // agent) make high-volume periodic calls to the platform control plane
+        // (WireServer/IMDS/...) that look like beaconing / data-exfil. They are
+        // recognised by NON-FORGEABLE /proc lineage (interpreter + root-owned
+        // guest-agent script, walked up to the parent agent), gated on a
+        // DMI-detected cloud VM + uid 0. Downgrade-only: a real attacker process
+        // from /tmp, or any non-root process, still fires. This closes the Azure
+        // WireServer multi-technique auto-block (prod audit 2026-06-26): waagent
+        // (python3) beaconing 168.63.129.16 fed outbound_anomaly+c2_callback into
+        // the 2-detector multi-technique block.
+        if crate::cloud_platform::is_guest_agent(pid, uid as u32) {
+            return None;
+        }
+
         let now = event.ts;
         let cutoff = now - self.window;
 
@@ -406,6 +421,18 @@ fn is_beaconing(timestamps: &[i64]) -> bool {
 mod tests {
     use super::*;
 
+    /// A pid ABOVE the kernel `pid_max` ceiling (2^22 = 4_194_304) so
+    /// `/proc/<DEAD_PID>` never exists. The fixtures run with `uid 0`, and the
+    /// cloud-platform guest-agent gate (`cloud_platform::is_guest_agent`)
+    /// resolves the connecting pid's `/proc` lineage when the host is a cloud VM
+    /// (GitHub Actions runners ARE Azure). A small live pid would race a real
+    /// runner process and could flip the gate non-deterministically; a DEAD_PID
+    /// resolves to no lineage so the gate is reliably inert and these tests
+    /// exercise the real-attacker (non-guest-agent) path. The guest-agent
+    /// suppression itself is unit-tested in `crate::cloud_platform`. See
+    /// RECURRING_BUGS.md "Flaky tests that read REAL /proc with a small pid".
+    const DEAD_PID: u64 = 4_000_000_001;
+
     fn connect_event(comm: &str, dst_ip: &str, dst_port: u16, ts: DateTime<Utc>) -> Event {
         Event {
             ts,
@@ -415,7 +442,7 @@ mod tests {
             severity: Severity::Info,
             summary: format!("{comm} connecting to {dst_ip}:{dst_port}"),
             details: serde_json::json!({
-                "pid": 1234,
+                "pid": DEAD_PID,
                 "uid": 0,
                 "comm": comm,
                 "dst_ip": dst_ip,

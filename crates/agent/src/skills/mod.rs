@@ -308,12 +308,25 @@ impl SkillRegistry {
         use builtin::*;
         Self {
             skills: vec![
+                // Unix firewall skills shell out to pfctl/ufw/iptables/nftables/
+                // firewalld/xdp, none of which exist on Windows. Gate them off
+                // Windows so the AI is never offered a dead skill there (spec 085
+                // Phase 2); on Windows the built-in Windows Firewall skill below
+                // is the block path instead. Linux/macOS are unchanged.
+                #[cfg(not(target_os = "windows"))]
                 Box::new(BlockIpUfw),
+                #[cfg(not(target_os = "windows"))]
                 Box::new(BlockIpIptables),
+                #[cfg(not(target_os = "windows"))]
                 Box::new(BlockIpNftables),
+                #[cfg(not(target_os = "windows"))]
                 Box::new(BlockIpFirewalld),
+                #[cfg(not(target_os = "windows"))]
                 Box::new(BlockIpPf),
+                #[cfg(not(target_os = "windows"))]
                 Box::new(BlockIpXdp),
+                #[cfg(target_os = "windows")]
+                Box::new(BlockIpWindows),
                 Box::new(MonitorIp),
                 Box::new(Honeypot),
                 Box::new(SuspendUserSudo),

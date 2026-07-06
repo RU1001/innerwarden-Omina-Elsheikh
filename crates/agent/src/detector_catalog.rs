@@ -38,7 +38,7 @@ pub fn explain(detector: &str) -> DetectorExplanation {
         ),
         "port_scan" => e(
             "One source probed many ports/services in a short window.",
-            "Reconnaissance — attackers map what is exposed before they pick a way in.",
+            "Reconnaissance: attackers map what is exposed before they pick a way in.",
         ),
         "web_scan" | "web_scanner" => e(
             "Automated probing of web paths/endpoints.",
@@ -46,7 +46,7 @@ pub fn explain(detector: &str) -> DetectorExplanation {
         ),
         "reverse_shell" => e(
             "A local process opened an interactive shell back out to a remote host.",
-            "This is how an attacker gets hands-on control after they break in — rarely benign.",
+            "This is how an attacker gets hands-on control after they break in, rarely benign.",
         ),
         "web_shell" => e(
             "A web-servable script that can execute commands was written or hit.",
@@ -70,7 +70,7 @@ pub fn explain(detector: &str) -> DetectorExplanation {
         ),
         "privesc" => e(
             "A process gained or used root through a path its lineage does not justify.",
-            "Privilege escalation — turning a limited foothold into full control of the host.",
+            "Privilege escalation: turning a limited foothold into full control of the host.",
         ),
         "data_exfiltration" | "data_exfil_ebpf" => e(
             "An unusual volume of data was staged or sent outbound.",
@@ -94,11 +94,57 @@ pub fn explain(detector: &str) -> DetectorExplanation {
         ),
         "ransomware" => e(
             "A burst of rapid file rewrites with high-entropy (encrypted) content.",
-            "Ransomware encrypting your files for extortion — speed of detection is everything.",
+            "Ransomware encrypting your files for extortion. Speed of detection is everything.",
         ),
         "reverse_shell_listener" | "c2_callback" => e(
             "A process is beaconing to a likely command-and-control server.",
             "The implant phoning home for instructions after a compromise.",
+        ),
+        // ── Daily-briefing coverage (2026-06): the digest routes every
+        // per-detector line through `explain`, so the categories that
+        // showed up most on prod must each have a plain "what + why".
+        "threat_intel" => e(
+            "Connections matched public blocklists of known-bad hosts (scanners/botnets).",
+            "These hosts are already documented as malicious, so they are auto-blocked on contact.",
+        ),
+        "proto_anomaly" => e(
+            "Traffic did not match the protocol its port normally speaks (junk on SSH/HTTP).",
+            "It usually means probing or a misconfiguration: someone poking a service the wrong way.",
+        ),
+        "kernel_devnode_exposed" => e(
+            "A program touched a low-level kernel device that ordinary apps should never open.",
+            "It is a privilege-escalation technique: a foothold reaching for full control of the box.",
+        ),
+        "network_sniffing" => e(
+            "A process started capturing raw network traffic.",
+            "Packet capture can steal credentials and session tokens in transit.",
+        ),
+        "kernel" => e(
+            "Unusual low-level kernel activity.",
+            "The kernel is the deepest, most serious layer to see noise on. Tampering here is hard to undo.",
+        ),
+        "telemetry.stream_silence" => e(
+            "One of InnerWarden's own sensors went quiet unexpectedly.",
+            "It is usually a glitch, but it can also be someone silencing our logging before an attack.",
+        ),
+        "logging_config_change" => e(
+            "The server's logging settings were changed.",
+            "Attackers often disable or redirect logs to cover their tracks.",
+        ),
+        "automated_file_collection" => e(
+            "A script was bulk-collecting files across the host.",
+            "This is how data-theft tooling stages files before exfiltrating them.",
+        ),
+        "suspicious_login" => e(
+            "A login succeeded but looked off: odd time, location, or account.",
+            "It can mean an attacker is using stolen but valid credentials.",
+        ),
+        // Honeypot is a RESPONSE, not a detector; the digest renders it via
+        // `friendly_detector_name`, but a curated gloss here keeps any caller
+        // that routes "honeypot" through `explain` honest and non-jargon.
+        "honeypot" => e(
+            "Attackers were lured into the decoy trap and safely observed.",
+            "The decoy soaks up the attack and gathers intelligence while the real host stays untouched.",
         ),
         _ => DetectorExplanation {
             // Never blank: humanise the raw name and give an honest generic line
@@ -115,6 +161,65 @@ pub fn explain(detector: &str) -> DetectorExplanation {
 pub fn mitre_line(detector: &str) -> Option<String> {
     crate::mitre::map_detector(detector)
         .map(|m| format!("MITRE {} · {}", m.technique_id, m.technique_name))
+}
+
+/// Turn a raw `snake_case` / `dotted.detector` name into a Title-Cased,
+/// space-separated label that never leaks the machine name to a boss.
+///
+/// The daily briefing used to fall through to the raw detector string
+/// (`kernel_devnode_exposed`, `telemetry.stream_silence`) on any uncurated
+/// detector. This is the safe humanised replacement: even a brand-new detector
+/// renders as "Kernel Devnode Exposed", not the snake_case token.
+pub fn humanize_detector(detector: &str) -> String {
+    let cleaned = detector.replace(['_', '.'], " ");
+    let mut out = String::with_capacity(cleaned.len());
+    for word in cleaned.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    if out.is_empty() {
+        "Suspicious Activity".to_string()
+    } else {
+        out
+    }
+}
+
+/// One boss-readable digest line for a detector: a short label plus the
+/// plain-language "why it matters" clause, so the operator learns enough to ask
+/// for the right fix. e.g. for `ssh_bruteforce`:
+/// `Repeated failed SSH logins. Attackers guess passwords at scale to get
+/// their first foothold on the box.`
+///
+/// The label prefers the curated [`crate::telegram::friendly_detector_name`]
+/// gloss; otherwise it falls back to [`humanize_detector`] (never snake_case).
+/// The "why" comes from [`explain`], which always returns a sentence.
+pub fn digest_gloss(detector: &str) -> String {
+    let why = explain(detector).why;
+    let label = friendly_label(detector);
+    format!("{label}. {why}")
+}
+
+/// A short human label for a detector, used as the leading clause of
+/// [`digest_gloss`]. Honeypot is a response, not a detector, so it gets an
+/// explicit phrasing instead of the generic "Threat Detected".
+fn friendly_label(detector: &str) -> String {
+    if detector == "honeypot" {
+        return "Decoy trap engaged".to_string();
+    }
+    let friendly = crate::telegram::friendly_detector_name(detector);
+    // `friendly_detector_name` returns the raw detector unchanged when it has
+    // no curated label — humanise that so no snake_case ever leaks.
+    if friendly == detector {
+        humanize_detector(detector)
+    } else {
+        friendly.to_string()
+    }
 }
 
 /// True when `explain` has a curated (non-fallback) entry for this detector.
@@ -172,5 +277,85 @@ mod tests {
         let ex = explain("keylogger_bash_trap");
         assert!(ex.what.to_lowercase().contains("shell startup"));
         assert!(ex.why.to_lowercase().contains("keylogger"));
+    }
+
+    /// Daily-briefing coverage (2026-06): every detector the briefing now routes
+    /// through `explain` must be CURATED — a fallback gloss in the boss report
+    /// is the exact "raw detector name leaked" failure this work removes.
+    #[test]
+    fn newly_added_briefing_detectors_are_all_curated() {
+        for d in [
+            "threat_intel",
+            "proto_anomaly",
+            "kernel_devnode_exposed",
+            "network_sniffing",
+            "kernel",
+            "telemetry.stream_silence",
+            "logging_config_change",
+            "automated_file_collection",
+            "suspicious_login",
+            "honeypot",
+        ] {
+            let ex = explain(d);
+            assert!(!ex.what.is_empty(), "{d} what empty");
+            assert!(!ex.why.is_empty(), "{d} why empty");
+            assert!(
+                is_curated(d),
+                "{d} must have a curated gloss, not the fallback"
+            );
+            // No snake_case / dotted machine name may survive into the gloss.
+            assert!(
+                !ex.why.contains('_'),
+                "{d} why leaks snake_case: {}",
+                ex.why
+            );
+        }
+    }
+
+    #[test]
+    fn humanize_detector_never_leaks_snake_or_dotted_case() {
+        assert_eq!(
+            humanize_detector("kernel_devnode_exposed"),
+            "Kernel Devnode Exposed"
+        );
+        assert_eq!(
+            humanize_detector("telemetry.stream_silence"),
+            "Telemetry Stream Silence"
+        );
+        assert_eq!(humanize_detector("proto_anomaly"), "Proto Anomaly");
+        // Empty / weird input still produces a safe, readable label.
+        assert_eq!(humanize_detector(""), "Suspicious Activity");
+        let h = humanize_detector("some_brand_new_detector");
+        assert!(
+            !h.contains('_'),
+            "humanised label must not contain underscores: {h}"
+        );
+    }
+
+    #[test]
+    fn digest_gloss_is_boss_readable_and_carries_a_why() {
+        // Curated detector → friendly label + why clause, no snake_case. The
+        // label and why are joined by a period (no em dash anywhere).
+        let g = digest_gloss("ssh_bruteforce");
+        assert!(g.contains(". "), "gloss must join label and why: {g}");
+        assert!(!g.contains('\u{2014}'), "gloss must carry no em dash: {g}");
+        assert!(!g.contains("ssh_bruteforce"), "raw name leaked: {g}");
+        // Uncurated-label detector still humanises (kernel_devnode_exposed has
+        // no friendly_detector_name entry but a curated explain why).
+        let g2 = digest_gloss("kernel_devnode_exposed");
+        assert!(
+            g2.starts_with("Kernel Devnode Exposed"),
+            "humanised label: {g2}"
+        );
+        assert!(
+            !g2.contains("kernel_devnode_exposed"),
+            "raw name leaked: {g2}"
+        );
+        // Honeypot is a response, not a detector.
+        let g3 = digest_gloss("honeypot");
+        assert!(
+            g3.starts_with("Decoy trap engaged"),
+            "honeypot phrasing: {g3}"
+        );
     }
 }

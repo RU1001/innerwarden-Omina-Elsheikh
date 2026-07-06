@@ -193,7 +193,14 @@ impl PidTracker {
             return vec![];
         }
 
-        // 2b. Map event kind to bit flag
+        // 2b. Map event kind to bit flag.
+        //
+        // `captured_sensitive_path` carries the file path out of the
+        // `file.open`/`file.read_access` arm so it can be recorded on the
+        // per-PID state below and surfaced into the DATA_EXFIL incident
+        // evidence (`sensitive_file`). Spec-081: the kernel-block managed-agent
+        // verifier needs to know WHAT was read to apply its own-config gate.
+        let mut captured_sensitive_path: Option<String> = None;
         let flag = match kind.as_str() {
             "network.outbound_connect" => CHAIN_SOCKET,
             "network.bind_listen" => CHAIN_BIND,
@@ -231,6 +238,7 @@ impl PidTracker {
                 if !is_sensitive_read_path(path) {
                     return vec![];
                 }
+                captured_sensitive_path = Some(path.to_string());
                 CHAIN_SENSITIVE_READ
             }
             _ => return vec![],
@@ -260,6 +268,12 @@ impl PidTracker {
             if let Some(port) = details.get("dst_port").and_then(|v| v.as_u64()) {
                 state.last_connect_port = Some(port as u16);
             }
+        }
+
+        // Remember the sensitive file that set CHAIN_SENSITIVE_READ so the
+        // DATA_EXFIL incident can carry it (spec-081 own-config gate).
+        if let Some(path) = captured_sensitive_path {
+            state.last_sensitive_read_path = Some(path);
         }
 
         // 4. Check proximity across all patterns
@@ -331,6 +345,13 @@ impl PidTracker {
                 if c2.is_some() {
                     evidence["c2_ip"] = json!(c2_ip);
                     evidence["c2_port"] = json!(c2_port);
+                }
+
+                // Surface the sensitive file (spec-081): the managed-agent
+                // verifier's own-config gate runs on this in the kernel-block
+                // path, identically to the userspace IP-block path.
+                if let Some(path) = state.last_sensitive_read_path.as_deref() {
+                    evidence["sensitive_file"] = json!(path);
                 }
 
                 let mut recommended = vec![
@@ -433,6 +454,13 @@ impl PidTracker {
                 if c2.is_some() {
                     evidence["c2_ip"] = json!(c2_ip);
                     evidence["c2_port"] = json!(c2_port);
+                }
+
+                // Surface the sensitive file (spec-081): the managed-agent
+                // verifier's own-config gate runs on this in the kernel-block
+                // path, identically to the userspace IP-block path.
+                if let Some(path) = state.last_sensitive_read_path.as_deref() {
+                    evidence["sensitive_file"] = json!(path);
                 }
 
                 let mut recommended = vec![
@@ -1048,6 +1076,35 @@ mod tests {
         assert!(
             incidents.iter().any(|i| i["severity"] == "critical"),
             "shadow read + connect must still fire DATA_EXFIL"
+        );
+    }
+
+    #[test]
+    fn data_exfil_evidence_carries_sensitive_file() {
+        // Spec-081: the DATA_EXFIL incident must surface the sensitive file
+        // that set CHAIN_SENSITIVE_READ as `sensitive_file`, so the kernel-block
+        // managed-agent verifier can apply its own-config gate (it can only
+        // exempt a read of the agent's OWN config, never /etc/shadow).
+        let mut tracker = PidTracker::new();
+        tracker.process_event(&make_event_with_comm(
+            "file.read_access",
+            6100,
+            "node",
+            json!({"filename": "/etc/shadow"}),
+        ));
+        let incidents = tracker.process_event(&make_event_with_comm(
+            "network.outbound_connect",
+            6100,
+            "node",
+            json!({"dst_ip": "185.234.1.1", "dst_port": 9999}),
+        ));
+        let exfil = incidents
+            .iter()
+            .find(|i| i["severity"] == "critical")
+            .expect("shadow read + connect must fire a critical DATA_EXFIL incident");
+        assert_eq!(
+            exfil["evidence"][0]["sensitive_file"], "/etc/shadow",
+            "DATA_EXFIL evidence must carry the sensitive file path"
         );
     }
 

@@ -177,14 +177,27 @@ pub fn search_protection_nginx_rule() -> String {
         .to_string()
 }
 
-/// Returns the sudoers rule for suspend-user-sudo skill.
+/// Returns the sudoers rule for the suspend-user-sudo skill.
+///
+/// This grants ONLY the two hard-coded `innerwarden` helper subcommands, not a
+/// generic `install <file> → /etc/sudoers.d/`. The old grant let the innerwarden
+/// user install an arbitrary `/tmp` file into `sudoers.d`, which is a full
+/// privilege-escalation primitive (install a `NOPASSWD: ALL` rule). The helper
+/// subcommands generate the drop-in themselves (a deny-all rule, `root`
+/// refused), so the only attacker-influenced input is a username and the worst
+/// outcome is denying sudo to a non-root user — fail-safe, not escalation.
+///
+/// `secure_path` resolves the bare `innerwarden` the skill invokes to
+/// `/usr/local/bin/innerwarden` (the install location), so the grant lists that
+/// absolute path. The trailing `*` fills the `--expires <ts>` (suspend) argument;
+/// the binary re-validates every argument and can only ever write a deny rule.
 pub fn suspend_user_sudo_rule() -> String {
     "# Managed by innerwarden-ctl - do not edit manually\n\
      # Generated for capability: sudo-protection\n\
+     # Grants only the two hard-coded helper subcommands (no arbitrary-content write).\n\
      innerwarden ALL=(ALL) NOPASSWD: \\\n  \
-     /usr/bin/install -o root -g root -m 440 /tmp/innerwarden-sudoers-* /etc/sudoers.d/innerwarden-*, \\\n  \
-     /usr/sbin/visudo -cf /tmp/innerwarden-sudoers-*, \\\n  \
-     /bin/rm -f /etc/sudoers.d/zz-innerwarden-deny-*\n"
+     /usr/local/bin/innerwarden __sudo-suspend --user *, \\\n  \
+     /usr/local/bin/innerwarden __sudo-restore --user *\n"
         .to_string()
 }
 
@@ -287,7 +300,17 @@ mod tests {
         assert!(nginx.contains("/usr/sbin/nginx -s reload"));
 
         let suspend = suspend_user_sudo_rule();
-        assert!(suspend.contains("/usr/sbin/visudo -cf /tmp/innerwarden-sudoers-*"));
-        assert!(suspend.contains("/bin/rm -f /etc/sudoers.d/zz-innerwarden-deny-*"));
+        // Narrow helper-subcommand grant only — never a generic install into
+        // /etc/sudoers.d/ (the old privilege-escalation primitive).
+        assert!(suspend.contains("/usr/local/bin/innerwarden __sudo-suspend --user *"));
+        assert!(suspend.contains("/usr/local/bin/innerwarden __sudo-restore --user *"));
+        assert!(
+            !suspend.contains("install"),
+            "grant must not include a generic install-into-sudoers.d primitive"
+        );
+        assert!(
+            !suspend.contains("/etc/sudoers.d/*"),
+            "grant must not allow writing arbitrary files into sudoers.d"
+        );
     }
 }

@@ -1,0 +1,53 @@
+# Prometheus scrape config for an InnerWarden agent fleet.
+#
+# One InnerWarden agent runs per host/node and serves Prometheus metrics on
+# https://<host>:8787/metrics (self-signed TLS, loopback-bound by default — see
+# the note below for exposing it to an off-box Prometheus). Per-pod / per-tenant
+# breakdown comes from the metric LABELS (tenant=...), so you scrape the node's
+# agent, not each pod.
+#
+# Two ways to point Prometheus at the fleet are shown: a plain static list, and
+# Kubernetes service discovery. Use whichever matches the customer's setup; on a
+# Prometheus Operator cluster prefer the ServiceMonitor (servicemonitor.yaml).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ── Demo / static fleet ──────────────────────────────────────────────
+  # List each node's agent endpoint. The agent's /metrics is HTTPS with a
+  # self-signed cert, so scheme=https + insecure_skip_verify. (For a real
+  # deployment, front it with a proper cert or a metrics reverse-proxy.)
+  - job_name: innerwarden
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true
+    static_configs:
+      - targets:
+          - "127.0.0.1:8787" # demo: the local node's agent
+        # - "10.0.0.11:8787"   # node-2
+        # - "10.0.0.12:8787"   # node-3
+        labels:
+          fleet: "demo"
+
+  # ── Kubernetes service discovery (their real cluster) ────────────────
+  # Uncomment and adapt. This discovers every node's InnerWarden agent when
+  # it is deployed as a DaemonSet exposing a `metrics` port, so the fleet
+  # scales without editing a static list. `instance` becomes the node name.
+  #
+  # - job_name: innerwarden-k8s
+  #   scheme: https
+  #   tls_config:
+  #     insecure_skip_verify: true
+  #   kubernetes_sd_configs:
+  #     - role: endpoints
+  #   relabel_configs:
+  #     - source_labels: [__meta_kubernetes_service_label_app]
+  #       regex: innerwarden
+  #       action: keep
+  #     - source_labels: [__meta_kubernetes_endpoint_port_name]
+  #       regex: metrics
+  #       action: keep
+  #     - source_labels: [__meta_kubernetes_pod_node_name]
+  #       target_label: instance

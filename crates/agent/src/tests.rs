@@ -191,6 +191,10 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -205,6 +209,7 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         abuseipdb: None,
         geoip_client: None,
         slack_client: None,
+        discord_client: None,
         cloudflare_client: None,
         circuit_breaker_until: None,
         pending_honeypot_choices: HashMap::new(),
@@ -213,6 +218,7 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         mesh: None,
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
@@ -244,6 +250,9 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         last_orphan_recovery: std::time::Instant::now(),
         last_needs_review_timeout: std::time::Instant::now(),
         last_block_enforcement_reconcile: std::time::Instant::now(),
+        last_agent_registry_reconcile: std::time::Instant::now(),
+        pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         shield_state: None,
         deep_security_snapshot: None,
         dynamic_trusted_ips: Vec::new(),
@@ -266,6 +275,12 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     }
 }
 
@@ -482,6 +497,10 @@ async fn golden_path_dry_run_produces_decision_entry() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -496,6 +515,7 @@ async fn golden_path_dry_run_produces_decision_entry() {
         abuseipdb: None,
         geoip_client: None,
         slack_client: None,
+        discord_client: None,
         cloudflare_client: None,
         circuit_breaker_until: None,
         pending_honeypot_choices: HashMap::new(),
@@ -504,6 +524,7 @@ async fn golden_path_dry_run_produces_decision_entry() {
         mesh: None,
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
@@ -535,6 +556,9 @@ async fn golden_path_dry_run_produces_decision_entry() {
         last_orphan_recovery: std::time::Instant::now(),
         last_needs_review_timeout: std::time::Instant::now(),
         last_block_enforcement_reconcile: std::time::Instant::now(),
+        last_agent_registry_reconcile: std::time::Instant::now(),
+        pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         shield_state: None,
         deep_security_snapshot: None,
         dynamic_trusted_ips: Vec::new(),
@@ -557,6 +581,12 @@ async fn golden_path_dry_run_produces_decision_entry() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     // 4. Run the incident tick
@@ -671,6 +701,10 @@ async fn allowed_skills_whitelist_enforced() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -685,6 +719,7 @@ async fn allowed_skills_whitelist_enforced() {
         abuseipdb: None,
         geoip_client: None,
         slack_client: None,
+        discord_client: None,
         cloudflare_client: None,
         circuit_breaker_until: None,
         pending_honeypot_choices: HashMap::new(),
@@ -693,6 +728,7 @@ async fn allowed_skills_whitelist_enforced() {
         mesh: None,
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
@@ -724,6 +760,9 @@ async fn allowed_skills_whitelist_enforced() {
         last_orphan_recovery: std::time::Instant::now(),
         last_needs_review_timeout: std::time::Instant::now(),
         last_block_enforcement_reconcile: std::time::Instant::now(),
+        last_agent_registry_reconcile: std::time::Instant::now(),
+        pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         shield_state: None,
         deep_security_snapshot: None,
         dynamic_trusted_ips: Vec::new(),
@@ -746,6 +785,12 @@ async fn allowed_skills_whitelist_enforced() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -841,6 +886,10 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -855,6 +904,7 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         abuseipdb: None,
         geoip_client: None,
         slack_client: None,
+        discord_client: None,
         cloudflare_client: None,
         circuit_breaker_until: None,
         pending_honeypot_choices: HashMap::new(),
@@ -863,6 +913,7 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         mesh: None,
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
@@ -894,6 +945,9 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         last_orphan_recovery: std::time::Instant::now(),
         last_needs_review_timeout: std::time::Instant::now(),
         last_block_enforcement_reconcile: std::time::Instant::now(),
+        last_agent_registry_reconcile: std::time::Instant::now(),
+        pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         shield_state: None,
         deep_security_snapshot: None,
         dynamic_trusted_ips: Vec::new(),
@@ -916,6 +970,12 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1012,6 +1072,10 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -1026,6 +1090,7 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         abuseipdb: None,
         geoip_client: None,
         slack_client: None,
+        discord_client: None,
         cloudflare_client: None,
         circuit_breaker_until: None,
         pending_honeypot_choices: HashMap::new(),
@@ -1034,6 +1099,7 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         mesh: None,
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
@@ -1065,6 +1131,9 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         last_orphan_recovery: std::time::Instant::now(),
         last_needs_review_timeout: std::time::Instant::now(),
         last_block_enforcement_reconcile: std::time::Instant::now(),
+        last_agent_registry_reconcile: std::time::Instant::now(),
+        pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         shield_state: None,
         deep_security_snapshot: None,
         dynamic_trusted_ips: Vec::new(),
@@ -1087,6 +1156,12 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1168,6 +1243,10 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -1182,6 +1261,7 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         abuseipdb: None,
         geoip_client: None,
         slack_client: None,
+        discord_client: None,
         cloudflare_client: None,
         circuit_breaker_until: None,
         pending_honeypot_choices: HashMap::new(),
@@ -1190,6 +1270,7 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         mesh: None,
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
@@ -1221,6 +1302,9 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         last_orphan_recovery: std::time::Instant::now(),
         last_needs_review_timeout: std::time::Instant::now(),
         last_block_enforcement_reconcile: std::time::Instant::now(),
+        last_agent_registry_reconcile: std::time::Instant::now(),
+        pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         shield_state: None,
         deep_security_snapshot: None,
         dynamic_trusted_ips: Vec::new(),
@@ -1243,6 +1327,12 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1334,6 +1424,10 @@ async fn decision_cooldown_suppresses_repeat() {
         telegram_client: None,
         pending_confirmations: HashMap::new(),
         approval_rx: None,
+        dashboard_pending: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        dashboard_approval_rx: None,
         grouping_engine: notification_pipeline::GroupingEngine::new(
             &crate::config::NotificationPipelineConfig::default(),
         ),
@@ -1348,6 +1442,7 @@ async fn decision_cooldown_suppresses_repeat() {
         abuseipdb: None,
         geoip_client: None,
         slack_client: None,
+        discord_client: None,
         cloudflare_client: None,
         circuit_breaker_until: None,
         pending_honeypot_choices: HashMap::new(),
@@ -1356,6 +1451,7 @@ async fn decision_cooldown_suppresses_repeat() {
         mesh: None,
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
@@ -1387,6 +1483,9 @@ async fn decision_cooldown_suppresses_repeat() {
         last_orphan_recovery: std::time::Instant::now(),
         last_needs_review_timeout: std::time::Instant::now(),
         last_block_enforcement_reconcile: std::time::Instant::now(),
+        last_agent_registry_reconcile: std::time::Instant::now(),
+        pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         shield_state: None,
         deep_security_snapshot: None,
         dynamic_trusted_ips: Vec::new(),
@@ -1409,6 +1508,12 @@ async fn decision_cooldown_suppresses_repeat() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();

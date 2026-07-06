@@ -4,6 +4,7 @@
 //! or root. Safe to run — never writes to MSRs.
 
 use crate::{confidence, CheckResult, CheckStatus};
+#[cfg(unix)]
 use std::fs::File;
 use std::io;
 
@@ -28,19 +29,33 @@ pub const IA32_FEATURE_CONTROL: u64 = 0x3A;
 /// Uses `pread(2)` on `/dev/cpu/{cpu}/msr` which is a read-only operation
 /// from the hardware perspective — it queries the register without changing it.
 pub fn read_msr(cpu: u32, msr: u64) -> io::Result<u64> {
-    let path = format!("/dev/cpu/{cpu}/msr");
-    let f = File::open(&path)?;
-    let mut buf = [0u8; 8];
-    // pread at offset = MSR address reads the MSR value.
-    let n = nix::sys::uio::pread(&f, &mut buf, msr as i64)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    if n != 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("MSR read returned {n} bytes, expected 8"),
-        ));
+    #[cfg(unix)]
+    {
+        let path = format!("/dev/cpu/{cpu}/msr");
+        let f = File::open(&path)?;
+        let mut buf = [0u8; 8];
+        // pread at offset = MSR address reads the MSR value.
+        let n = nix::sys::uio::pread(&f, &mut buf, msr as i64)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if n != 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("MSR read returned {n} bytes, expected 8"),
+            ));
+        }
+        Ok(u64::from_le_bytes(buf))
     }
-    Ok(u64::from_le_bytes(buf))
+    // MSR reads require /dev/cpu (unix-only). On Windows (spec 085 Phase 0)
+    // this is Unsupported, so try_read_msr yields None, the same "missing
+    // /dev/cpu / non-x86" path callers already handle.
+    #[cfg(not(unix))]
+    {
+        let _ = (cpu, msr);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "MSR read requires /dev/cpu (unix-only)",
+        ))
+    }
 }
 
 /// Read an MSR, returning None on any error (permissions, missing /dev/cpu, non-x86).

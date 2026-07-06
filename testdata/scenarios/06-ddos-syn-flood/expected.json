@@ -1,9 +1,9 @@
 {
   "status": "ready",
-  "description": "SYN flood already mitigated by shield (xdp + cloudflare). The scenario seeds a pre-built shield incident because reproducing a 10k pps flood on the CI runner would require a packet generator. Stub AI returns Ignore (shield already mitigated; the agent's job is to acknowledge, not re-block). Target envelope per spec 024: 1 incident, 1 telegram, blocks=0 (upstream mitigation is what handled the attack). The scenario guards against accidental double-blocking regressions in the shield path.",
-  "last_reviewed": "2026-04-18",
+  "description": "SYN flood already mitigated by shield (xdp + cloudflare). The scenario seeds a pre-built shield incident because reproducing a 10k pps flood on the CI runner would require a packet generator. Stub AI returns Ignore (shield already mitigated; the agent's job is to acknowledge, not re-block). Target envelope per spec 024: 1 incident, blocks=0 (upstream mitigation is what handled the attack), telegram=0 (PR #1020 / spec 078 P0: Ignore/Dismiss are non-actions and no longer push a 'Threat neutralized' action report; the acknowledgement lives in the dashboard + daily digest, not a push). The scenario guards against accidental double-blocking regressions in the shield path.",
+  "last_reviewed": "2026-06-15",
   "incidents": { "min": 1, "max": 1 },
-  "telegram_msgs": { "min": 1, "max": 1 },
+  "telegram_msgs": { "min": 0, "max": 0 },
   "blocks": { "min": 0, "max": 0 },
   "decisions_auto_executed": { "min": 1, "max": 1 }
 }

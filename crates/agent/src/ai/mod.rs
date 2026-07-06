@@ -190,6 +190,20 @@ pub struct DecisionContext<'a> {
     /// lacks).
     /// `None` when DShield is disabled or the profile is not yet backfilled.
     pub ip_dshield: Option<String>,
+    /// Structured DShield signal for the deterministic Context Gate: `true` when
+    /// ISC has confirmed the primary IP attacking the community (reports > 0 or
+    /// active threat-feed membership, via `DshieldReputation::is_known_attacker`).
+    /// The trained classifier's text input is intentionally NOT changed (novel
+    /// input is out-of-distribution; enriching it is the re-distill path). The
+    /// gate around the classifier uses this to PREVENT a benign dismiss and to
+    /// ESCALATE a low-confidence passive close. Only ever escalates, never
+    /// relaxes. `false` when DShield is off, unknown, or the IP is clean.
+    // Read only by the `warden_context_gate`, which is behind the
+    // `local-classifier` feature; without that feature there is no reader, so the
+    // default build would warn. It is always written (the decide path sets it) and
+    // is genuinely used in the prod build (local-classifier is on there).
+    #[allow(dead_code)]
+    pub ip_dshield_attacker: bool,
     /// Optional compact host-posture line (spec 067 Phase 2b), from
     /// `posture::ai_context_line()`. Lets the LLM reason with the same
     /// defensive facts the downgrade engine uses (e.g. an ssh_bruteforce on a

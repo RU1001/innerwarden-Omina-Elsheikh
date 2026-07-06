@@ -47,6 +47,11 @@ pub struct TelemetrySnapshot {
     pub decisions_by_action: BTreeMap<String, u64>,
     pub dry_run_execution_count: u64,
     pub real_execution_count: u64,
+    /// Spec 084 P0 1C: per-tenant incident counts, keyed by the `tenant:<id>`
+    /// tag that `tenancy::enrich_incident` stamps on container-scoped incidents.
+    /// Default empty on replay of pre-084 snapshots.
+    #[serde(default)]
+    pub incidents_by_tenant: BTreeMap<String, u64>,
 }
 
 /// Map a physical (source, kind) tuple to its logical telemetry stream id.
@@ -140,6 +145,7 @@ pub struct TelemetryState {
     decisions_by_action: BTreeMap<String, u64>,
     dry_run_execution_count: u64,
     real_execution_count: u64,
+    incidents_by_tenant: BTreeMap<String, u64>,
 }
 
 impl TelemetryState {
@@ -185,6 +191,16 @@ impl TelemetryState {
             .incidents_by_detector
             .entry(crate::knowledge_graph::intern::intern(&kind))
             .or_insert(0) += 1;
+        // Spec 084 P0 1C: per-tenant incident count from the `tenant:<id>` tag
+        // that `tenancy::enrich_incident` stamps (the agent enriches incidents
+        // before this observe call). Host / non-k8s incidents carry no such tag
+        // and so create no per-tenant bucket.
+        if let Some(tenant) = incident.tags.iter().find_map(|t| t.strip_prefix("tenant:")) {
+            *self
+                .incidents_by_tenant
+                .entry(tenant.to_string())
+                .or_insert(0) += 1;
+        }
     }
 
     pub fn observe_gate_pass(&mut self) {
@@ -245,6 +261,7 @@ impl TelemetryState {
             decisions_by_action: self.decisions_by_action.clone(),
             dry_run_execution_count: self.dry_run_execution_count,
             real_execution_count: self.real_execution_count,
+            incidents_by_tenant: self.incidents_by_tenant.clone(),
         }
     }
 }
@@ -533,6 +550,7 @@ mod tests {
             decisions_by_action: BTreeMap::new(),
             dry_run_execution_count: 0,
             real_execution_count: 0,
+            incidents_by_tenant: BTreeMap::new(),
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         // Wire format check: keys appear as plain JSON strings, not
@@ -616,6 +634,39 @@ mod tests {
         assert_eq!(snap.decisions_by_action.get("block_ip").copied(), Some(1));
     }
 
+    // Spec 084 P0 1C: incidents carrying a `tenant:<id>` tag (stamped by
+    // tenancy::enrich_incident) are counted per tenant; host/non-k8s incidents
+    // (no tag) create no bucket.
+    #[test]
+    fn observe_incident_counts_per_tenant_tag() {
+        let mut state = TelemetryState::default();
+        let mk = |id: &str, tags: Vec<String>| Incident {
+            ts: Utc::now(),
+            host: "h".into(),
+            incident_id: id.into(),
+            severity: Severity::High,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags,
+            entities: vec![],
+        };
+        state.observe_incident(&mk(
+            "reverse_shell:1",
+            vec!["ebpf".into(), "tenant:acme-corp".into()],
+        ));
+        state.observe_incident(&mk("privesc:2", vec!["tenant:acme-corp".into()]));
+        state.observe_incident(&mk("c2_callback:3", vec!["tenant:globex-inc".into()]));
+        state.observe_incident(&mk("ssh_bruteforce:4", vec![])); // host, no tenant
+
+        let snap = state.snapshot("t");
+        assert_eq!(snap.incidents_by_tenant.get("acme-corp").copied(), Some(2));
+        assert_eq!(snap.incidents_by_tenant.get("globex-inc").copied(), Some(1));
+        // the host incident created no per-tenant bucket
+        assert_eq!(snap.incidents_by_tenant.len(), 2);
+    }
+
     #[test]
     fn telemetry_writer_and_reader_roundtrip() {
         let dir = TempDir::new().unwrap();
@@ -671,6 +722,7 @@ mod tests {
             decisions_by_action: BTreeMap::new(),
             dry_run_execution_count: 0,
             real_execution_count: 0,
+            incidents_by_tenant: BTreeMap::new(),
         };
         let newer = TelemetrySnapshot {
             ts: now - chrono::Duration::minutes(61),
@@ -687,6 +739,7 @@ mod tests {
             decisions_by_action: BTreeMap::new(),
             dry_run_execution_count: 0,
             real_execution_count: 0,
+            incidents_by_tenant: BTreeMap::new(),
         };
         let too_new = TelemetrySnapshot {
             ts: now - chrono::Duration::minutes(10),
@@ -703,6 +756,7 @@ mod tests {
             decisions_by_action: BTreeMap::new(),
             dry_run_execution_count: 0,
             real_execution_count: 0,
+            incidents_by_tenant: BTreeMap::new(),
         };
 
         let mut content = String::new();

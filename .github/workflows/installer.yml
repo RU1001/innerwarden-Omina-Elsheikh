@@ -1,0 +1,70 @@
+name: Installer
+
+# The installer (install.sh) is the product's front door: `curl -fsSL
+# innerwarden.com/install | sudo bash`. A broken install.sh = a broken first
+# impression for every new user, and the failures are nasty to catch by eye
+# (an `[responder]` backtick leaking out of an unquoted heredoc, a `SUPERVISED:
+# unbound variable` under `set -u`, a `/dev/tty` open failing on a headless
+# pipe). shellcheck catches the static/quoting class; only an ACTUAL headless
+# run catches the `set -u` / heredoc / tty runtime class. This workflow does
+# both so this category of bug can never ship again. (2026-06-13 incident.)
+
+on:
+  push:
+    branches: [main, develop]
+    paths: ["install.sh", ".github/workflows/installer.yml"]
+  pull_request:
+    paths: ["install.sh", ".github/workflows/installer.yml"]
+  schedule:
+    # Nightly: catches drift even when install.sh itself didn't change
+    # (e.g. a release-asset/layout change the script depends on).
+    - cron: "27 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Static analysis: parse errors, quoting, unquoted-heredoc landmines ──
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: shellcheck install.sh
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck --version
+          # Fail on any error-severity finding. SC1035/SC1072/SC1073 (the
+          # unquoted-heredoc backtick parse error from the 2026-06-13 incident)
+          # are errors, so this gate would have caught it.
+          shellcheck -S error install.sh
+      - name: bash syntax check
+        run: bash -n install.sh
+
+  # ── Runtime smoke: run the installer EXACTLY as users do (piped, headless,
+  #    no controlling TTY) and assert it completes cleanly. This is what
+  #    catches `set -u` unbound vars, heredoc execution, and the /dev/tty
+  #    open-failure that shellcheck cannot see. ──────────────────────────────
+  smoke:
+    runs-on: ubuntu-latest # GitHub's ubuntu runner has systemd, so the
+                           # systemctl enable/start steps in the installer run.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install via pipe (replicates `curl | sudo bash`, no TTY)
+        run: |
+          set -o pipefail
+          # Pipe the script to bash with stdin coming from the pipe and no
+          # controlling terminal — the exact condition that broke on 2026-06-13.
+          cat install.sh | sudo bash
+      - name: Assert services are active
+        run: |
+          for svc in innerwarden-sensor innerwarden-agent; do
+            state="$(systemctl is-active "$svc" || true)"
+            echo "$svc = $state"
+            if [ "$state" != "active" ]; then
+              echo "::error::$svc is not active after install ($state)"
+              sudo journalctl -u "$svc" -n 80 --no-pager || true
+              exit 1
+            fi
+          done
+          echo "Installer smoke test passed: sensor + agent active."

@@ -12,6 +12,11 @@ use tracing::warn;
 /// Uses Block Kit for a structured, readable message.
 /// Failure is logged as a warning and swallowed - a dead Slack webhook must
 /// never stop the agent from processing events (fail-open policy).
+///
+/// `Clone` is cheap: the only non-trivial field is a `reqwest::Client`, whose
+/// clone shares the underlying connection pool. The chat-channel registry
+/// (spec 078) clones it into a `Box<dyn ChatChannel>`.
+#[derive(Clone)]
 pub struct SlackClient {
     /// Slack Incoming Webhook URL.
     webhook_url: String,
@@ -89,6 +94,149 @@ impl SlackClient {
         }
         Ok(())
     }
+
+    /// Send a post-execution action report ("what the agent did") to Slack.
+    ///
+    /// Mirrors the Telegram action report so an operator watching either
+    /// channel sees the same disposition (spec 078 Phase 2).
+    pub async fn send_action_report(
+        &self,
+        report: &crate::notification_channels::ActionReport,
+        dashboard_url: Option<&str>,
+    ) -> Result<()> {
+        let payload = action_report_payload(report, dashboard_url);
+        let resp = self
+            .client
+            .post(&self.webhook_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("Slack action-report webhook POST failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(
+                status = status.as_u16(),
+                body = body.chars().take(200).collect::<String>(),
+                "Slack action-report webhook returned non-2xx"
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a pre-rendered summary line (burst/group rollup) to Slack.
+    ///
+    /// The input is Telegram HTML; Slack has no HTML rendering, so the tags are
+    /// stripped and the text posted plain.
+    pub async fn send_summary(&self, html: &str) -> Result<()> {
+        let payload = json!({ "text": strip_html_tags(html) });
+        let resp = self
+            .client
+            .post(&self.webhook_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("Slack summary webhook POST failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(
+                status = status.as_u16(),
+                body = body.chars().take(200).collect::<String>(),
+                "Slack summary webhook returned non-2xx"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Strip HTML tags from a Telegram-formatted string for plain-text channels.
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn action_report_payload(
+    report: &crate::notification_channels::ActionReport,
+    dashboard_url: Option<&str>,
+) -> serde_json::Value {
+    let pct = (report.confidence * 100.0) as u32;
+    let mode = if report.dry_run {
+        "🟡 DRY-RUN (simulated)"
+    } else {
+        "🟢 Executed"
+    };
+
+    let mut context_bits = vec![
+        format!("🖥 `{}`", report.host),
+        format!("Confidence: {pct}%"),
+    ];
+    if report.cloudflare_pushed {
+        context_bits.push("Cloudflare edge updated".to_string());
+    }
+    if let Some(rep) = &report.ip_reputation {
+        let country = report
+            .ip_geo
+            .as_ref()
+            .map(|g| g.country_code.clone())
+            .filter(|c| !c.is_empty())
+            .map(|c| format!(" ({c})"))
+            .unwrap_or_default();
+        context_bits.push(format!("AbuseIPDB {}%{}", rep.confidence_score, country));
+    }
+
+    let mut blocks = vec![
+        json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!(
+                    "🛡️ *Threat neutralized*\n{label} `{target}`\n_{title}_",
+                    label = report.action_label,
+                    target = report.target,
+                    title = report.incident_title,
+                )
+            }
+        }),
+        json!({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": format!("{mode}  |  {}", context_bits.join("  |  "))
+            }]
+        }),
+    ];
+
+    if let Some(url) = dashboard_url {
+        blocks.push(json!({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": { "type": "plain_text", "text": "Investigate →", "emoji": true },
+                "url": url
+            }]
+        }));
+    }
+
+    json!({
+        "attachments": [{
+            "color": "#22c55e",
+            "blocks": blocks,
+            "fallback": format!(
+                "[InnerWarden] {} {}: {}",
+                report.action_label, report.target, report.incident_title
+            ),
+        }]
+    })
 }
 
 fn incident_alert_payload(incident: &Incident, dashboard_url: Option<&str>) -> serde_json::Value {
@@ -328,6 +476,7 @@ mod tests {
             signals: vec!["shell".to_string(), "credential".to_string()],
             atr_rule_ids: vec!["ATR-7".to_string()],
             explanation: "dangerous".to_string(),
+            tenant: None,
         }
     }
 
@@ -397,5 +546,60 @@ mod tests {
             .unwrap();
         assert!(text.contains("MEDIUM"));
         assert!(!text.contains("ATR:"));
+    }
+
+    #[test]
+    fn strip_html_tags_removes_markup_keeps_text() {
+        assert_eq!(
+            strip_html_tags("<b>3 incidents</b> from <code>1.2.3.4</code>"),
+            "3 incidents from 1.2.3.4"
+        );
+        assert_eq!(strip_html_tags("no tags"), "no tags");
+        assert_eq!(strip_html_tags("<a href=\"x\">link</a>"), "link");
+    }
+
+    fn test_action_report(dry_run: bool) -> crate::notification_channels::ActionReport {
+        crate::notification_channels::ActionReport {
+            action_label: "Blocked".to_string(),
+            target: "203.0.113.9".to_string(),
+            incident_title: "SSH brute force".to_string(),
+            confidence: 0.97,
+            host: "prod-1".to_string(),
+            dry_run,
+            ip_reputation: None,
+            ip_geo: None,
+            cloudflare_pushed: true,
+        }
+    }
+
+    #[test]
+    fn action_report_payload_renders_disposition_and_dashboard_button() {
+        let payload = action_report_payload(&test_action_report(false), Some("https://dash"));
+        assert_eq!(payload["attachments"][0]["color"], "#22c55e");
+        let header = payload["attachments"][0]["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(header.contains("Threat neutralized"));
+        assert!(header.contains("Blocked"));
+        assert!(header.contains("203.0.113.9"));
+        let ctx = payload["attachments"][0]["blocks"][1]["elements"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("Executed"), "non-dry-run shows Executed");
+        assert!(ctx.contains("97%"));
+        assert!(ctx.contains("Cloudflare"));
+        // dashboard_url present -> an actions block with the Investigate button.
+        assert_eq!(payload["attachments"][0]["blocks"][2]["type"], "actions");
+    }
+
+    #[test]
+    fn action_report_payload_dry_run_and_no_dashboard() {
+        let payload = action_report_payload(&test_action_report(true), None);
+        let ctx = payload["attachments"][0]["blocks"][1]["elements"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("DRY-RUN"));
+        // No dashboard_url -> no third (actions) block.
+        assert!(payload["attachments"][0]["blocks"][2].is_null());
     }
 }

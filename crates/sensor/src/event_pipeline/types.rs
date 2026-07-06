@@ -61,7 +61,20 @@ pub struct RawRule {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuppressConfig {
-    pub detector: String,
+    /// Detector name for `suppress_incident` rules (sensor-side). Optional so
+    /// that agent-side `suppress_response` rules — which key on `scope`, not a
+    /// detector — parse cleanly under `deny_unknown_fields` instead of making
+    /// the sensor warn-and-skip the whole file. `validate_suppress_rule`
+    /// enforces presence for `suppress_incident`.
+    #[serde(default)]
+    pub detector: Option<String>,
+    /// Scope for agent-side `suppress_response` rules: `"ip"` | `"user"` |
+    /// `"process"`. Ignored by the sensor (it skips `suppress_response` rules);
+    /// consumed by the agent's `YamlResponseRules`. Present here only so the
+    /// sensor's strict schema accepts the shared rule file, hence `dead_code`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub scope: Option<String>,
     pub values: Vec<String>,
 }
 
@@ -396,7 +409,8 @@ pub fn validate_suppress_rule(raw: &RawRule) -> Result<(String, Vec<String>), St
             raw.id
         )
     })?;
-    if sc.detector.is_empty() {
+    let detector = sc.detector.as_deref().unwrap_or("");
+    if detector.is_empty() {
         return Err(format!(
             "rule '{}': suppress.detector must not be empty",
             raw.id
@@ -408,7 +422,7 @@ pub fn validate_suppress_rule(raw: &RawRule) -> Result<(String, Vec<String>), St
             raw.id
         ));
     }
-    Ok((sc.detector.clone(), sc.values.clone()))
+    Ok((detector.to_string(), sc.values.clone()))
 }
 
 pub fn expand_list_refs(values: &mut Option<Vec<String>>, lists: &HashMap<String, Vec<String>>) {
@@ -1237,7 +1251,32 @@ rules:
         let rf: RuleFile = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(rf.rules[0].action, ActionKind::SuppressIncident);
         let sc = rf.rules[0].suppress.as_ref().unwrap();
-        assert_eq!(sc.detector, "sudo_abuse");
+        assert_eq!(sc.detector.as_deref(), Some("sudo_abuse"));
         assert_eq!(sc.values, vec!["ubuntu", "deploy"]);
+    }
+
+    #[test]
+    fn suppress_response_scope_rule_parses_and_is_skipped_by_sensor() {
+        // Agent-side suppress_response rules (scope, no detector) must parse
+        // cleanly under the sensor's deny_unknown_fields schema — otherwise the
+        // sensor warn-skips the whole shared rule file. The sensor skips the
+        // rule itself (it's an agent-side concern); we only assert it loads.
+        let yaml = r#"
+version: 1
+rules:
+  - id: operator-trust-203-0-113-10
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["203.0.113.10"]
+    drop_reason: "office vpn"
+    expires_at: "2026-06-20T12:00:00Z"
+    tags: [operator-trust]
+"#;
+        let rf: RuleFile = serde_yaml::from_str(yaml).expect("suppress_response/scope must parse");
+        assert_eq!(rf.rules[0].action, ActionKind::SuppressResponse);
+        let sc = rf.rules[0].suppress.as_ref().unwrap();
+        assert_eq!(sc.scope.as_deref(), Some("ip"));
+        assert!(sc.detector.is_none());
     }
 }

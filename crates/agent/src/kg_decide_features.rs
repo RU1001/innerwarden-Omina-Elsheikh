@@ -305,6 +305,27 @@ pub fn apply_critical_floor(modifier: f32, severity: &Severity) -> f32 {
     }
 }
 
+/// Merge persisted attacker-intel signals into the KG-derived features.
+///
+/// The KG IP node is rebuilt from a dated, daily graph snapshot, so its
+/// `first_seen` (and risk) effectively resets across days/restarts — which made
+/// the age-gated benign-suppression bands unreachable (the modifier sat at
+/// `0.0`). The attacker-intel profile is persisted to redb and loaded on boot,
+/// so it carries the true first sighting + composite risk. We adopt the OLDER
+/// age and the HIGHER risk: longer tenure makes the benign bands reachable for
+/// genuinely long-lived IPs, and the higher composite risk keeps the
+/// repeat-offender band honest — neither direction weakens detection.
+pub fn merge_persisted_profile(
+    features: &mut KgDecideFeatures,
+    profile_first_seen: DateTime<Utc>,
+    profile_risk_score: u8,
+    now: DateTime<Utc>,
+) {
+    let persisted_age_days = (now - profile_first_seen).num_days().max(0) as u32;
+    features.first_seen_age_days = features.first_seen_age_days.max(persisted_age_days);
+    features.risk_score = features.risk_score.max(profile_risk_score);
+}
+
 /// Single record appended to `kg_shadow_decide_modifier_<YYYY-MM-DD>.jsonl`
 /// when running in `mode = "shadow"`. Operator inspects this log for at
 /// least 7 days before promoting to `enforce`. The `would_change_action`
@@ -496,6 +517,53 @@ mod tests {
         let (m, reason) = compute_modifier(&f);
         assert!((m - (-0.30)).abs() < f32::EPSILON, "got {m}");
         assert!(reason.contains("long-tenure benign"));
+    }
+
+    /// The inert-modifier fix: a long-tenured benign IP whose KG node shows
+    /// age 0 (daily-snapshot reset) cannot reach the age-gated benign band,
+    /// but merging the PERSISTED attacker-intel first_seen unlocks it.
+    #[test]
+    fn merge_persisted_profile_unlocks_age_gated_benign_band() {
+        let now = chrono::Utc::now();
+        let mut f = KgDecideFeatures {
+            prior_incidents_24h: 0,
+            benign_history_score: 0.95,
+            related_campaigns: 0,
+            cluster_size: 12,
+            risk_score: 5,
+            first_seen_age_days: 0, // KG thinks the IP is brand-new (snapshot reset)
+        };
+        assert_eq!(
+            compute_modifier(&f).0,
+            0.0,
+            "age 0 cannot reach the benign band"
+        );
+        merge_persisted_profile(&mut f, now - chrono::Duration::days(30), 8, now);
+        assert_eq!(f.first_seen_age_days, 30);
+        assert_eq!(f.risk_score, 8); // higher of (5, 8)
+        assert!(
+            (compute_modifier(&f).0 - (-0.30)).abs() < f32::EPSILON,
+            "persisted 30d tenure unlocks the strong-benign band"
+        );
+    }
+
+    /// The merge only ever lengthens tenure / raises risk — it never shortens
+    /// the age or lowers the risk, so it cannot weaken detection.
+    #[test]
+    fn merge_persisted_profile_takes_older_age_and_higher_risk() {
+        let now = chrono::Utc::now();
+        let mut f = KgDecideFeatures {
+            prior_incidents_24h: 0,
+            benign_history_score: 0.5,
+            related_campaigns: 0,
+            cluster_size: 1,
+            risk_score: 90,
+            first_seen_age_days: 20,
+        };
+        // Profile is younger + lower risk than the KG view -> KG values kept.
+        merge_persisted_profile(&mut f, now - chrono::Duration::days(2), 10, now);
+        assert_eq!(f.first_seen_age_days, 20);
+        assert_eq!(f.risk_score, 90);
     }
 
     /// Anchor: the strongest malicious signal (`+0.20` band) requires

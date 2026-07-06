@@ -156,7 +156,37 @@ fi
 echo "[replay] running sensor from fixture logs (graceful stop)"
 "$SENSOR_BIN" --config "$SENSOR_CFG" > "$SENSOR_LOG" 2>&1 &
 SENSOR_PID=$!
-sleep 4
+# Quiesce-wait before SIGINT: a fixed `sleep` then kill is a flake on a loaded
+# CI runner — the debug sensor may not have read the auth fixture + run the
+# detectors + WRITTEN its events to SQLite within the window, so SIGINT lands
+# early, the `events` table is empty, and the agent's slow loop sees
+# events_count=0 -> the `events_count > 0` gate in maybe_write_daily_summary
+# skips the summary -> `assert_file_nonempty summary-$DATE.md` fails (the 2026-06
+# post-merge replay-qa flake; same class as the scenario-qa fix). Wait until the
+# sensor has written events and the count has QUIESCED (held steady), capped, so
+# the agent's first --once pass deterministically reads a non-empty event set.
+sleep 2
+if command -v sqlite3 > /dev/null 2>&1; then
+  _rq_prev=-1
+  _rq_stable=0
+  for _ in $(seq 1 80); do
+    _rq_n=$(sqlite3 "$SQLITE_DB" "SELECT COUNT(*) FROM events;" 2>/dev/null || echo 0)
+    _rq_n=${_rq_n:-0}
+    if [[ "$_rq_n" -gt 0 ]]; then
+      if [[ "$_rq_n" -eq "$_rq_prev" ]]; then
+        _rq_stable=$((_rq_stable + 1))
+        [[ "$_rq_stable" -ge 3 ]] && break
+      else
+        _rq_stable=0
+      fi
+      _rq_prev="$_rq_n"
+    fi
+    sleep 0.3
+  done
+else
+  # No sqlite3 (rare; ubuntu-latest ships it): fall back to the fixed window.
+  sleep 2
+fi
 kill -INT "$SENSOR_PID" 2>/dev/null || true
 for _ in $(seq 1 20); do
   if ! kill -0 "$SENSOR_PID" 2>/dev/null; then

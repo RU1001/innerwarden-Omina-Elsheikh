@@ -624,6 +624,7 @@ mod tests {
             ip_reputation,
             ip_geo,
             ip_dshield: None,
+            ip_dshield_attacker: false,
             host_posture: None,
             prior_decisions: None,
             graph_context: None,

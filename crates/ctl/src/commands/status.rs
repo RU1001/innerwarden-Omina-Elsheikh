@@ -125,9 +125,15 @@ pub(crate) fn cmd_status_global(
 
     println!("\nServices");
     for unit in &["innerwarden-sensor", "innerwarden-agent"] {
-        let active = systemd::is_service_active(unit);
-        let indicator = if active { "●" } else { "○" };
-        let label = if active { "running" } else { "stopped" };
+        // service_status is platform-aware: systemd on Linux, process presence
+        // on macOS. Distinguish Unknown ("could not determine") from Inactive so
+        // a running launchd daemon is never falsely reported as "stopped"
+        // (2026-07-01 macOS finding F7).
+        let (indicator, label) = match systemd::service_status(unit) {
+            systemd::ServiceStatus::Active => ("●", "running"),
+            systemd::ServiceStatus::Inactive => ("○", "stopped"),
+            systemd::ServiceStatus::Unknown => ("◐", "unknown"),
+        };
         println!("  {indicator} {unit:<28} {label}");
     }
 

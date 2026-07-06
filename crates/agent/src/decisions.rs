@@ -261,10 +261,16 @@ fn open_or_create(data_dir: &Path, date: &str) -> Result<File> {
 /// made today".)
 pub fn count_decisions_for_date(data_dir: &Path, date: &str) -> usize {
     let path = data_dir.join(format!("decisions-{date}.jsonl"));
-    match std::fs::read_to_string(&path) {
-        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
-        Err(_) => 0,
-    }
+    // Stream the (all-day-growing) log line by line instead of slurping the
+    // whole file into a String just to count non-empty lines.
+    let Ok(file) = File::open(&path) else {
+        return 0;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .count()
 }
 
 /// Count `block_ip` decisions in `decisions-<date>.jsonl` whose timestamp
@@ -284,13 +290,15 @@ pub fn count_block_ips_in_current_hour(
     let date = now.format("%Y-%m-%d").to_string();
     let path = data_dir.join(format!("decisions-{date}.jsonl"));
     let hour_prefix = now.format("%Y-%m-%dT%H").to_string();
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    // Stream the daily log rather than holding the whole file in RAM.
+    let Ok(file) = File::open(&path) else {
         return 0;
     };
-    content
+    BufReader::new(file)
         .lines()
+        .map_while(Result::ok)
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
         .filter(|v| {
             v.get("action_type").and_then(|a| a.as_str()) == Some("block_ip")
                 && v.get("ts")

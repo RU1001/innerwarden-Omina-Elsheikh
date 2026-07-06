@@ -169,14 +169,14 @@ mod tests {
         let line = format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"save","arguments":{{"token":"sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa"}}}}}}"#
         );
-        let d = route_message(&env(&line), Direction::ClientToServer, None, None);
+        let d = route_message(&env(&line), Direction::ClientToServer, None, None, None);
         assert!(!d.verdict.allowed, "fixture must be a blocking decision");
         d
     }
 
     fn clean_decision() -> ProxyDecision {
         let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"location":"NYC"}}}"#;
-        route_message(&env(line), Direction::ClientToServer, None, None)
+        route_message(&env(line), Direction::ClientToServer, None, None, None)
     }
 
     fn server_alert_decision() -> ProxyDecision {
@@ -186,6 +186,7 @@ mod tests {
             &env(line),
             Direction::ServerToClient,
             Some("tools/call"),
+            None,
             None,
         );
         assert!(d.verdict.allowed && !d.verdict.alerts.is_empty());

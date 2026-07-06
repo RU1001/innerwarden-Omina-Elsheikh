@@ -854,8 +854,112 @@ pub(crate) fn parse_ufw_status(status_out: &str) -> Vec<ScanFinding> {
 }
 
 /// Audit general system-level security posture. Always runs. Fail-silent.
+/// Inspect a single sudoers grant line for an over-broad `install` command.
+///
+/// Returns `Some(reason)` when the granted `install` has a wildcard
+/// DESTINATION into `/etc/sudoers.d/` (a compromised agent user can write an
+/// arbitrary sudoers file = instant root) or an unanchored wildcard SOURCE `*`
+/// (arbitrary attacker-writable content copied into the root-owned dest). A
+/// source anchored to a fixed prefix (`/tmp/innerwarden-*`) is not flagged by
+/// this check — that residual is narrower and closed separately by the
+/// content-generating helper, not by this stale-rule detector.
+fn overbroad_install_grant(rule_line: &str) -> Option<String> {
+    let line = rule_line.trim();
+    if !line.contains("install") {
+        return None;
+    }
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let install_pos = toks
+        .iter()
+        .position(|t| *t == "install" || t.ends_with("/install"))?;
+    // Positional (non-flag) args after `install`, skipping `-o VAL`, `-g VAL`,
+    // `-m VAL`, `-t VAL` flag pairs and any other `-x` flag. Strip trailing
+    // sudoers `,` separators and line-continuation `\`.
+    let mut i = install_pos + 1;
+    let mut positional: Vec<&str> = Vec::new();
+    while i < toks.len() {
+        let t = toks[i];
+        match t {
+            "-o" | "-g" | "-m" | "-t" => i += 2,
+            _ if t.starts_with('-') => i += 1,
+            _ => {
+                positional.push(t.trim_end_matches([',', '\\']));
+                i += 1;
+            }
+        }
+    }
+    let src = positional.first().copied().unwrap_or_default();
+    let dst = positional.get(1).copied().unwrap_or_default();
+    if dst == "/etc/sudoers.d/*" {
+        return Some(
+            "grants `install` with a wildcard destination into /etc/sudoers.d/ — a \
+             compromised innerwarden user can write an arbitrary sudoers file and gain root"
+                .to_string(),
+        );
+    }
+    if src == "*" {
+        return Some(
+            "grants `install` with an unanchored wildcard source `*` — a compromised \
+             innerwarden user can copy arbitrary content into the root-owned destination"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Audit InnerWarden's own `/etc/sudoers.d/innerwarden*` drop-ins for the
+/// over-broad `install` grants that early installs shipped. A hardening tool
+/// must not itself leave a privilege-escalation primitive on disk; because
+/// `innerwarden upgrade` swaps binaries but does not regenerate sudoers, a box
+/// installed before the codegen was scoped keeps the loose rule indefinitely.
+/// This surfaces it so the operator regenerates or removes it.
+fn audit_innerwarden_sudoers() -> Vec<ScanFinding> {
+    audit_innerwarden_sudoers_in(std::path::Path::new("/etc/sudoers.d"))
+}
+
+/// Directory-parameterised core of [`audit_innerwarden_sudoers`] for testing.
+fn audit_innerwarden_sudoers_in(dir: &std::path::Path) -> Vec<ScanFinding> {
+    let mut findings = vec![];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return findings;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("innerwarden") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some(reason) = content.lines().find_map(overbroad_install_grant) {
+            findings.push(ScanFinding {
+                severity: FindingSeverity::High,
+                resource: name.clone(),
+                title: format!("InnerWarden sudoers drop-in '{name}' is over-broad"),
+                detail: format!(
+                    "/etc/sudoers.d/{name} {reason}. This is a stale rule from an older \
+                     install — `innerwarden upgrade` swaps binaries but does not regenerate \
+                     sudoers, so the loose rule persists."
+                ),
+                iw_handles: false,
+                admin_action: Some(format!(
+                    "If this capability is unused, remove the drop-in:\n  \
+                     sudo rm -f /etc/sudoers.d/{name} && sudo visudo -c\n\
+                     Otherwise upgrade InnerWarden and re-run `sudo innerwarden harden` to \
+                     regenerate a scoped rule."
+                )),
+            });
+        }
+    }
+    findings.sort_by(|a, b| a.resource.cmp(&b.resource));
+    findings
+}
+
 pub(crate) fn audit_system() -> Vec<ScanFinding> {
     let mut findings = vec![];
+
+    // InnerWarden's own sudoers drop-ins (must not ship an escalation primitive)
+    findings.extend(audit_innerwarden_sudoers());
 
     // Automatic security updates
     let auto_upgrade_configured = {
@@ -2126,6 +2230,81 @@ mod tests {
         let findings = audit_system();
         // It's a Vec, even if empty on a well-configured system
         let _ = findings.len();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // InnerWarden sudoers drop-in over-broad `install` grant detection
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn overbroad_install_flags_sudoers_d_wildcard_dest() {
+        // The worst case, as shipped on stale prod boxes.
+        let line = "  /usr/bin/install -o root -g root -m 440 * /etc/sudoers.d/*, \\";
+        let reason = overbroad_install_grant(line).expect("must flag");
+        assert!(reason.contains("/etc/sudoers.d/"));
+        assert!(reason.contains("root"));
+    }
+
+    #[test]
+    fn overbroad_install_flags_bare_wildcard_source() {
+        let line =
+            "  /usr/bin/install -o root -g root -m 644 * /etc/nginx/innerwarden-blocklist.conf, \\";
+        assert!(overbroad_install_grant(line).is_some());
+    }
+
+    #[test]
+    fn overbroad_install_ignores_anchored_tmp_source() {
+        // The current (scoped) codegen — narrower, not this check's target.
+        let line = "  /usr/bin/install -o root -g root -m 440 /tmp/innerwarden-sudoers-* /etc/sudoers.d/innerwarden-*, \\";
+        assert!(overbroad_install_grant(line).is_none());
+    }
+
+    #[test]
+    fn overbroad_install_ignores_non_install_grants() {
+        assert!(overbroad_install_grant(
+            "innerwarden ALL=(ALL) NOPASSWD: /usr/sbin/ufw deny from *"
+        )
+        .is_none());
+        assert!(overbroad_install_grant("/usr/sbin/nginx -s reload").is_none());
+    }
+
+    #[test]
+    fn audit_sudoers_dir_flags_only_loose_innerwarden_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Loose (stale) drop-in — must be flagged High.
+        std::fs::write(
+            dir.path().join("innerwarden-suspend-user"),
+            "innerwarden ALL=(ALL) NOPASSWD: \\\n  /usr/bin/install -o root -g root -m 440 * /etc/sudoers.d/*, \\\n  /usr/sbin/visudo -cf *\n",
+        )
+        .unwrap();
+        // Scoped drop-in — must NOT be flagged.
+        std::fs::write(
+            dir.path().join("innerwarden-search-protection"),
+            "innerwarden ALL=(ALL) NOPASSWD: \\\n  /usr/bin/install -o root -g root -m 644 /tmp/innerwarden-nginx-* /etc/nginx/innerwarden-blocklist.conf\n",
+        )
+        .unwrap();
+        // Non-innerwarden file with a loose rule — out of scope, must be ignored.
+        std::fs::write(
+            dir.path().join("99-other"),
+            "someone ALL=(ALL) NOPASSWD: /usr/bin/install -o root -g root -m 440 * /etc/sudoers.d/*\n",
+        )
+        .unwrap();
+
+        let findings = audit_innerwarden_sudoers_in(dir.path());
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the loose innerwarden file is flagged"
+        );
+        assert_eq!(findings[0].resource, "innerwarden-suspend-user");
+        assert_eq!(findings[0].severity, FindingSeverity::High);
+        assert!(findings[0].admin_action.is_some());
+    }
+
+    #[test]
+    fn audit_sudoers_dir_missing_returns_empty() {
+        let findings = audit_innerwarden_sudoers_in(std::path::Path::new("/nonexistent/sudoers.d"));
+        assert!(findings.is_empty());
     }
 
     // ─────────────────────────────────────────────────────────────────────

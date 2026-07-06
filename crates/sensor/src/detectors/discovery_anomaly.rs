@@ -243,6 +243,11 @@ mod tests {
                 "ppid": ppid,
                 "comm": comm,
                 "parent_comm": parent_comm,
+                // Interactive-operator baseline (real ssh shell owns a tty). Only
+                // matters when parent_comm is a shell — the attacker tests use a
+                // non-shell parent, so they classify AttackerInferred regardless.
+                // OpInteractive now requires this tty proof (evasion audit E3).
+                "has_tty": true,
                 "command": comm,
                 "argv": [comm],
                 "argc": 1,

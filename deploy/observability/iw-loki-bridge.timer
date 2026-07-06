@@ -1,0 +1,8 @@
+[Unit]
+Description=Run the InnerWarden SQLite->Loki bridge every 20s
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=20
+AccuracySec=5s
+[Install]
+WantedBy=timers.target

@@ -65,6 +65,29 @@ pub(crate) fn hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// The label this host's incidents are stamped with, for display in operator
+/// messages. Prefers the sensor's `[agent] host_id` — that's exactly what real
+/// incidents (and their Telegram/Slack alerts) carry, so a test alert shows the
+/// same name and the operator can tell which box it came from. Falls back to the
+/// system hostname.
+pub(crate) fn host_label(sensor_config: &Path) -> String {
+    if let Ok(content) = std::fs::read_to_string(sensor_config) {
+        if let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
+            if let Some(h) = doc
+                .get("agent")
+                .and_then(|a| a.get("host_id"))
+                .and_then(|v| v.as_str())
+            {
+                let h = h.trim();
+                if !h.is_empty() && h != "test-host" {
+                    return h.to_string();
+                }
+            }
+        }
+    }
+    hostname()
+}
+
 /// Load key=value pairs from an env file (silently ignores missing file).
 pub(crate) fn load_env_file(path: &Path) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -191,6 +214,31 @@ pub(crate) fn resolve_data_dir(cli: &Cli, data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- host_label --
+
+    #[test]
+    fn host_label_reads_sensor_host_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[agent]\nhost_id = \"azure-spot\"\ndata_dir = \"/x\"\n",
+        )
+        .unwrap();
+        assert_eq!(host_label(&cfg), "azure-spot");
+    }
+
+    #[test]
+    fn host_label_ignores_test_host_and_empty_then_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        // sentinel "test-host" is treated as unset → fall back to system hostname
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "[agent]\nhost_id = \"test-host\"\n").unwrap();
+        assert_ne!(host_label(&cfg), "test-host");
+        // missing file → fall back too (does not panic)
+        let _ = host_label(&dir.path().join("nope.toml"));
+    }
 
     // -- mask_secret --
 

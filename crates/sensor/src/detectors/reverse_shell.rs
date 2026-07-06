@@ -142,6 +142,51 @@ impl ReverseShellDetector {
             .unwrap_or("unknown");
         let now = event.ts;
 
+        // Self-exclusion: InnerWarden's OWN agent/ctl legitimately connect out
+        // (Telegram notifications, the dashboard API, threat-feed polling) and
+        // dup2 fds, and that connect + fd_redirect shape self-false-fired
+        // `ebpf_reverse_shell` on the product's own egress — observed 126
+        // Critical self-flags / 30 min to Telegram (149.154.166.x) on test001,
+        // with `innerwarden-age` / `innerwarden` as the source comm. Verified via
+        // `/proc/<pid>/exe` (NOT the forgeable comm): a process that merely sets
+        // comm=innerwarden-* but whose exe is /tmp still fires — no blind spot.
+        // Checked on the reliable connect-time comm; skipping the connect means a
+        // later fd_redirect finds no recorded connect and cannot fire either.
+        if super::is_verified_infra_process(comm, pid, &["innerwarden"]) {
+            return None;
+        }
+
+        // Cloud guest-agent downgrade: on a cloud VM the platform's own agent
+        // (Azure WALinuxAgent / ExtHandler) opens control-plane sockets (e.g. the
+        // WireServer 168.63.129.16) and redirects fds in a shape that trips
+        // `ebpf_reverse_shell` — observed ~992+ Critical FP/hour from `ExtHandler`
+        // on an Azure k8s node, saturating the sensor event channel (shed-load).
+        //
+        // The short-lived guest-agent CHILD (`ExtHandler`) usually EXITS before
+        // this userspace detector runs, so its own `/proc` is gone and identity
+        // can't be resolved from the child pid. Fall back to its LONG-LIVED
+        // PARENT — `WALinuxAgent ... -run-exthandlers` — which the collector
+        // enriches as `ppid` on the fd_redirect (the event that EMITS the
+        // incident) and whose `/proc` lineage still resolves. Identity stays
+        // NON-FORGEABLE (real /proc lineage of the alive parent). `uid` is not
+        // present on every eBPF event (the fd_redirect omits it), so default it
+        // to 0 rather than SKIP the whole gate; `is_guest_agent` still requires a
+        // DMI-detected cloud VM + a real root-owned guest-agent lineage, so the
+        // default cannot let a `/tmp` or non-root process through. Downgrade-only.
+        let uid = event
+            .details
+            .get("uid")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let ppid = event.details.get("ppid").and_then(|v| v.as_u64());
+        let is_guest = crate::cloud_platform::is_guest_agent(pid, uid as u32)
+            || ppid.is_some_and(|pp| {
+                pp != 0 && crate::cloud_platform::is_guest_agent(pp as u32, uid as u32)
+            });
+        if is_guest {
+            return None;
+        }
+
         // Record this event for the PID
         let dst_ip = event
             .details
@@ -156,18 +201,18 @@ impl ReverseShellDetector {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u16;
 
-        let pid_events = self.pid_network_events.entry(pid).or_default();
-
-        // Expire old events (>30s)
-        pid_events.retain(|e| now - e.ts < Duration::seconds(30));
-
-        pid_events.push(PidNetworkEvent {
-            kind: event.kind.clone(),
-            ts: now,
-            dst_ip: dst_ip.clone(),
-            dst_port,
-            comm: comm.to_string(),
-        });
+        {
+            let pid_events = self.pid_network_events.entry(pid).or_default();
+            // Expire old events (>30s)
+            pid_events.retain(|e| now - e.ts < Duration::seconds(30));
+            pid_events.push(PidNetworkEvent {
+                kind: event.kind.clone(),
+                ts: now,
+                dst_ip: dst_ip.clone(),
+                dst_port,
+                comm: comm.to_string(),
+            });
+        }
 
         // Only check on fd_redirect — that's the final step
         if event.kind != "process.fd_redirect" {
@@ -184,18 +229,41 @@ impl ReverseShellDetector {
             return None; // Not redirecting stdio
         }
 
+        // Fork-aware correlation (evasion audit E4): a reverse shell can connect()
+        // in the PARENT then fork() and dup2() the socket onto stdio in the CHILD
+        // (classic socat / `python: fork; in child dup2+exec`). The connect is then
+        // recorded under the parent pid while the fd_redirect arrives under the
+        // child pid, so a strict per-pid match (the old behaviour) never fired. We
+        // correlate over THIS pid's ring UNION its PARENT's ring. ppid is enriched
+        // onto the fd_redirect event by the collector (stdio dups only).
+        let ppid = event
+            .details
+            .get("ppid")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let mut combined: Vec<PidNetworkEvent> = self
+            .pid_network_events
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default();
+        if ppid != 0 && ppid != pid {
+            if let Some(parent) = self.pid_network_events.get(&ppid) {
+                combined.extend(parent.iter().cloned());
+            }
+        }
+
         // Check for reverse shell: connect + fd_redirect
-        let has_connect = pid_events
+        let has_connect = combined
             .iter()
             .any(|e| e.kind == "network.outbound_connect");
 
         // Check for bind shell: bind_listen + listen + fd_redirect
-        let has_bind = pid_events.iter().any(|e| e.kind == "network.bind_listen");
-        let has_listen = pid_events.iter().any(|e| e.kind == "network.listen");
+        let has_bind = combined.iter().any(|e| e.kind == "network.bind_listen");
+        let has_listen = combined.iter().any(|e| e.kind == "network.listen");
 
         let (pattern, target_ip, target_port, source_comm) = if has_connect {
             // Reverse shell detected
-            let conn = pid_events
+            let conn = combined
                 .iter()
                 .find(|e| e.kind == "network.outbound_connect")?;
             (
@@ -206,9 +274,7 @@ impl ReverseShellDetector {
             )
         } else if has_bind && has_listen {
             // Bind shell detected
-            let bind = pid_events
-                .iter()
-                .find(|e| e.kind == "network.bind_listen")?;
+            let bind = combined.iter().find(|e| e.kind == "network.bind_listen")?;
             (
                 "ebpf_bind_shell",
                 bind.dst_ip.clone(),
@@ -256,6 +322,36 @@ impl ReverseShellDetector {
             .iter()
             .any(|p| source_comm == *p || source_comm.starts_with(p));
         if comm_match && target_port == 22 {
+            return None;
+        }
+
+        // 2026-06-29: HTTP/download-client exclusion. wget / curl (and friends)
+        // connect to a web server and dup2 the socket onto stdio to stream the
+        // body — bit-identical to a reverse shell from the kernel's POV, but
+        // `curl https://...` is not an attack. This is the single most common
+        // false positive: ANY box (not just AI-agent boxes) running wget/curl
+        // gets flooded with Critical `ebpf_reverse_shell`. Observed on test001:
+        // busybox `wget http://1.1.1.1` -> connect:80 + fd_redirect(0) ->
+        // Critical, source_comm=wget.
+        //
+        // Same shape, same risk model, and INTENTIONALLY as narrow as the SSH
+        // exclusion above:
+        //   - source_comm comes from the CONNECT event (reliable).
+        //   - target_port must be a standard web port — a "wget" connecting to
+        //     4444 / 1337 / a random high C2 port still fires (real reverse
+        //     shells do not live on :443; a renamed binary cannot fake the
+        //     kernel-reported destination port).
+        //   - defence in depth: a genuinely malicious download is still seen by
+        //     c2_callback / c2_web_tunnel / process_tree / the agent context
+        //     gate; this only stops the connect+dup2 *shape* from self-flagging.
+        const REVERSE_SHELL_HTTP_CLIENTS: &[&str] = &[
+            "wget", "curl", "aria2c", "axel", "lynx", "links", "w3m", "fetch", "http", "https",
+        ];
+        let http_client_match = REVERSE_SHELL_HTTP_CLIENTS
+            .iter()
+            .any(|p| source_comm == *p || source_comm.starts_with(p));
+        let web_port = matches!(target_port, 80 | 443 | 8080 | 8443 | 8000 | 8888);
+        if http_client_match && web_port {
             return None;
         }
 
@@ -726,6 +822,19 @@ mod tests {
             entities: vec![],
         }
     }
+    /// fd_redirect carrying a parent pid (the collector enriches this from
+    /// /proc for stdio dups) — used for the fork()'d reverse-shell case.
+    fn fd_redirect_event_ppid(
+        pid: u32,
+        oldfd: u32,
+        newfd: u32,
+        ppid: u32,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        let mut ev = fd_redirect_event(pid, oldfd, newfd, ts);
+        ev.details["ppid"] = serde_json::json!(ppid);
+        ev
+    }
 
     fn bind_event(pid: u32, port: u16, ts: DateTime<Utc>) -> Event {
         Event {
@@ -805,6 +914,41 @@ mod tests {
             inc.is_none(),
             "ssh + connect + fd_redirect on port 22 must be suppressed"
         );
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_does_not_fire_on_wget_to_web_port() {
+        // 2026-06-29: the #1 false positive. wget/curl connect to a web server
+        // and dup2 the socket onto stdio to stream the body — bit-identical to a
+        // reverse shell. Observed on test001: busybox `wget http://1.1.1.1` ->
+        // connect:80 + fd_redirect(0) -> Critical. Must be suppressed for known
+        // HTTP clients on a standard web port.
+        for (comm, port) in [("wget", 80u16), ("curl", 443), ("wget", 8080)] {
+            let mut det = ReverseShellDetector::new("test", 300);
+            let now = Utc::now();
+            det.process(&connect_event_with_comm(7100, "1.1.1.1", port, comm, now));
+            let inc = det.process(&fd_redirect_event(7100, 5, 0, now + Duration::seconds(1)));
+            assert!(
+                inc.is_none(),
+                "{comm} connect+fd_redirect to web port {port} must be suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_still_fires_on_wget_to_non_web_port() {
+        // INTENTIONALLY narrow: a "wget" to a C2 port (4444/1337/random high)
+        // is NOT a real download and still fires — an attacker renaming their
+        // reverse shell to wget cannot also make the kernel report port 80.
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        det.process(&connect_event_with_comm(
+            7101, "10.0.0.1", 4444, "wget", now,
+        ));
+        let inc = det
+            .process(&fd_redirect_event(7101, 5, 0, now + Duration::seconds(1)))
+            .expect("wget to a non-web C2 port must still fire");
+        assert_eq!(inc.severity, Severity::Critical);
     }
 
     #[test]
@@ -975,9 +1119,137 @@ mod tests {
         // Connect from PID 1234
         det.process(&connect_event(1234, "10.0.0.1", 4444, now));
 
-        // fd_redirect from different PID 5678 → should NOT trigger
+        // fd_redirect from an UNRELATED PID 5678 (no ppid link) → must NOT trigger
         let inc = det.process(&fd_redirect_event(5678, 5, 0, now + Duration::seconds(1)));
         assert!(inc.is_none());
+    }
+
+    /// Regression anchor (evasion audit E4, 2026-06-20): a fork()'d reverse shell
+    /// connects in the PARENT then dup2()s the socket onto stdio in the CHILD
+    /// (socat / `python: fork; child dup2+exec`). The connect is recorded under
+    /// the parent pid, the fd_redirect arrives under the child pid — the old
+    /// strict per-pid match never fired. With ppid-aware correlation (parent ring
+    /// unioned in) the child's stdio redirect now correctly fires Critical.
+    #[test]
+    fn ebpf_reverse_shell_fires_across_fork_parent_connect_child_redirect() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+
+        // Parent PID 1234 connects to the attacker.
+        assert!(det
+            .process(&connect_event(1234, "10.0.0.1", 4444, now))
+            .is_none());
+
+        // Child PID 9999 (ppid=1234) dup2's the socket onto stdin → reverse shell.
+        let inc = det
+            .process(&fd_redirect_event_ppid(
+                9999,
+                5,
+                0,
+                1234,
+                now + Duration::seconds(1),
+            ))
+            .expect("a fork()'d reverse shell (connect in parent, dup2 in child) MUST fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("ebpf_reverse_shell"));
+    }
+
+    /// Guard the fix's bound: a child fd_redirect whose parent did NOT connect
+    /// must still NOT fire (no false positive from the parent-ring union alone).
+    #[test]
+    fn ebpf_fork_correlation_does_not_false_fire_without_a_parent_connect() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        // Parent 1234 did something unrelated (no connect); child 9999 redirects.
+        let inc = det.process(&fd_redirect_event_ppid(9999, 5, 0, 1234, now));
+        assert!(inc.is_none());
+    }
+
+    /// A pid above the kernel pid_max ceiling → `/proc/<pid>/exe` never exists →
+    /// `is_verified_infra_process` takes its comm-match + process-exited fallback,
+    /// the same Managed semantics as a live verified InnerWarden process. Avoids
+    /// the flaky-small-live-pid /proc read (RECURRING_BUGS.md).
+    const DEAD_PID: u32 = 4_000_000_001;
+
+    /// Regression anchor (self-FP found 2026-06-21): InnerWarden's own agent/ctl
+    /// connect out (Telegram, API, threat feeds) + dup2 fds, and that shape
+    /// self-false-fired `ebpf_reverse_shell` — 126 Critical self-flags / 30 min on
+    /// test001 (`innerwarden-age` → Telegram 149.154.166.x). The agent must not
+    /// accuse itself of a reverse shell.
+    #[test]
+    fn innerwarden_self_egress_is_not_flagged_as_reverse_shell() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        // Agent connects out, then a fd_redirect at the same pid.
+        assert!(det
+            .process(&connect_event_with_comm(
+                DEAD_PID,
+                "149.154.166.110",
+                443,
+                "innerwarden-agent",
+                now
+            ))
+            .is_none());
+        let inc = det.process(&fd_redirect_event(
+            DEAD_PID,
+            5,
+            0,
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_none(),
+            "InnerWarden's own verified egress must NOT fire ebpf_reverse_shell"
+        );
+    }
+
+    /// The cloud guest-agent gate is DOWNGRADE-ONLY: a real reverse shell (any
+    /// non-guest-agent process) still fires. Uses DEAD_PID so `/proc` has no
+    /// lineage and `is_guest_agent` is reliably inert on cloud CI runners
+    /// (GitHub runners are Azure), so this exercises the real-attacker path. The
+    /// guest-agent suppression itself is unit-tested in `crate::cloud_platform`.
+    #[test]
+    fn guest_agent_gate_does_not_suppress_a_real_reverse_shell() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        assert!(det
+            .process(&connect_event(DEAD_PID, "185.220.101.44", 4444, now))
+            .is_none());
+        let inc = det.process(&fd_redirect_event(
+            DEAD_PID,
+            5,
+            0,
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_some(),
+            "a real (non-guest-agent) reverse shell must still fire"
+        );
+    }
+
+    /// No blind spot: a process that merely SETS comm=innerwarden-* but whose
+    /// `/proc/exe` is NOT a system path (here the test binary under target/) is
+    /// still flagged — the exclusion is verified by exe, not the forgeable comm.
+    /// Linux-only: needs a real readable /proc/<pid>/exe (absent on macOS).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forged_innerwarden_comm_from_nonsystem_exe_still_fires() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        let own = std::process::id();
+        assert!(det
+            .process(&connect_event_with_comm(
+                own,
+                "10.0.0.1",
+                4444,
+                "innerwarden-agent",
+                now
+            ))
+            .is_none());
+        let inc = det.process(&fd_redirect_event(own, 5, 0, now + Duration::seconds(1)));
+        assert!(
+            inc.is_some(),
+            "a forged comm=innerwarden-* with a non-system /proc/exe must still fire"
+        );
     }
 
     #[test]

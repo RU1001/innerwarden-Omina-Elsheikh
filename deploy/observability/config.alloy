@@ -1,0 +1,53 @@
+// Grafana Alloy: ship the InnerWarden agent's JSONL to Loki so the fleet
+// dashboard can INVESTIGATE incidents (not just chart metrics). One Alloy per
+// node tails the agent's incident / agent-guard / decision logs and forwards
+// them to Loki with LOW-cardinality labels (host, kind); the high-cardinality
+// fields (tenant, command text, ATR rule ids) stay in the log LINE and are
+// parsed on read by LogQL — the correct Loki pattern.
+//
+// Runs as root (or a user in the `innerwarden` group) so it can read
+// /var/lib/innerwarden (mode 0750 innerwarden:innerwarden).
+
+local.file_match "iw_incidents" {
+  path_targets = [{ __path__ = "/var/lib/innerwarden/incidents-*.jsonl", kind = "incident", host = sys.env("HOSTNAME") }]
+}
+local.file_match "iw_guard" {
+  path_targets = [{ __path__ = "/var/lib/innerwarden/agent-guard-events-*.jsonl", kind = "guard", host = sys.env("HOSTNAME") }]
+}
+local.file_match "iw_decisions" {
+  path_targets = [{ __path__ = "/var/lib/innerwarden/decisions-*.jsonl", kind = "decision", host = sys.env("HOSTNAME") }]
+}
+
+loki.source.file "iw_incidents" {
+  targets    = local.file_match.iw_incidents.targets
+  forward_to = [loki.process.iw.receiver]
+}
+loki.source.file "iw_guard" {
+  targets    = local.file_match.iw_guard.targets
+  forward_to = [loki.process.iw.receiver]
+}
+loki.source.file "iw_decisions" {
+  targets    = local.file_match.iw_decisions.targets
+  forward_to = [loki.process.iw.receiver]
+}
+
+loki.process "iw" {
+  // Redact obvious secrets before they land in Loki (command lines can carry
+  // tokens). The customer controls retention; this bounds the blast radius.
+  stage.replace {
+    expression = "(?i)(AKIA[0-9A-Z]{16}|-----BEGIN[^-]+PRIVATE KEY-----|(?:password|passwd|token|secret|api[_-]?key)\\s*[=:]\\s*)([^\\s\"']+)"
+    replace    = "${1}[REDACTED]"
+  }
+  // `kind` + `host` come from the target labels (set in local.file_match) and
+  // flow through as Loki stream labels; only add the fixed `job` here. The
+  // high-cardinality fields (tenant, command, ATR ids) stay in the line and
+  // are parsed on read by LogQL.
+  stage.static_labels {
+    values = { job = "innerwarden" }
+  }
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint { url = "http://127.0.0.1:3100/loki/api/v1/push" }
+}

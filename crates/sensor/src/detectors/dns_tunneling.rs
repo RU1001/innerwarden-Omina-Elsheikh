@@ -30,6 +30,17 @@ const DNS_ALLOWED_DOMAINS: &[&str] = &[
     "amazonaws.com",
     "azure.com",
     "azurefd.net",
+    // Azure platform service zones. These were the #1 DNS-tunneling false
+    // positive on the Azure prod audit (2026-06-26): 667/667 dns_tunneling
+    // incidents were high-entropy queries to `windows.net` (632) + `azure.net`
+    // (35) - the host resolving Azure Storage / SQL / Service Bus / Key Vault
+    // FQDNs, whose leftmost label is a random-looking resource name. Microsoft
+    // controls these zones and does NOT delegate arbitrary subdomains, so an
+    // attacker cannot create the many-unique-subdomain (or per-query) pattern a
+    // DNS tunnel needs under them - safe to allowlist, matched on a dot boundary
+    // like every entry here (so `evil-windows.net` is NOT trusted).
+    "windows.net",
+    "azure.net",
     "microsoft.com",
     "googleapis.com",
     "gcr.io",
@@ -660,6 +671,44 @@ mod tests {
             now,
         ));
         assert!(inc.is_some(), "look-alike domain must not be trusted");
+    }
+
+    #[test]
+    fn azure_platform_service_dns_is_silent() {
+        // The exact Azure prod FP (2026-06-26): the host resolving Azure
+        // Storage / Key Vault FQDNs whose leftmost label is a random-looking
+        // resource name trips the high-entropy heuristic. windows.net +
+        // azure.net are Microsoft-controlled zones (no attacker subdomain
+        // delegation), so these must be silent despite high entropy.
+        let mut det = DnsTunnelingDetector::new("test", 4.0, 15, 100, 60);
+        let now = Utc::now();
+        for fqdn in [
+            "x7k2p9q4z1.blob.core.windows.net",
+            "a1b2c3d4e5f6.database.windows.net",
+            "k9m2x7-vault.vault.azure.net",
+        ] {
+            assert!(
+                det.process(&dns_event("10.0.0.4", fqdn, now)).is_none(),
+                "{fqdn} (Azure platform service) must be silent"
+            );
+        }
+    }
+
+    #[test]
+    fn lookalike_azure_domain_still_fires() {
+        // SECURITY: a registrable look-alike `evil-windows.net` must NOT be
+        // allowlisted by the new entry - the dot-boundary match rejects it.
+        let mut det = DnsTunnelingDetector::new("test", 4.0, 15, 100, 60);
+        let now = Utc::now();
+        assert!(
+            det.process(&dns_event(
+                "10.0.0.5",
+                "a1b2c3d4e5f6g7h8i9j0k1.evil-windows.net",
+                now
+            ))
+            .is_some(),
+            "look-alike evil-windows.net must not be trusted"
+        );
     }
 
     #[test]

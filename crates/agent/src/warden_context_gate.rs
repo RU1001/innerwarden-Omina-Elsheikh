@@ -47,6 +47,14 @@ use innerwarden_core::event::Severity;
 /// treated as "the classifier was not sure" and surfaced rather than trusted.
 const ESCALATE_FLOOR: f32 = 0.85;
 
+/// AbuseIPDB confidence (0-100) at or above which the community has near-certain
+/// consensus that an IP is a malicious actor. Deliberately high: a cloud-range
+/// safelist (`safelist=Google Cloud`, etc.) must not buy such an IP a free
+/// passive close, but a borderline score should not flood the operator with
+/// surfaces. Escalate-only (surface, never block), so even a noisy shared-cloud
+/// IP at this score only gets Monitored, never auto-blocked.
+const ABUSE_CONFIRMED_FLOOR: u8 = 90;
+
 /// Process names (`comm`) of InnerWarden's own components. Matched by EXACT
 /// base-name equality (never prefix — `comm` is forgeable and a prefix match
 /// let `innerwarden9` / `ccminer` impersonate a component). Linux truncates
@@ -168,6 +176,18 @@ fn is_passive_close(action: &AiAction) -> bool {
     matches!(action, AiAction::Dismiss { .. } | AiAction::Ignore { .. })
 }
 
+/// True when AbuseIPDB reports near-certain malice for this IP. Like the DShield
+/// signal this is an externally-sourced, non-forgeable reputation: it is used
+/// ONLY to refuse a passive close (escalate-only), never to relax an
+/// enforcement verdict. Closes the prod blind spot where a cloud-range safelist
+/// (e.g. `safelist=Google Cloud`) let the classifier `ignore` an
+/// `abuseipdb=100` IP, a free pass an attacker buys by renting cloud.
+fn ip_abuse_confirmed(ctx: &DecisionContext<'_>) -> bool {
+    ctx.ip_reputation
+        .as_ref()
+        .is_some_and(|r| r.confidence_score >= ABUSE_CONFIRMED_FLOOR)
+}
+
 fn is_high_severity(sev: &Severity) -> bool {
     matches!(sev, Severity::High | Severity::Critical)
 }
@@ -238,6 +258,53 @@ pub(crate) fn apply(ctx: &DecisionContext<'_>, decision: AiDecision) -> AiDecisi
         );
     }
 
+    // DShield (ISC) signal: the community has confirmed this IP attacking the
+    // internet (reports > 0 or active threat-feed membership). A passive close
+    // (dismiss/monitor) on a confirmed global attacker is never allowed to
+    // stand — surface it, regardless of severity or the classifier's
+    // confidence. Escalate-only by construction: a block/contain verdict is not
+    // a passive close, so this can only raise a weak dismiss/monitor, never
+    // relax an enforcement verdict. This is how the DShield enrichment becomes a
+    // real decision signal on the classifier path (the gate wraps the
+    // classifier) without touching the trained model's text input.
+    if ctx.ip_dshield_attacker && is_passive_close(&decision.action) {
+        return surface(
+            ctx,
+            format!(
+                "context gate: refusing a {} ({:.2}) on a DShield-confirmed global attacker \
+                 (ISC reports this IP attacking the internet); surfaced, not closed.",
+                decision.action.name(),
+                decision.confidence
+            ),
+            "high".to_string(),
+        );
+    }
+
+    // AbuseIPDB signal: same escalate-only shape as DShield. A near-certain
+    // malicious IP (score >= ABUSE_CONFIRMED_FLOOR) must not be passively closed
+    // even when a cloud-range safelist nudged the classifier toward ignore. This
+    // closes the prod blind spot (`safelist=Google Cloud, abuseipdb=100` -> the
+    // classifier ignored it): the cloud safelist can no longer bury a
+    // community-confirmed attacker. Surfaces (Monitor / RequestConfirmation),
+    // never blocks, so a shared-cloud IP at this score is at worst watched.
+    if ip_abuse_confirmed(ctx) && is_passive_close(&decision.action) {
+        return surface(
+            ctx,
+            format!(
+                "context gate: refusing a {} ({:.2}) on an AbuseIPDB-confirmed attacker \
+                 (score {}/100); a cloud-range safelist must not free-pass a confirmed \
+                 attacker. Surfaced, not closed.",
+                decision.action.name(),
+                decision.confidence,
+                ctx.ip_reputation
+                    .as_ref()
+                    .map(|r| r.confidence_score)
+                    .unwrap_or(0),
+            ),
+            "high".to_string(),
+        );
+    }
+
     let provenance_benign = match provenance {
         ActorProvenance::SelfComponent => SELF_NOISY_DETECTORS.contains(&detector),
         ActorProvenance::BuildToolchain => BUILD_NOISY_DETECTORS.contains(&detector),
@@ -245,8 +312,11 @@ pub(crate) fn apply(ctx: &DecisionContext<'_>, decision: AiDecision) -> AiDecisi
     };
 
     // 1. Provenance dismiss — Medium/Low ONLY. A forgeable `comm` must never
-    //    auto-dismiss a High/Critical incident (red-team must-fix #1).
-    if provenance_benign && !high_sev {
+    //    auto-dismiss a High/Critical incident (red-team must-fix #1). Also never
+    //    provenance-dismiss a DShield- or AbuseIPDB-confirmed attacker, even at
+    //    low severity with benign-looking lineage (the overrides above only catch
+    //    an incoming passive close; this guards the provenance-driven dismiss too).
+    if provenance_benign && !high_sev && !ctx.ip_dshield_attacker && !ip_abuse_confirmed(ctx) {
         let label = match provenance {
             ActorProvenance::SelfComponent => "an InnerWarden component",
             _ => "the local build toolchain",
@@ -339,6 +409,7 @@ mod tests {
             ip_reputation: None,
             ip_geo: None,
             ip_dshield: None,
+            ip_dshield_attacker: false,
             host_posture: None,
             prior_decisions: None,
             graph_context: None,
@@ -390,6 +461,142 @@ mod tests {
 
     fn is_dismiss(d: &AiDecision) -> bool {
         matches!(d.action, AiAction::Dismiss { .. })
+    }
+
+    #[test]
+    fn dshield_attacker_passive_close_is_surfaced() {
+        // A DShield-confirmed global attacker must never be passively closed,
+        // even at low severity with a confident classifier dismiss.
+        let i = inc("d1", Severity::Low, "ssh probe", &["9.9.9.9"]);
+        let mut c = ctx(&i, vec![]);
+        c.ip_dshield_attacker = true;
+        let out = apply(&c, dismiss(0.97));
+        assert!(
+            !is_dismiss(&out),
+            "DShield-confirmed attacker must not be dismissed"
+        );
+        assert_eq!(out.confidence, ESCALATE_FLOOR);
+        assert!(out.reason.contains("DShield-confirmed"));
+    }
+
+    #[test]
+    fn dshield_attacker_block_left_intact() {
+        // Escalate-only: DShield raises a passive close but never touches an
+        // enforcement verdict.
+        let i = inc("d2", Severity::High, "c2 beacon", &["9.9.9.9"]);
+        let mut c = ctx(&i, vec![]);
+        c.ip_dshield_attacker = true;
+        let out = apply(&c, block(0.6));
+        assert!(
+            matches!(out.action, AiAction::BlockIp { .. }),
+            "block must survive"
+        );
+        assert_eq!(out.confidence, 0.6);
+    }
+
+    #[test]
+    fn no_dshield_low_sev_dismiss_unchanged() {
+        // DShield off (default) must not change prior behavior: a low-sev,
+        // non-attacker, confident dismiss stays a dismiss.
+        let i = inc("d3", Severity::Low, "noise", &["9.9.9.9"]);
+        let c = ctx(&i, vec![]); // ip_dshield_attacker = false
+        let out = apply(&c, dismiss(0.95));
+        assert!(
+            is_dismiss(&out),
+            "non-DShield low-sev dismiss must be unchanged"
+        );
+    }
+
+    fn rep(score: u8) -> crate::abuseipdb::IpReputation {
+        crate::abuseipdb::IpReputation {
+            confidence_score: score,
+            total_reports: 10,
+            distinct_users: 5,
+            country_code: Some("BE".into()),
+            isp: Some("Google Cloud".into()),
+            is_tor: false,
+        }
+    }
+
+    #[test]
+    fn abuseipdb_confirmed_passive_close_is_surfaced() {
+        // The prod blind spot: a cloud-safelisted IP with abuseipdb=100 was
+        // ignored. The veto must surface it instead of closing it.
+        let i = inc("a1", Severity::Low, "proto anomaly", &["9.9.9.9"]);
+        let mut c = ctx(&i, vec![]);
+        c.ip_reputation = Some(rep(100));
+        let out = apply(&c, dismiss(0.97));
+        assert!(
+            !is_dismiss(&out),
+            "AbuseIPDB-confirmed attacker must not be passively closed"
+        );
+        assert_eq!(out.confidence, ESCALATE_FLOOR);
+        assert!(out.reason.contains("AbuseIPDB-confirmed"), "{}", out.reason);
+    }
+
+    #[test]
+    fn abuseipdb_confirmed_block_left_intact() {
+        // Escalate-only: a high-abuse IP with a block verdict is untouched.
+        let i = inc("a2", Severity::High, "c2", &["9.9.9.9"]);
+        let mut c = ctx(&i, vec![]);
+        c.ip_reputation = Some(rep(100));
+        let out = apply(&c, block(0.6));
+        assert!(
+            matches!(out.action, AiAction::BlockIp { .. }),
+            "block must survive"
+        );
+        assert_eq!(out.confidence, 0.6);
+    }
+
+    #[test]
+    fn abuseipdb_below_floor_dismiss_unchanged() {
+        // A borderline score (< floor) must NOT trigger the veto: avoids
+        // flooding the operator with surfaces on noisy-but-not-confirmed IPs.
+        let i = inc("a3", Severity::Low, "noise", &["9.9.9.9"]);
+        let mut c = ctx(&i, vec![]);
+        c.ip_reputation = Some(rep(ABUSE_CONFIRMED_FLOOR - 1));
+        let out = apply(&c, dismiss(0.95));
+        assert!(is_dismiss(&out), "below-floor abuse score must not veto");
+        assert_eq!(out.reason, "orig");
+    }
+
+    #[test]
+    fn abuseipdb_confirmed_blocks_provenance_self_dismiss() {
+        // Symmetric to the DShield guard: the gate's own provenance-dismiss path
+        // (Medium self/build allowlisted detector) must NOT fire when the IP is
+        // an AbuseIPDB-confirmed attacker. Drive it with a non-passive-close
+        // incoming so the escalate-only branch above does not short-circuit, and
+        // assert the gate did not synthesise a dismiss. Without the guard, branch
+        // 1 would turn this into a Dismiss regardless of the incoming verdict.
+        let i = inc(
+            "suspicious_archive:innerwarden-agent:x",
+            Severity::Medium,
+            "comm=innerwarden-agent",
+            &["9.9.9.9"],
+        );
+        let mut c = ctx(&i, vec![]);
+        c.ip_reputation = Some(rep(100));
+        let out = apply(&c, block(0.4));
+        assert!(
+            !is_dismiss(&out),
+            "confirmed-attacker provenance self-dismiss must be refused: {:?}",
+            out.action
+        );
+    }
+
+    #[test]
+    fn benign_self_provenance_dismiss_still_works_without_abuse() {
+        // Regression: with NO abuse reputation the Medium self-noise dismiss path
+        // is unchanged (the guard only bites on a confirmed attacker).
+        let i = inc(
+            "suspicious_archive:innerwarden-agent:x",
+            Severity::Medium,
+            "comm=innerwarden-agent",
+            &[],
+        );
+        let out = apply(&ctx(&i, vec![]), dismiss(0.4));
+        assert!(is_dismiss(&out));
+        assert!(out.reason.contains("context gate"), "{}", out.reason);
     }
 
     // ============================================================

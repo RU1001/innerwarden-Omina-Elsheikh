@@ -19,9 +19,13 @@
 //! Recognized agents/tools/runtimes (see [`signatures`]): Claude Code, Cursor,
 //! Aider, Goose, OpenClaw, Codex CLI, Gemini CLI, Cline, Ollama, and more.
 
+pub mod asi;
+pub mod benchmark;
+pub mod breaker;
 pub mod detect;
 pub mod mcp;
 pub mod mcp_proxy;
+pub mod redact;
 pub mod registry;
 pub mod rules;
 pub mod session;

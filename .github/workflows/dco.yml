@@ -1,0 +1,54 @@
+name: DCO
+
+# Enforces the Developer Certificate of Origin (see the DCO file at the
+# repo root): every human-authored commit in a PR must carry a
+# `Signed-off-by:` trailer (`git commit -s`). Merge commits and bot
+# commits (dependabot etc.) are exempt — there is no human authorship
+# to certify. Implemented as a plain git script instead of a
+# third-party action to keep the supply-chain surface at zero.
+
+on:
+  pull_request:
+
+# Read-only token per Scorecard Token-Permissions: the job only reads
+# the git history and prints annotations.
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: Verify Signed-off-by
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned by SHA per Scorecard Pinned-Dependencies; resolves to
+      # actions/checkout v4. fetch-depth 0 so the PR base..head range
+      # is walkable.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Check every commit for a DCO sign-off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r sha; do
+            author=$(git show -s --format='%an <%ae>' "$sha")
+            case "$author" in
+              *"[bot]"*) continue ;;
+            esac
+            if ! git show -s --format='%B' "$sha" | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::Commit $sha by $author is missing a Signed-off-by line."
+              missing=1
+            fi
+          done < <(git rev-list --no-merges "$BASE_SHA".."$HEAD_SHA")
+          if [ "$missing" -ne 0 ]; then
+            echo ""
+            echo "Every commit must carry a Developer Certificate of Origin sign-off."
+            echo "Fix the last commit with:   git commit --amend -s"
+            echo "Fix a whole branch with:    git rebase --signoff origin/main"
+            echo "What you are certifying:    the DCO file at the repo root."
+            exit 1
+          fi
+          echo "All commits carry a Signed-off-by line."

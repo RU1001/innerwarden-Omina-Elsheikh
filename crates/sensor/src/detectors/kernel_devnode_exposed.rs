@@ -46,7 +46,6 @@
 //!   permission flips.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,8 +149,19 @@ impl DevnodeMetadataReader for RealDevnodeReader {
     fn mode_of(&self, path: &Path) -> io::Result<u32> {
         let meta = std::fs::symlink_metadata(path)?;
         // Mask to the permission bits (suid/sgid/sticky are not part of
-        // the "world-accessible" decision).
-        Ok(meta.permissions().mode() & 0o777)
+        // the "world-accessible" decision). On Windows (spec 085 Phase 0)
+        // there is no unix mode and /dev nodes do not exist, so return 0 ->
+        // never world-accessible -> the detector no-ops.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            Ok(meta.permissions().mode() & 0o777)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            Ok(0)
+        }
     }
 }
 

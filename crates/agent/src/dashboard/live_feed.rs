@@ -748,6 +748,23 @@ pub(super) fn live_feed_title(detector: &str, severity: &Severity) -> String {
         "masquerading" => "Binary masquerading detected. Fake identity exposed.".into(),
         "suspicious_execution" => "Suspicious process execution flagged for review.".into(),
         "io_uring_create" => "io_uring syscall bypass attempt detected.".into(),
+        // Previously these fell through to the generic severity line, which made
+        // the public feed read "High severity threat detected." on a large share
+        // of real catches. Each gets a specific, sanitized headline (no paths,
+        // rules, or thresholds) so a visitor sees what actually happened.
+        "proto_anomaly" => {
+            "Protocol anomaly. Something on this port is lying about what it is.".into()
+        }
+        "threat_intel" => "Known-bad address recognized on sight. Reputation said no.".into(),
+        "honeypot" => "Took the honeypot bait. Every keystroke recorded.".into(),
+        "suspicious_login" => "A login that does not add up. Flagged and watched.".into(),
+        "data_exfiltration" => "Data exfiltration attempt caught. Nice try.".into(),
+        "credential_harvest" => "Someone reached for the credentials. Caught in the act.".into(),
+        "sudo_abuse" => "Sudo aimed at the locks, not the work. Flagged.".into(),
+        "setns_owner" => "Root walked into a namespace it never created.".into(),
+        "untrusted_root_exec" => "Root ran code from a place attackers can write.".into(),
+        "provenance" => "Root power, used down a path that cannot justify it.".into(),
+        "nmap_scan" => "Port scan detected. Someone is knocking on every door.".into(),
         _ => match severity {
             Severity::Critical => "Critical threat detected and handled.".into(),
             Severity::High => "High severity threat detected.".into(),
@@ -778,6 +795,9 @@ pub(super) fn live_feed_reason(detector: &str, action: &str) -> String {
         "ransomware" => format!("Ransomware killed before encryption. {action_verb}."),
         "c2_callback" => format!("C2 communication severed. {action_verb}."),
         "web_shell" => format!("Backdoor removed. {action_verb}."),
+        "threat_intel" => format!("Known-bad IP shut out on reputation. {action_verb}."),
+        "proto_anomaly" => format!("Disguised traffic exposed. {action_verb}."),
+        "data_exfiltration" => format!("Data theft attempt stopped cold. {action_verb}."),
         _ => format!("{action_verb}."),
     }
 }
@@ -1327,6 +1347,45 @@ mod tests {
             live_feed_title("unknown_detector", &Severity::Low),
             "Suspicious activity detected and logged."
         );
+        // Detectors that previously fell through to the generic line now get a
+        // specific, sanitized headline (no paths/rules/thresholds leaked).
+        for (det, expected) in [
+            (
+                "proto_anomaly",
+                "Protocol anomaly. Something on this port is lying about what it is.",
+            ),
+            (
+                "threat_intel",
+                "Known-bad address recognized on sight. Reputation said no.",
+            ),
+            (
+                "honeypot",
+                "Took the honeypot bait. Every keystroke recorded.",
+            ),
+            (
+                "suspicious_login",
+                "A login that does not add up. Flagged and watched.",
+            ),
+            (
+                "setns_owner",
+                "Root walked into a namespace it never created.",
+            ),
+        ] {
+            assert_eq!(
+                live_feed_title(det, &Severity::High),
+                expected,
+                "detector {det}"
+            );
+            // None of these leak an internal token a probing visitor could use.
+            for banned in ["/etc", "threshold", "rule ", "spec "] {
+                assert!(
+                    !live_feed_title(det, &Severity::High)
+                        .to_lowercase()
+                        .contains(banned),
+                    "{det} headline leaked {banned}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1342,6 +1401,14 @@ mod tests {
         assert_eq!(
             live_feed_reason("unknown_detector", "monitor"),
             "Monitoring."
+        );
+        assert_eq!(
+            live_feed_reason("threat_intel", "block_ip"),
+            "Known-bad IP shut out on reputation. IP blocked."
+        );
+        assert_eq!(
+            live_feed_reason("proto_anomaly", "monitor"),
+            "Disguised traffic exposed. Monitoring."
         );
     }
 

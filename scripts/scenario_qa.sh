@@ -352,6 +352,51 @@ run_scenario() {
   "$SENSOR_BIN" --config "$sensor_cfg" > "$sensor_log" 2>&1 &
   local sensor_pid=$!
   sleep 3
+  # Flake guard: on a loaded CI runner the sensor may not finish reading
+  # auth.log + running the detectors within the 3s base window, so SIGINT lands
+  # mid-detection and the scenario sees too few (or zero) incidents.
+  #
+  # Two failure shapes this guards against:
+  #   1. 01-ssh-brute-single: the single incident fires late -> SIGINT before
+  #      it lands -> 0 incidents.
+  #   2. 02-ssh-brute-coordinated: the auth.log is round-robin across 10 IPs, so
+  #      the FIRST incident only fires near the end of the file and the other 9
+  #      land on the last handful of lines. Breaking on the FIRST incident (the
+  #      old `COUNT>0 && break`) SIGINT'd the sensor before IPs 2-10 crossed
+  #      threshold -> partial counts; a slow runner could even SIGINT before any
+  #      incident -> 0.
+  #
+  # So instead of bailing on the first incident, wait until the incident count
+  # has APPEARED and then QUIESCED (held steady across several polls = the
+  # sensor has drained auth.log and all detectors have fired), capped well above
+  # the worst-case debug-build read time. Seeded scenarios (empty auth.log) just
+  # consume the base window and are unaffected.
+  if [[ -s "$auth_log" ]]; then
+    local _sqa_db="$data_dir/innerwarden.db"
+    local _w _n _prev=-1 _stable=0
+    for ((_w = 0; _w < 80; _w++)); do
+      _n=$("$PYTHON_BIN" - "$_sqa_db" <<'PY' 2>/dev/null || echo 0
+import sqlite3, sys
+try:
+    print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM incidents").fetchone()[0])
+except Exception:
+    print(0)
+PY
+)
+      if [[ "${_n:-0}" -gt 0 ]]; then
+        if [[ "${_n}" -eq "${_prev}" ]]; then
+          _stable=$((_stable + 1))
+          # Count non-zero and unchanged for 3 consecutive polls (~0.9s) =>
+          # the sensor has quiesced; safe to SIGINT without truncating.
+          [[ "$_stable" -ge 3 ]] && break
+        else
+          _stable=0
+        fi
+        _prev="$_n"
+      fi
+      sleep 0.3
+    done
+  fi
   kill -INT "$sensor_pid" 2>/dev/null || true
   if ! wait_for_pid_exit "$sensor_pid" 3; then
     kill -TERM "$sensor_pid" 2>/dev/null || true

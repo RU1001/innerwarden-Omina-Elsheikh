@@ -464,6 +464,151 @@ fn send_slack_test(webhook_url: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_valid_discord_webhook_url(url: &str) -> bool {
+    (url.starts_with("https://discord.com/api/webhooks/")
+        || url.starts_with("https://discordapp.com/api/webhooks/")
+        || url.starts_with("https://canary.discord.com/api/webhooks/")
+        || url.starts_with("https://ptb.discord.com/api/webhooks/"))
+        && url.matches('/').count() >= 6
+}
+
+fn send_discord_test(webhook_url: &str) -> Result<()> {
+    let body = serde_json::json!({
+        "content": "✅ **InnerWarden** is connected. You'll receive security alerts here."
+    });
+    ureq::post(webhook_url)
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Configure Discord Incoming Webhook notifications (spec 078 P3b).
+///
+/// Mirrors [`cmd_configure_slack`]: prompts for / accepts a webhook URL, saves
+/// it to `agent.env` (`DISCORD_WEBHOOK_URL`), flips `[discord] enabled = true`
+/// + `min_severity` in agent.toml, sends a test message, and restarts the agent.
+pub(crate) fn cmd_configure_discord(
+    cli: &Cli,
+    webhook_url_arg: Option<&str>,
+    min_severity: &str,
+    no_test: bool,
+) -> Result<()> {
+    if !cli.dry_run {
+        require_sudo(cli);
+    }
+    let env_file = cli
+        .agent_config
+        .parent()
+        .map(|p| p.join("agent.env"))
+        .unwrap_or_else(|| PathBuf::from("/etc/innerwarden/agent.env"));
+
+    // ── Webhook URL ────────────────────────────────────────────────────────
+    let webhook_url = if let Some(u) = webhook_url_arg {
+        u.to_string()
+    } else {
+        println!("InnerWarden - Discord setup\n");
+        println!("Step 1 - Create an Incoming Webhook");
+        println!("  1. In your Discord server: Server Settings → Integrations → Webhooks");
+        println!("  2. Click 'New Webhook', name it 'InnerWarden', pick a channel");
+        println!("  3. Click 'Copy Webhook URL'");
+        println!("     (starts with https://discord.com/api/webhooks/...)\n");
+        let u = prompt("Webhook URL")?;
+        if u.is_empty() {
+            anyhow::bail!("webhook URL cannot be empty");
+        }
+        u
+    };
+
+    if !is_valid_discord_webhook_url(&webhook_url) {
+        anyhow::bail!(
+            "webhook URL should start with https://discord.com/api/webhooks/\nCreate one in Server Settings → Integrations → Webhooks"
+        );
+    }
+
+    // Validate severity
+    if !is_valid_alert_severity(min_severity) {
+        anyhow::bail!("min-severity must be one of: low, medium, high, critical");
+    }
+
+    // ── Save credentials ───────────────────────────────────────────────────
+    if cli.dry_run {
+        println!(
+            "\n  [dry-run] would write DISCORD_WEBHOOK_URL=... to {}",
+            env_file.display()
+        );
+        println!(
+            "  [dry-run] would set [discord] enabled=true min_severity={min_severity} in {}",
+            cli.agent_config.display()
+        );
+    } else {
+        write_env_key(&env_file, "DISCORD_WEBHOOK_URL", &webhook_url)?;
+        println!("\n  [ok] Webhook URL saved to {}", env_file.display());
+
+        config_editor::write_bool(&cli.agent_config, "discord", "enabled", true)?;
+        config_editor::write_str(&cli.agent_config, "discord", "min_severity", min_severity)?;
+        println!("  [ok] agent.toml: discord.enabled = true, min_severity = {min_severity}");
+    }
+
+    // ── Test notification ──────────────────────────────────────────────────
+    if !no_test && !cli.dry_run {
+        print!("  Sending test notification... ");
+        std::io::stdout().flush()?;
+        match send_discord_test(&webhook_url) {
+            Ok(()) => println!("sent!"),
+            Err(e) => {
+                println!("failed");
+                println!();
+                println!("  Warning: could not send test message: {e:#}");
+                println!(
+                    "  Your URL has been saved. Verify the webhook in Discord server settings."
+                );
+            }
+        }
+    }
+
+    // ── Restart agent ──────────────────────────────────────────────────────
+    let is_macos = std::env::consts::OS == "macos";
+    if cli.dry_run {
+        let cmd = if is_macos {
+            "sudo launchctl kickstart -k system/com.innerwarden.agent"
+        } else {
+            "sudo systemctl restart innerwarden-agent"
+        };
+        println!("  [dry-run] would restart: {cmd}");
+    } else if is_macos {
+        let _ = systemd::restart_launchd("com.innerwarden.agent", false);
+        println!("  [ok] innerwarden-agent restarted");
+    } else {
+        let _ = systemd::restart_service("innerwarden-agent", false);
+        println!("  [ok] innerwarden-agent restarted");
+    }
+
+    // Audit log
+    let mut audit = AdminActionEntry {
+        ts: chrono::Utc::now(),
+        operator: current_operator(),
+        source: "cli".to_string(),
+        action: "configure".to_string(),
+        target: "discord".to_string(),
+        parameters: serde_json::json!({ "min_severity": min_severity }),
+        result: if cli.dry_run {
+            "dry_run".to_string()
+        } else {
+            "success".to_string()
+        },
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(&cli.data_dir, &mut audit) {
+        eprintln!("  [warn] failed to write admin audit: {e:#}");
+    }
+
+    println!();
+    println!("Discord configured. You'll receive alerts for {min_severity}+ incidents.");
+    println!("Run 'innerwarden doctor' to validate the full setup.");
+    Ok(())
+}
+
 pub(crate) fn cmd_configure_webhook(
     cli: &Cli,
     url_arg: Option<&str>,
@@ -688,16 +833,52 @@ pub(crate) fn cmd_configure_dashboard(
     // Ensure --dashboard is in the service ExecStart
     ensure_dashboard_flag_in_service(cli);
 
+    // Offer to expose the dashboard on the network. The login above is now set,
+    // so the agent will accept a non-loopback bind (SEC-005). Default NO — an
+    // open admin panel is NEVER the silent default; we ASK (issue #1046). The
+    // bind is stored config-driven in `[dashboard] bind`, managed afterwards by
+    // `innerwarden dashboard {open,close,status}`.
+    let mut exposed = false;
+    if password_arg.is_none() && !cli.dry_run {
+        exposed = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(
+                "Make the dashboard reachable from other machines (network), not just localhost? \
+                 It requires the login you just set.",
+            )
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        let bind = if exposed {
+            "0.0.0.0:8787"
+        } else {
+            "127.0.0.1:8787"
+        };
+        let _ = crate::config_editor::write_str(&cli.agent_config, "dashboard", "bind", bind);
+        if exposed {
+            println!(
+                "  [ok] Dashboard set to listen on the network (0.0.0.0:8787). Login required."
+            );
+            println!(
+                "  ⚠ Lock the firewall to trusted IPs: `innerwarden dashboard open` (auto-locks to your IP), \
+                 or `sudo ufw allow from <your-ip> to any port 8787`."
+            );
+        }
+    }
+
     restart_agent(cli);
     println!();
     println!("Dashboard configured.");
-    println!("  URL:      http://localhost:8787");
+    if exposed {
+        println!("  URL:      https://YOUR_SERVER_IP:8787  (network — login required)");
+    } else {
+        println!("  URL:      https://localhost:8787  (localhost only — use the SSH tunnel below)");
+    }
     println!("  Username: {user}");
     println!("  Password: (the one you entered)");
     println!();
     println!("To access from your browser via SSH tunnel:");
     println!("  ssh -L 8787:127.0.0.1:8787 user@YOUR_SERVER");
-    println!("  Then open: http://localhost:8787");
+    println!("  Then open: https://localhost:8787");
     println!();
     println!("If you use nginx, add this to your server block:");
     println!("  location / {{");
@@ -831,7 +1012,12 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
     let mut any_tested = false;
     let mut any_failed = false;
 
-    println!("InnerWarden - test alert\n");
+    // Same label real incidents are stamped with (sensor `[agent] host_id`),
+    // so the operator can tell which box a test alert came from when several
+    // hosts share one Telegram chat / Slack channel.
+    let host = crate::helpers::host_label(&cli.sensor_config);
+
+    println!("InnerWarden - test alert ({host})\n");
 
     // ── Telegram ─────────────────────────────────────────────────────────
     let try_telegram = channel_selected(test_only, "telegram");
@@ -849,8 +1035,10 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
                 any_tested = true;
                 print!("  Telegram ... ");
                 std::io::stdout().flush().ok();
-                let msg = "🔔 *Test alert from InnerWarden*\n\nYour Telegram notifications are working correctly\\.";
-                match send_telegram_message_md(&tok, &cid, msg) {
+                let msg = format!(
+                    "🔔 *Test alert from InnerWarden*\nFrom host: `{host}`\n\nYour Telegram notifications are working correctly\\."
+                );
+                match send_telegram_message_md(&tok, &cid, &msg) {
                     Ok(()) => println!("ok"),
                     Err(e) => {
                         println!("FAILED: {e:#}");
@@ -882,7 +1070,7 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
                 print!("  Slack ...... ");
                 std::io::stdout().flush().ok();
                 let payload = serde_json::json!({
-                    "text": "🔔 *Test alert from InnerWarden* - Slack notifications are working correctly."
+                    "text": format!("🔔 *Test alert from InnerWarden* — host `{host}` — Slack notifications are working correctly.")
                 });
                 match ureq::post(&url)
                     .header("Content-Type", "application/json")
@@ -1547,6 +1735,79 @@ mod tests {
         )
         .expect_err("bad severity should fail");
         assert!(err.to_string().contains("min-severity"));
+    }
+
+    #[test]
+    fn cmd_configure_discord_dry_run_validates_url_and_severity() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_configure_discord(
+            &cli,
+            Some("https://discord.com/api/webhooks/123456789/AbCdEf-token"),
+            "critical",
+            true,
+        )
+        .expect("dry-run discord config should succeed");
+
+        let err = cmd_configure_discord(&cli, Some("https://example.com/hook"), "high", true)
+            .expect_err("non-discord URL should fail");
+        assert!(err.to_string().contains("discord.com/api/webhooks"));
+
+        let err = cmd_configure_discord(
+            &cli,
+            Some("https://discord.com/api/webhooks/123456789/AbCdEf-token"),
+            "urgent",
+            true,
+        )
+        .expect_err("bad severity should fail");
+        assert!(err.to_string().contains("min-severity"));
+    }
+
+    #[test]
+    fn discord_webhook_url_validation() {
+        assert!(is_valid_discord_webhook_url(
+            "https://discord.com/api/webhooks/123/abc"
+        ));
+        assert!(is_valid_discord_webhook_url(
+            "https://ptb.discord.com/api/webhooks/123/abc"
+        ));
+        assert!(!is_valid_discord_webhook_url("https://hooks.slack.com/x"));
+        assert!(!is_valid_discord_webhook_url(
+            "https://discord.com/api/webhooks/"
+        ));
+    }
+
+    #[test]
+    fn cmd_configure_discord_non_dry_run_persists_env_and_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut cli = test_cli(&temp);
+        cli.dry_run = false; // exercise the real persist + restart path
+        std::fs::write(&cli.agent_config, "").expect("seed agent.toml");
+
+        // require_sudo passes because the temp config dir is writable; no_test
+        // skips the network call; the agent restart is best-effort (`let _ =`)
+        // and fails harmlessly with no systemd unit present.
+        cmd_configure_discord(
+            &cli,
+            Some("https://discord.com/api/webhooks/123456789/AbCdEf-token"),
+            "high",
+            true,
+        )
+        .expect("non-dry-run discord config should persist");
+
+        let env = std::fs::read_to_string(temp.path().join("agent.env")).expect("agent.env");
+        assert!(env.contains("DISCORD_WEBHOOK_URL="));
+        let toml = std::fs::read_to_string(&cli.agent_config).expect("agent.toml");
+        assert!(toml.contains("[discord]"));
+        assert!(toml.contains("enabled = true"));
+        assert!(toml.contains("high"));
+    }
+
+    #[test]
+    fn send_discord_test_posts_to_webhook() {
+        let url = serve_status(204, 1);
+        send_discord_test(&url).expect("discord test post should succeed against mock");
     }
 
     #[test]

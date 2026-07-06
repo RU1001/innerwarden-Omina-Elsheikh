@@ -2,49 +2,33 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
-use crate::agent_context::guardian_mode;
 use crate::config::ChannelFilterLevel;
 use crate::notification_pipeline::{self, FeedbackEvent, GroupAction, SuppressReason};
 use crate::{config, state_store, web_push, webhook, AgentState};
 
 pub(crate) struct NotificationThresholds {
     pub(crate) webhook_min_rank: Option<u8>,
-    pub(crate) telegram_min_rank: Option<u8>,
-    pub(crate) slack_min_rank: Option<u8>,
 }
 
 pub(crate) fn compute_notification_thresholds(
     cfg: &config::AgentConfig,
-    state: &AgentState,
+    _state: &AgentState,
 ) -> NotificationThresholds {
+    // Telegram + Slack thresholds now live in the chat-channel registry
+    // (spec 078, `notification_channels`); only the non-chat webhook sink
+    // keeps its threshold here.
     let webhook_min_rank = if cfg.webhook.enabled && !cfg.webhook.url.is_empty() {
         Some(webhook::severity_rank(&cfg.webhook.parsed_min_severity()))
     } else {
         None
     };
 
-    let telegram_min_rank = if cfg.telegram.enabled && state.telegram_client.is_some() {
-        Some(webhook::severity_rank(&cfg.telegram.parsed_min_severity()))
-    } else {
-        None
-    };
-
-    let slack_min_rank = if cfg.slack.enabled && state.slack_client.is_some() {
-        Some(webhook::severity_rank(&cfg.slack.parsed_min_severity()))
-    } else {
-        None
-    };
-
-    NotificationThresholds {
-        webhook_min_rank,
-        telegram_min_rank,
-        slack_min_rank,
-    }
+    NotificationThresholds { webhook_min_rank }
 }
 
 /// Check if a first-alert should pass the channel filter.
 /// For the first alert, auto_resolved is always false (obvious gate runs after dispatch).
-fn passes_channel_filter(
+pub(crate) fn passes_channel_filter(
     level: ChannelFilterLevel,
     severity: &innerwarden_core::event::Severity,
 ) -> bool {
@@ -167,13 +151,29 @@ pub(crate) async fn dispatch_incident_notifications(
                     .entry(detector.to_string())
                     .or_insert(0) += 1;
 
-                // Record contained + check if burst threshold hit
-                if let Some(count) = state.notification_burst_tracker.record_contained() {
-                    if let Some(ref tg) = state.telegram_client {
-                        let msg = crate::notification_gate::format_burst_summary(count);
-                        let tg = tg.clone();
+                // Record contained + check if burst threshold hit. The burst
+                // summary fans out through the chat-channel registry (spec 078
+                // P2) so Slack/Discord get it too, not just Telegram.
+                let category = crate::notification_gate::burst_category(detector);
+                let source_ip = incident
+                    .entities
+                    .iter()
+                    .find(|e| matches!(e.r#type, innerwarden_core::entities::EntityType::Ip))
+                    .map(|e| e.value.clone());
+                if let Some(mut summary) = state
+                    .notification_burst_tracker
+                    .record_contained(category, source_ip.as_deref())
+                {
+                    let host = crate::notification_gate::resolve_host_id(
+                        &cfg.agent.tags,
+                        &state.knowledge_graph,
+                    );
+                    summary.host = host.clone();
+                    let channels = crate::notification_channels::collect_chat_channels(cfg, state);
+                    if !channels.is_empty() {
+                        let msg = crate::notification_gate::format_burst_summary(&host, &summary);
                         tokio::spawn(async move {
-                            let _ = tg.send_alert_html(&msg).await;
+                            crate::notification_channels::fan_out_summary(&channels, &msg).await;
                         });
                     }
                 }
@@ -200,35 +200,15 @@ pub(crate) async fn dispatch_incident_notifications(
                 }
             }
 
-            // Telegram T.1 — gate already passed above.
-            if let Some(min_rank) = thresholds.telegram_min_rank {
-                let level = cfg.telegram.channel_notifications.notification_level;
-                if incident_rank >= min_rank && passes_channel_filter(level, &incident.severity) {
-                    if let Some(ref tg) = state.telegram_client {
-                        let mode = guardian_mode(cfg);
-                        let is_simple = cfg.telegram.is_simple_profile();
-                        if let Err(e) = tg.send_incident_alert(incident, mode, is_simple).await {
-                            warn!(incident_id = %incident.incident_id, "Telegram alert failed: {e:#}");
-                        }
-                    }
-                }
-            }
-
-            // Slack
-            if let Some(min_rank) = thresholds.slack_min_rank {
-                let level = cfg.slack.channel_notifications.notification_level;
-                if incident_rank >= min_rank && passes_channel_filter(level, &incident.severity) {
-                    if let Some(ref sc) = state.slack_client {
-                        let dashboard_url = if cfg.slack.dashboard_url.is_empty() {
-                            None
-                        } else {
-                            Some(cfg.slack.dashboard_url.as_str())
-                        };
-                        if let Err(e) = sc.send_incident_alert(incident, dashboard_url).await {
-                            warn!(incident_id = %incident.incident_id, "Slack alert failed: {e:#}");
-                        }
-                    }
-                }
+            // Telegram + Slack via the unified chat-channel registry (spec 078
+            // P1). Each channel applies its own severity-rank + filter-level
+            // gate inside `fan_out_alert`; one channel failing never blocks the
+            // others. Webhook (machine JSON) and Web Push (browser) are non-chat
+            // sinks and keep their own dispatch above/below.
+            let chat_channels = crate::notification_channels::collect_chat_channels(cfg, state);
+            if !chat_channels.is_empty() {
+                let ctx = crate::notification_channels::ChatContext::from_config(cfg);
+                crate::notification_channels::fan_out_alert(&chat_channels, incident, &ctx).await;
             }
 
             // Web Push — respects its own channel filter.

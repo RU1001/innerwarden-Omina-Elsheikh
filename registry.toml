@@ -156,6 +156,16 @@ builtin     = true
 enables     = []   # observe mode - incidents go to AI pipeline + agent API
 
 [[modules]]
+id          = "claude-code-protection"
+name        = "Claude Code Protection"
+version     = "0.1.0"
+description = "Official integration for Anthropic's Claude Code CLI - a fail-closed in-path PreToolUse command guard plus kernel-level execution monitoring for the agent's shell activity"
+tags        = ["ai-agents", "claude-code", "execution-guard", "in-path-guard"]
+tier        = "open"
+builtin     = true
+enables     = []   # observe mode + agent API; enforcing layer is `innerwarden agent install-hook`
+
+[[modules]]
 id          = "cloudflare-integration"
 name        = "Cloudflare Integration"
 version     = "0.1.0"

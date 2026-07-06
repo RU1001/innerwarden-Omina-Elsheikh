@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,12 @@ pub struct IntegrityCollector {
     poll_interval: Duration,
     /// path string → SHA-256 hex. Empty = no baseline yet (first run).
     known_hashes: HashMap<String, String>,
+    /// Paths we have already warned about being unhashable (e.g. permission
+    /// denied). Without this, an unreadable integrity target re-warned every
+    /// poll interval forever — 10k "cannot hash file: Permission denied" lines
+    /// in 7 days observed on prod. We warn ONCE per path and clear the entry
+    /// when the path becomes hashable again (so a recurrence still surfaces).
+    warned_unhashable: HashSet<String>,
 }
 
 impl IntegrityCollector {
@@ -34,6 +40,7 @@ impl IntegrityCollector {
             host: host.into(),
             poll_interval: Duration::from_secs(poll_seconds),
             known_hashes,
+            warned_unhashable: HashSet::new(),
         }
     }
 
@@ -54,13 +61,16 @@ impl IntegrityCollector {
             let paths = self.paths.clone();
             let host = self.host.clone();
             let known = self.known_hashes.clone();
+            let warned = std::mem::take(&mut self.warned_unhashable);
 
             let result =
-                tokio::task::spawn_blocking(move || poll_integrity(&paths, &host, &known)).await?;
+                tokio::task::spawn_blocking(move || poll_integrity(&paths, &host, &known, warned))
+                    .await?;
 
             match result {
-                Ok((events, new_hashes)) => {
+                Ok((events, new_hashes, warned)) => {
                     self.known_hashes = new_hashes.clone();
+                    self.warned_unhashable = warned;
                     *shared_hashes.lock().unwrap() = new_hashes;
                     for event in events {
                         if tx.send(event).await.is_err() {
@@ -86,37 +96,52 @@ impl IntegrityCollector {
 // Blocking poll
 // ---------------------------------------------------------------------------
 
+/// `(emitted events, updated path→hash map, updated warned-unhashable set)`.
+type PollOutcome = (Vec<Event>, HashMap<String, String>, HashSet<String>);
+
 fn poll_integrity(
     paths: &[PathBuf],
     host: &str,
     known: &HashMap<String, String>,
-) -> Result<(Vec<Event>, HashMap<String, String>)> {
+    mut warned: HashSet<String>,
+) -> Result<PollOutcome> {
     let mut events = Vec::new();
     let mut new_hashes = known.clone();
 
     for path in paths {
         let key = path.display().to_string();
         match hash_file(path) {
-            Ok(hash) => match known.get(&key) {
-                None => {
-                    // First time seeing this file - establish baseline, no event.
-                    info!(path = %path.display(), hash = %&hash[..12], "integrity baseline set");
-                    new_hashes.insert(key, hash);
+            Ok(hash) => {
+                // Path is hashable again — clear any prior "unhashable" warn
+                // latch so a future failure is reported afresh.
+                warned.remove(&key);
+                match known.get(&key) {
+                    None => {
+                        // First time seeing this file - establish baseline, no event.
+                        info!(path = %path.display(), hash = %&hash[..12], "integrity baseline set");
+                        new_hashes.insert(key, hash);
+                    }
+                    Some(prev) if *prev != hash => {
+                        info!(path = %path.display(), "file changed");
+                        events.push(make_change_event(path, &hash, prev, host));
+                        new_hashes.insert(key, hash);
+                    }
+                    _ => {} // unchanged
                 }
-                Some(prev) if *prev != hash => {
-                    info!(path = %path.display(), "file changed");
-                    events.push(make_change_event(path, &hash, prev, host));
-                    new_hashes.insert(key, hash);
-                }
-                _ => {} // unchanged
-            },
+            }
             Err(e) => {
-                warn!(path = %path.display(), "cannot hash file: {e}");
+                // Warn ONCE per path (insert returns true only the first time)
+                // — an unreadable target must not re-warn every poll forever.
+                // This is a real integrity blind spot, so we still surface it,
+                // just not on a per-minute loop.
+                if warned.insert(key) {
+                    warn!(path = %path.display(), "cannot hash file: {e}");
+                }
             }
         }
     }
 
-    Ok((events, new_hashes))
+    Ok((events, new_hashes, warned))
 }
 
 fn hash_file(path: &Path) -> io::Result<String> {
@@ -328,8 +353,13 @@ mod tests {
     #[test]
     fn baseline_established_no_event() {
         let f = tmp_with(b"hello");
-        let (events, hashes) =
-            poll_integrity(&[f.path().to_owned()], "host", &HashMap::new()).unwrap();
+        let (events, hashes, _warned) = poll_integrity(
+            &[f.path().to_owned()],
+            "host",
+            &HashMap::new(),
+            HashSet::new(),
+        )
+        .unwrap();
         assert!(events.is_empty(), "no event on first run");
         assert_eq!(hashes.len(), 1);
     }
@@ -340,7 +370,8 @@ mod tests {
         let key = f.path().display().to_string();
         let hash = hash_file(f.path()).unwrap();
         let known = HashMap::from([(key, hash)]);
-        let (events, _) = poll_integrity(&[f.path().to_owned()], "host", &known).unwrap();
+        let (events, _, _) =
+            poll_integrity(&[f.path().to_owned()], "host", &known, HashSet::new()).unwrap();
         assert!(events.is_empty());
     }
 
@@ -354,7 +385,8 @@ mod tests {
         // Modify the file
         f.write_all(b" modified").unwrap();
 
-        let (events, new_hashes) = poll_integrity(&[f.path().to_owned()], "host", &known).unwrap();
+        let (events, new_hashes, _) =
+            poll_integrity(&[f.path().to_owned()], "host", &known, HashSet::new()).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "file.changed");
         assert_eq!(events[0].severity, Severity::High);
@@ -364,10 +396,47 @@ mod tests {
     #[test]
     fn missing_file_is_warned_not_panicked() {
         let known = HashMap::new();
-        let result = poll_integrity(&[PathBuf::from("/nonexistent/file")], "host", &known);
+        let result = poll_integrity(
+            &[PathBuf::from("/nonexistent/file")],
+            "host",
+            &known,
+            HashSet::new(),
+        );
         assert!(result.is_ok());
-        let (events, _) = result.unwrap();
+        let (events, _, _) = result.unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn unhashable_path_warns_once_then_latches_until_recovery() {
+        let missing = PathBuf::from("/nonexistent/integrity-target");
+        let known = HashMap::new();
+
+        // First poll: path is unhashable -> it enters the warned set.
+        let (_, _, warned) =
+            poll_integrity(&[missing.clone()], "host", &known, HashSet::new()).unwrap();
+        let key = missing.display().to_string();
+        assert!(
+            warned.contains(&key),
+            "first failure must record the warn latch"
+        );
+
+        // Second poll with the latch carried over: still unhashable, but the
+        // latch is already set so no fresh warn would fire (set is unchanged).
+        let (_, _, warned2) = poll_integrity(&[missing.clone()], "host", &known, warned).unwrap();
+        assert!(warned2.contains(&key), "latch persists while still failing");
+
+        // Now point at a hashable file with the latch still carried: success
+        // must CLEAR the latch so a later failure surfaces again.
+        let f = tmp_with(b"now-readable");
+        let mut carried = HashSet::new();
+        carried.insert(f.path().display().to_string());
+        let (_, _, warned3) =
+            poll_integrity(&[f.path().to_owned()], "host", &HashMap::new(), carried).unwrap();
+        assert!(
+            !warned3.contains(&f.path().display().to_string()),
+            "a path that becomes hashable again must clear its warn latch"
+        );
     }
 
     // ---------------------------------------------------------------------------

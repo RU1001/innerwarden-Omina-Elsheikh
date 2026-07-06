@@ -1,4 +1,255 @@
 use super::formatting::{escape_html, friendly_detector_name};
+use crate::detector_catalog;
+
+/// A blocked-source line for the briefing: an IP, how many times it was
+/// blocked today, and whether it is still contained at send time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedSource {
+    pub ip: String,
+    pub block_count: u32,
+    /// Live-verified: the firewall/XDP rule for this IP is still active.
+    pub still_contained: bool,
+    /// 2-letter country code if cheaply known (geo cache hit); else None.
+    pub country_code: Option<String>,
+}
+
+/// Everything the redesigned Daily Security Briefing needs, assembled by
+/// `narrative_daily_summary::build_daily_digest_text` from canonical state.
+///
+/// Spec (2026-06): the briefing is a diligent employee's daily report to a
+/// non-technical boss who must still learn enough TECHNICALLY to ask for the
+/// right fix. Every number is explained, every category line is boss-readable
+/// with a one-clause "why it matters", and the "Needs review" count is the
+/// LIVE dashboard number — never a stale grouped counter.
+pub struct DailyBriefingData {
+    /// Total events the agent analysed today (`incidents_today`).
+    pub events: u32,
+    /// Decisions the agent recorded today (can exceed `events`: one event may
+    /// yield several decisions).
+    pub decisions: u32,
+    /// Post-posture Critical compromises.
+    pub critical: u32,
+    /// Post-posture High-severity threats.
+    pub high: u32,
+    /// LIVE "Needs review" count — the SAME number the dashboard "Needs review"
+    /// tile shows (open cases whose most-recent decision is still needs_review).
+    /// NOT the transient grouped counter.
+    pub needs_review_live: u32,
+    /// Threat groups the agent auto-resolved (informational only).
+    pub auto_resolved_groups: u32,
+    /// Per-category counts (detector -> count), already merged from the
+    /// deferred breakdown + the day's incident detector tally.
+    pub categories: Vec<(String, u32)>,
+    /// Top blocked source IPs today, highest block-count first.
+    pub blocked_sources: Vec<BlockedSource>,
+    /// Total unique IPs blocked today.
+    pub unique_blocked_ips: u32,
+    /// How many of those are still contained at send time.
+    pub still_contained: u32,
+    /// Optional one-line proactive suggestion (e.g. key-only SSH).
+    pub proactive: Option<String>,
+}
+
+/// Convert a 2-letter ISO country code to a flag emoji (reused locally so the
+/// briefing body can render `🇨🇳` next to a blocked IP). Empty on bad input.
+fn flag(code: &str) -> String {
+    super::formatting::country_flag_emoji_pub(code)
+}
+
+/// How many category lines to show before collapsing the long tail.
+const MAX_CATEGORY_LINES: usize = 8;
+/// How many blocked-source IPs to show before collapsing.
+const MAX_BLOCKED_SOURCES: usize = 5;
+
+/// Plain bottom-line verdict in the confident guardian voice. The boss reads
+/// ONE sentence and knows whether to relax or act. A real compromise drops the
+/// jokes entirely; everything else stays cocky-but-competent.
+fn verdict_line(d: &DailyBriefingData) -> String {
+    // Override 1: a real compromise lands. No jokes — the boss is needed.
+    if d.critical > 0 {
+        return "\u{1f6a8} <b>Okay, no jokes. Someone landed a hit. Details below, and I need \
+                you on it.</b>"
+            .to_string();
+    }
+    // Override 2: calls are the operator's to make.
+    if d.needs_review_live > 0 {
+        let call = if d.needs_review_live == 1 {
+            "call"
+        } else {
+            "call(s)"
+        };
+        return format!(
+            "\u{26a0}\u{fe0f} <b>Mostly handled, but {} {call} are yours to make.</b>",
+            d.needs_review_live
+        );
+    }
+    // Quiet night: nothing worth the boss's time.
+    if d.events == 0 {
+        return "\u{2705} <b>Quiet night. Walked the perimeter, found nothing worth your time. \
+                We're good.</b>"
+            .to_string();
+    }
+    // Busy but all contained: a lot of knocking, nobody got in.
+    if d.high > 0 || d.unique_blocked_ips > 5 {
+        return "\u{2705} <b>Busy night on the wall. A lot of knocking. Nobody got in, not in \
+                my house.</b>"
+            .to_string();
+    }
+    // Everything handled automatically.
+    "\u{2705} <b>Handled the whole night myself. Nobody got in. You're welcome.</b>".to_string()
+}
+
+/// The actionable "Needs review" block. Always points at something real: when
+/// the live count is 0 it reassures instead of sending the operator to an empty
+/// queue.
+fn needs_review_block(n: u32) -> String {
+    if n == 0 {
+        "\u{2705} <b>Nothing for you tonight. I'm a professional. Go back to sleep.</b>".to_string()
+    } else {
+        let thing = if n == 1 { "thing" } else { "thing(s)" };
+        format!(
+            "\u{26a0}\u{fe0f} <b>{n} {thing} have your name on them.</b> I could guess, but \
+             then you'd yell at me. Open InnerWarden \u{2192} Cases \u{2192} \"Needs review\" and \
+             hit Block, Dismiss, or Monitor. (Live count. Already sorted them? It says 0 and we \
+             never speak of this again.)"
+        )
+    }
+}
+
+/// Render the redesigned Daily Security Briefing. Boss-readable for EVERY
+/// profile; `technical` just appends the raw counters power users want at the
+/// end, it does not switch to jargon.
+pub fn format_daily_briefing(d: &DailyBriefingData, technical: bool) -> String {
+    let mut msg = String::new();
+
+    // 1. Header + plain bottom-line verdict.
+    msg.push_str("\u{1f6e1}\u{fe0f} <b>Daily Security Briefing</b>\n\n");
+    msg.push_str(&verdict_line(d));
+
+    // 2. Explained headline numbers in the guardian voice. One clause each
+    // (kills the "more decisions than events?" confusion + the cryptic jargon).
+    msg.push_str(&format!(
+        "\n\nOh hey, you're awake. While you were off doing whatever it is you do, I worked the \
+         door all night. Here's the night shift:\n\
+         \u{00a0}\u{00a0}\u{2022} <b>{decisions}</b> calls made across <b>{events}</b> security \
+         events (block, babysit, or \"yeah fine, come in\"). One event can take a few calls, \
+         don't @ me.\n\
+         \u{00a0}\u{00a0}\u{2022} Break-ins: <b>{critical}</b>. Serious attempts: <b>{high}</b>, \
+         all face-planted into the wall (and that's after I grade on a curve for how locked down \
+         this box already is).",
+        decisions = d.decisions,
+        events = d.events,
+        critical = d.critical,
+        high = d.high,
+    ));
+
+    // 3. Blocked sources: what a real daily report leads with.
+    if d.unique_blocked_ips > 0 {
+        msg.push_str(&format!(
+            "\n\n\u{1f6ab} <b>Bouncer count: {} IP(s) shown the door</b> ({} still contained):",
+            d.unique_blocked_ips, d.still_contained
+        ));
+        for src in d.blocked_sources.iter().take(MAX_BLOCKED_SOURCES) {
+            let flag_str = src
+                .country_code
+                .as_deref()
+                .map(|c| {
+                    let f = flag(c);
+                    if f.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {f}")
+                    }
+                })
+                .unwrap_or_default();
+            let contained = if src.still_contained {
+                ""
+            } else {
+                " <i>(block expired)</i>"
+            };
+            msg.push_str(&format!(
+                "\n\u{00a0}\u{00a0}\u{2022} <code>{ip}</code>{flag_str} \u{00d7}{n}{contained}",
+                ip = escape_html(&src.ip),
+                n = src.block_count,
+            ));
+        }
+        let shown = d.blocked_sources.len().min(MAX_BLOCKED_SOURCES);
+        if d.blocked_sources.len() > shown {
+            msg.push_str(&format!(
+                "\n\u{00a0}\u{00a0}\u{2022} … and {} more (see dashboard)",
+                d.blocked_sources.len() - shown
+            ));
+        }
+    }
+
+    // 4. What InnerWarden handled, by category. Each line stays boss-readable
+    // with a one-clause "why it matters", routed through the catalog. No raw
+    // names. The personality lives in the header, not the factual glosses.
+    if !d.categories.is_empty() {
+        msg.push_str("\n\n\u{1f916} <b>What I shut down (and why you'd care):</b>");
+        for (detector, count) in d.categories.iter().take(MAX_CATEGORY_LINES) {
+            let gloss = escape_html(&detector_catalog::digest_gloss(detector));
+            msg.push_str(&format!(
+                "\n\u{00a0}\u{00a0}\u{2022} <b>{count}\u{00d7}</b> {gloss}"
+            ));
+        }
+        if d.categories.len() > MAX_CATEGORY_LINES {
+            let tail: u32 = d
+                .categories
+                .iter()
+                .skip(MAX_CATEGORY_LINES)
+                .map(|(_, c)| *c)
+                .sum();
+            let more = d.categories.len() - MAX_CATEGORY_LINES;
+            msg.push_str(&format!(
+                "\n\u{00a0}\u{00a0}\u{2022} … and {tail} more across {more} other categor{} (see dashboard)",
+                if more == 1 { "y" } else { "ies" }
+            ));
+        }
+    }
+
+    // 5. Auto-resolved (informational only).
+    if d.auto_resolved_groups > 0 {
+        msg.push_str(&format!(
+            "\n\n\u{2705} {} threat group(s) sorted automatically. You're welcome.",
+            d.auto_resolved_groups
+        ));
+    }
+
+    // 6. The actionable needs-review block: never points at nothing.
+    msg.push_str("\n\n");
+    msg.push_str(&needs_review_block(d.needs_review_live));
+
+    // 7. Optional proactive suggestion. The tip stays factual/actionable; only
+    // the label carries the persona.
+    if let Some(tip) = &d.proactive {
+        msg.push_str(&format!(
+            "\n\n\u{1f4a1} <b>Real talk:</b> {}",
+            escape_html(tip)
+        ));
+    }
+
+    // 8. Technical profile: append the raw counters power users asked for.
+    // Additive, still boss-readable above.
+    if technical {
+        msg.push_str(&format!(
+            "\n\n\u{1f4ca} <i>Technical: {events} events · {decisions} decisions · \
+             {critical} critical · {high} high · {blocked} IPs blocked · \
+             {review} needs-review (live)</i>",
+            events = d.events,
+            decisions = d.decisions,
+            critical = d.critical,
+            high = d.high,
+            blocked = d.unique_blocked_ips,
+            review = d.needs_review_live,
+        ));
+    }
+
+    // 9. Closer (once, at the very end): the guardian signing off.
+    msg.push_str("\n\nGo on, I've got the place. As usual.");
+
+    msg
+}
 
 /// Format the daily digest message.
 /// Simple mode: friendly, non-technical. Technical mode: concise stats.
@@ -44,6 +295,13 @@ pub fn format_daily_digest(
 }
 
 /// Pipeline digest stats for enriched daily digest.
+///
+/// Superseded 2026-06 by [`DailyBriefingData`] + [`format_daily_briefing`]
+/// (the boss-readable redesign). Kept with `#[allow(dead_code)]` because its
+/// regression anchors (health-score removal, the "All clear" honesty gate, the
+/// "Made N decisions" wording) still document hard-won copy decisions; mirrors
+/// how the pre-enriched [`format_daily_digest`] above was retired.
+#[allow(dead_code)]
 pub struct PipelineDigestStats {
     pub suppressed_count: u32,
     pub auto_resolved_groups: u32,
@@ -53,6 +311,10 @@ pub struct PipelineDigestStats {
 }
 
 /// Format an enriched daily digest with pipeline grouping stats.
+///
+/// Superseded 2026-06 by [`format_daily_briefing`]; retained `#[allow(dead_code)]`
+/// for its copy-regression anchors (see [`PipelineDigestStats`]).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn format_daily_digest_enriched(
     incidents_today: u32,
@@ -554,5 +816,287 @@ mod tests {
             !msg.contains("Blocked <b>7</b> attacks"),
             "must not regress to misleading 'Blocked N attacks' label"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_daily_briefing — the boss-readable redesign (2026-06)
+    // -----------------------------------------------------------------------
+
+    fn sample_briefing() -> DailyBriefingData {
+        DailyBriefingData {
+            events: 55,
+            decisions: 259,
+            critical: 0,
+            high: 10,
+            needs_review_live: 0,
+            auto_resolved_groups: 41,
+            categories: vec![
+                ("ssh_bruteforce".to_string(), 168),
+                ("proto_anomaly".to_string(), 96),
+                ("kernel_devnode_exposed".to_string(), 7),
+                ("telemetry.stream_silence".to_string(), 2),
+            ],
+            blocked_sources: vec![
+                BlockedSource {
+                    ip: "45.155.205.108".to_string(),
+                    block_count: 38,
+                    still_contained: true,
+                    country_code: Some("ru".to_string()),
+                },
+                BlockedSource {
+                    ip: "159.223.44.17".to_string(),
+                    block_count: 21,
+                    still_contained: false,
+                    country_code: None,
+                },
+            ],
+            unique_blocked_ips: 2,
+            still_contained: 1,
+            proactive: None,
+        }
+    }
+
+    #[test]
+    fn briefing_explains_headline_numbers_and_kills_post_posture_jargon() {
+        // FIX 3 (guardian voice): the "N calls across M events" clause renders
+        // with the data wired, the curve/hardening clause is present, and the
+        // cryptic "(post-posture)" token is gone.
+        let msg = format_daily_briefing(&sample_briefing(), false);
+        assert!(
+            msg.contains("<b>259</b> calls made across <b>55</b> security events"),
+            "calls-across-events clause: {msg}"
+        );
+        assert!(
+            msg.contains("grade on a curve for how locked down this box already is"),
+            "hardening curve wording: {msg}"
+        );
+        assert!(
+            !msg.contains("(post-posture)"),
+            "jargon must be gone: {msg}"
+        );
+    }
+
+    #[test]
+    fn briefing_leads_with_a_plain_verdict() {
+        // FIX 3 (guardian voice): a bottom-line verdict the boss reads first.
+        // Busy but all contained → "Busy night on the wall".
+        let busy = format_daily_briefing(&sample_briefing(), false);
+        assert!(
+            busy.contains("Busy night on the wall"),
+            "busy verdict: {busy}"
+        );
+
+        // Quiet day (no events) → "Quiet night" verdict.
+        let mut quiet = sample_briefing();
+        quiet.events = 0;
+        quiet.high = 0;
+        quiet.categories.clear();
+        quiet.blocked_sources.clear();
+        quiet.unique_blocked_ips = 0;
+        quiet.auto_resolved_groups = 0;
+        let q = format_daily_briefing(&quiet, false);
+        assert!(
+            q.contains("Quiet night. Walked the perimeter"),
+            "quiet verdict: {q}"
+        );
+
+        // Everything handled, no high / no big block burst → "Handled the
+        // whole night myself".
+        let mut handled = sample_briefing();
+        handled.high = 0;
+        handled.unique_blocked_ips = 1;
+        handled.still_contained = 1;
+        let h = format_daily_briefing(&handled, false);
+        assert!(
+            h.contains("Handled the whole night myself"),
+            "all-handled verdict: {h}"
+        );
+
+        // Needs-review present → verdict leads with the "yours to make" ask.
+        let mut review = sample_briefing();
+        review.needs_review_live = 3;
+        let r = format_daily_briefing(&review, false);
+        assert!(
+            r.contains("3 call(s) are yours to make"),
+            "review verdict: {r}"
+        );
+
+        // A real compromise overrides everything and drops the jokes.
+        let mut breach = sample_briefing();
+        breach.critical = 1;
+        breach.needs_review_live = 2; // critical override wins over needs-review.
+        let b = format_daily_briefing(&breach, false);
+        assert!(
+            b.contains("Okay, no jokes. Someone landed a hit"),
+            "compromise verdict drops the jokes: {b}"
+        );
+    }
+
+    #[test]
+    fn briefing_renders_blocked_sources_with_count_and_containment() {
+        // FIX 4: top blocked IPs + unique count + still-contained count.
+        let msg = format_daily_briefing(&sample_briefing(), false);
+        assert!(
+            msg.contains("Bouncer count: 2 IP(s) shown the door"),
+            "unique count: {msg}"
+        );
+        assert!(
+            msg.contains("(1 still contained)"),
+            "containment count: {msg}"
+        );
+        assert!(msg.contains("45.155.205.108"), "top IP: {msg}");
+        assert!(msg.contains("\u{00d7}38"), "block multiplier: {msg}");
+        assert!(
+            msg.contains("\u{1f1f7}\u{1f1fa}"),
+            "country flag (RU): {msg}"
+        );
+        // The expired block is flagged honestly.
+        assert!(
+            msg.contains("(block expired)"),
+            "expired block flagged: {msg}"
+        );
+    }
+
+    #[test]
+    fn briefing_category_lines_are_glossed_never_raw_snake_case() {
+        // FIX 2: every category line is boss-readable with a "why it matters"
+        // clause; no raw snake_case / dotted detector name survives.
+        let msg = format_daily_briefing(&sample_briefing(), false);
+        assert!(msg.contains("What I shut down"), "category header: {msg}");
+        // Each gloss carries a "why it matters" clause: a factual label, then a
+        // period, then the plain-language reason (e.g. "...blocked. Attackers
+        // guess passwords...").
+        assert!(
+            msg.contains("guess passwords at scale"),
+            "lines carry a factual why clause: {msg}"
+        );
+        for raw in [
+            "ssh_bruteforce",
+            "proto_anomaly",
+            "kernel_devnode_exposed",
+            "telemetry.stream_silence",
+        ] {
+            assert!(
+                !msg.contains(raw),
+                "raw detector name leaked ({raw}): {msg}"
+            );
+        }
+        // The humanised + glossed forms are present.
+        assert!(
+            msg.contains("Kernel Devnode Exposed"),
+            "humanised label: {msg}"
+        );
+        assert!(
+            msg.contains("Telemetry Stream Silence"),
+            "humanised label: {msg}"
+        );
+    }
+
+    #[test]
+    fn briefing_needs_review_block_never_points_at_nothing() {
+        // FIX 1 render contract (guardian voice): 0 → reassurance, N>0 →
+        // actionable copy that points at Cases → Needs review.
+        let mut d = sample_briefing();
+        d.needs_review_live = 0;
+        let zero = format_daily_briefing(&d, false);
+        assert!(
+            zero.contains("Nothing for you tonight. I'm a professional"),
+            "zero reassurance: {zero}"
+        );
+        assert!(
+            !zero.contains("have your name on them"),
+            "zero must not nag about review: {zero}"
+        );
+
+        d.needs_review_live = 2;
+        let some = format_daily_briefing(&d, false);
+        assert!(
+            some.contains("2 thing(s) have your name on them"),
+            "actionable count: {some}"
+        );
+        assert!(
+            some.contains("Cases \u{2192} \"Needs review\""),
+            "points at Cases: {some}"
+        );
+    }
+
+    #[test]
+    fn briefing_long_tail_categories_collapse() {
+        let mut d = sample_briefing();
+        d.categories = (0..12)
+            .map(|i| (format!("port_scan_{i}"), (12 - i) as u32))
+            .collect();
+        let msg = format_daily_briefing(&d, false);
+        // 8 shown, the remaining 4 collapse into the tail line.
+        assert!(
+            msg.contains("4 other categories (see dashboard)"),
+            "tail collapse: {msg}"
+        );
+    }
+
+    #[test]
+    fn briefing_technical_profile_appends_raw_counters_but_stays_boss_readable() {
+        let msg = format_daily_briefing(&sample_briefing(), true);
+        // The boss-readable body is unchanged; the raw footer is additive.
+        assert!(msg.contains("What I shut down"), "boss body present: {msg}");
+        assert!(msg.contains("Technical:"), "technical footer: {msg}");
+        assert!(
+            msg.contains("259 decisions") && msg.contains("55 events"),
+            "raw counters: {msg}"
+        );
+        // The closer is appended once, after the technical footer.
+        assert!(
+            msg.contains("Go on, I've got the place. As usual."),
+            "closer present: {msg}"
+        );
+        assert_eq!(
+            msg.matches("Go on, I've got the place. As usual.").count(),
+            1,
+            "closer must appear exactly once: {msg}"
+        );
+    }
+
+    #[test]
+    fn briefing_renders_proactive_suggestion_when_present() {
+        let mut d = sample_briefing();
+        d.proactive = Some("consider key-only SSH".to_string());
+        let msg = format_daily_briefing(&d, false);
+        assert!(
+            msg.contains("\u{1f4a1} <b>Real talk:</b>"),
+            "proactive label: {msg}"
+        );
+        assert!(msg.contains("key-only SSH"), "proactive text: {msg}");
+    }
+
+    /// HARD RULE: the rendered briefing must contain zero em dashes (U+2014).
+    /// The framing switched to the guardian voice with no em dashes anywhere;
+    /// this pins that the live renderer never emits one again.
+    #[test]
+    fn briefing_contains_no_em_dash() {
+        // Exercise every branch: busy, quiet, all-handled, needs-review,
+        // real-compromise, technical footer, proactive tip.
+        let mut d = sample_briefing();
+        d.proactive = Some("consider key-only SSH".to_string());
+        for technical in [false, true] {
+            let msg = format_daily_briefing(&d, technical);
+            assert!(!msg.contains('\u{2014}'), "em dash in briefing: {msg}");
+        }
+
+        let mut quiet = sample_briefing();
+        quiet.events = 0;
+        quiet.high = 0;
+        quiet.categories.clear();
+        quiet.blocked_sources.clear();
+        quiet.unique_blocked_ips = 0;
+        quiet.auto_resolved_groups = 0;
+        assert!(!format_daily_briefing(&quiet, false).contains('\u{2014}'));
+
+        let mut review = sample_briefing();
+        review.needs_review_live = 2;
+        assert!(!format_daily_briefing(&review, true).contains('\u{2014}'));
+
+        let mut breach = sample_briefing();
+        breach.critical = 1;
+        assert!(!format_daily_briefing(&breach, true).contains('\u{2014}'));
     }
 }

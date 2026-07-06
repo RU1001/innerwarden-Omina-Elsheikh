@@ -1,8 +1,27 @@
 use crate::{abuseipdb, ai, config, geoip, AgentState};
 
-/// Send a post-execution action report to Telegram when an action was executed.
+/// Whether a decided action is worth a post-execution report to the operator.
+///
+/// `Dismiss` and `Ignore` are non-actions — the agent decided the incident is
+/// not a threat, so "🛡️ Threat neutralized — Dismissed" reports are pure noise.
+/// Every other action did something the operator should be told about.
+fn is_reportable_action(action: &ai::AiAction) -> bool {
+    use ai::AiAction;
+    !matches!(action, AiAction::Dismiss { .. } | AiAction::Ignore { .. })
+}
+
+/// Send a post-execution action report ("what the agent did") to every
+/// operator-facing chat channel when an action was executed.
+///
+/// Spec 078 Phase 2: this used to be Telegram-only; it now fans out through the
+/// chat-channel registry so Slack (and future Discord) see the same
+/// disposition. Gating is unchanged in spirit — executed action, immediate
+/// threat, reportable (non-`Dismiss`/`Ignore`) — except the old
+/// `telegram.bot.enabled` gate (the conversational-bot switch) is replaced by
+/// "at least one chat channel is configured", so an action report now follows
+/// the notification master switch rather than the bot interface.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn maybe_send_post_execution_telegram_report(
+pub(crate) fn maybe_send_post_execution_report(
     incident: &innerwarden_core::incident::Incident,
     decision: &ai::AiDecision,
     execution_result: &str,
@@ -12,10 +31,8 @@ pub(crate) fn maybe_send_post_execution_telegram_report(
     ip_reputation: Option<&abuseipdb::IpReputation>,
     ip_geo: Option<&geoip::GeoInfo>,
 ) {
-    // In GUARD/DryRun mode, send a post-execution Telegram report so the
-    // operator knows what was done (action report replaces a manual ask).
     let was_executed = !execution_result.starts_with("skipped");
-    if !was_executed || !cfg.telegram.bot.enabled {
+    if !was_executed {
         return;
     }
 
@@ -25,9 +42,19 @@ pub(crate) fn maybe_send_post_execution_telegram_report(
         return;
     }
 
-    let Some(ref tg) = state.telegram_client else {
+    // Dismiss / Ignore are non-actions: the agent decided this incident is NOT a
+    // threat. Sending "🛡️ Threat neutralized — Dismissed" for every dismissed
+    // false positive floods the operator with reports about things that needed
+    // no response. Skip them here (the first-alert and the daily digest still
+    // record the incident).
+    if !is_reportable_action(&decision.action) {
         return;
-    };
+    }
+
+    let channels = crate::notification_channels::collect_chat_channels(cfg, state);
+    if channels.is_empty() {
+        return;
+    }
 
     use ai::AiAction;
     let (action_label, target) = match &decision.action {
@@ -53,27 +80,19 @@ pub(crate) fn maybe_send_post_execution_telegram_report(
         }
     };
 
-    let tg = tg.clone();
-    let title = incident.title.clone();
-    let host = incident.host.clone();
-    let confidence = decision.confidence;
-    let dry_run = cfg.responder.dry_run;
-    let rep_clone = ip_reputation.cloned();
-    let geo_clone = ip_geo.cloned();
+    let report = crate::notification_channels::ActionReport {
+        action_label,
+        target,
+        incident_title: incident.title.clone(),
+        confidence: decision.confidence,
+        host: incident.host.clone(),
+        dry_run: cfg.responder.dry_run,
+        ip_reputation: ip_reputation.cloned(),
+        ip_geo: ip_geo.cloned(),
+        cloudflare_pushed,
+    };
     tokio::spawn(async move {
-        let _ = tg
-            .send_action_report(
-                &action_label,
-                &target,
-                &title,
-                confidence,
-                &host,
-                dry_run,
-                rep_clone.as_ref(),
-                geo_clone.as_ref(),
-                cloudflare_pushed,
-            )
-            .await;
+        crate::notification_channels::fan_out_action_report(&channels, &report).await;
     });
 }
 
@@ -82,6 +101,30 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn dismiss_and_ignore_are_not_reportable() {
+        // Non-actions must not produce a "Threat neutralized" report — that
+        // floods the operator with noise about incidents that needed nothing.
+        assert!(!is_reportable_action(&ai::AiAction::Dismiss {
+            reason: "false positive".to_string(),
+        }));
+        assert!(!is_reportable_action(&ai::AiAction::Ignore {
+            reason: "benign".to_string(),
+        }));
+
+        // Real actions still report.
+        assert!(is_reportable_action(&ai::AiAction::BlockIp {
+            ip: "203.0.113.7".to_string(),
+            skill_id: "block-ip-ufw".to_string(),
+        }));
+        assert!(is_reportable_action(&ai::AiAction::Monitor {
+            ip: "203.0.113.7".to_string(),
+        }));
+        assert!(is_reportable_action(&ai::AiAction::RequestConfirmation {
+            summary: "needs operator".to_string(),
+        }));
+    }
 
     fn base_decision(action: ai::AiAction) -> ai::AiDecision {
         ai::AiDecision {
@@ -103,11 +146,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_when_execution_was_not_performed_or_bot_disabled() {
+    async fn skips_when_not_executed_or_no_channels_configured() {
         let dir = TempDir::new().expect("tempdir");
         let state = crate::tests::triage_test_state(dir.path());
         let mut cfg = config::AgentConfig::default();
-        cfg.telegram.bot.enabled = false;
+        cfg.telegram.enabled = true; // enabled, but state has no client below
         let mut incident = crate::tests::test_incident("203.0.113.30");
         incident.severity = innerwarden_core::event::Severity::Critical;
         let decision = base_decision(ai::AiAction::BlockIp {
@@ -115,7 +158,7 @@ mod tests {
             skill_id: "block-ip-ufw".to_string(),
         });
 
-        maybe_send_post_execution_telegram_report(
+        maybe_send_post_execution_report(
             &incident,
             &decision,
             "skipped: confidence below threshold",
@@ -126,8 +169,8 @@ mod tests {
             None,
         );
 
-        cfg.telegram.bot.enabled = true;
-        maybe_send_post_execution_telegram_report(
+        cfg.telegram.enabled = true;
+        maybe_send_post_execution_report(
             &incident, &decision, "ok", false, &cfg, &state, None, None,
         );
     }
@@ -137,13 +180,13 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let state = state_with_telegram(dir.path());
         let mut cfg = config::AgentConfig::default();
-        cfg.telegram.bot.enabled = true;
+        cfg.telegram.enabled = true;
         let incident = crate::tests::test_incident_with_kind("203.0.113.31", "benign_detector");
         let decision = base_decision(ai::AiAction::Monitor {
             ip: "203.0.113.31".to_string(),
         });
 
-        maybe_send_post_execution_telegram_report(
+        maybe_send_post_execution_report(
             &incident, &decision, "ok", false, &cfg, &state, None, None,
         );
     }
@@ -153,7 +196,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let state = state_with_telegram(dir.path());
         let mut cfg = config::AgentConfig::default();
-        cfg.telegram.bot.enabled = true;
+        cfg.telegram.enabled = true;
         cfg.responder.dry_run = true;
 
         let mut incident = crate::tests::test_incident("203.0.113.32");
@@ -199,7 +242,7 @@ mod tests {
 
         for action in actions {
             let decision = base_decision(action);
-            maybe_send_post_execution_telegram_report(
+            maybe_send_post_execution_report(
                 &incident, &decision, "executed", true, &cfg, &state, None, None,
             );
         }

@@ -86,6 +86,14 @@ pub fn cleanup(data_dir: &Path, cfg: &DataRetentionConfig) -> usize {
             ".jsonl.gz",
             cfg.decisions_keep_days,
         ),
+        // Mesh signal forensic log (innerwarden-mesh `append_signal_log`):
+        // a write-only audit trail, never loaded on restart and read by no
+        // query surface, so it stays JSONL (SQLite buys nothing without a
+        // reader) — but it was accumulating unbounded because it was absent
+        // from this sweep while its sibling advisory-audit was pruned. Low
+        // volume (forensic), so retained on the decisions horizon.
+        ("mesh-signals-", ".jsonl", cfg.decisions_keep_days),
+        ("mesh-signals-", ".jsonl.gz", cfg.decisions_keep_days),
         ("telemetry-", ".jsonl", cfg.telemetry_keep_days),
         ("telemetry-", ".jsonl.gz", cfg.telemetry_keep_days),
         ("admin-actions-", ".jsonl", cfg.decisions_keep_days),
@@ -548,6 +556,29 @@ mod tests {
         assert!(tmp
             .path()
             .join(format!("decisions-{}.jsonl", recent.format("%Y-%m-%d")))
+            .exists());
+    }
+
+    #[test]
+    fn prunes_old_mesh_signals_forensic_log() {
+        // Regression: mesh-signals-<date>.jsonl (innerwarden-mesh
+        // `append_signal_log` forensic trail) was absent from the retention
+        // sweep and accumulated unbounded on prod (observed 18 days / 1.3MB)
+        // while its sibling mesh_advisory_suppressions- was pruned. It is a
+        // write-only forensic log (no reader → stays JSONL, not SQLite),
+        // retained on the decisions horizon; a file past that must be removed.
+        let tmp = tempfile::tempdir().unwrap();
+        let today = Local::now().date_naive();
+        let cfg = DataRetentionConfig::default();
+        let old = today - Duration::days(cfg.decisions_keep_days as i64 + 5);
+        write_dated_file(tmp.path(), "mesh-signals-", ".jsonl", old);
+
+        let removed = cleanup(tmp.path(), &cfg);
+
+        assert_eq!(removed, 1);
+        assert!(!tmp
+            .path()
+            .join(format!("mesh-signals-{}.jsonl", old.format("%Y-%m-%d")))
             .exists());
     }
 

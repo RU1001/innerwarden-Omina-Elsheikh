@@ -5,6 +5,7 @@
 //! Bot command responses (operator asked for info) and daily briefings are
 //! exempt — they bypass this gate.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -369,11 +370,34 @@ fn evaluate_verdict(ctx: &NotificationContext) -> NotificationVerdict {
 // Burst summary counter
 // ---------------------------------------------------------------------------
 
-/// Tracks contained-threat count for burst summary notifications.
-/// When 50+ threats are auto-blocked in one hour, a single summary is sent.
+/// A snapshot of the burst taken at the moment the threshold is crossed.
+///
+/// It carries the breakdown of what was auto-blocked *so far in the window*
+/// (not the final total — the window keeps counting after this fires) so the
+/// operator-facing message can say WHICH server, WHAT kind of attack, and
+/// FROM how many sources, instead of a bare "50 threats blocked".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BurstSummary {
+    /// Host identity. Filled by the caller/formatter (the tracker is host-agnostic).
+    pub host: String,
+    /// Number of contained threats counted when the threshold was crossed.
+    pub total: u64,
+    /// Coarse plain-language buckets, sorted by count descending, top 3.
+    pub top_categories: Vec<(String, u64)>,
+    /// Count of distinct attacker source IPs seen in the window so far.
+    pub distinct_sources: usize,
+}
+
+/// Tracks contained-threat count + breakdown for burst summary notifications.
+/// When 50+ threats are auto-blocked in one hour, a single enriched summary
+/// is sent (once per window) describing what was blocked.
 pub(crate) struct BurstTracker {
     /// Count of contained threats since last summary or window reset.
     contained_count: AtomicU64,
+    /// Per-category counts (coarse plain-language buckets) for the window.
+    categories: std::sync::Mutex<HashMap<String, u64>>,
+    /// Distinct attacker source IPs seen in the window.
+    sources: std::sync::Mutex<HashSet<String>>,
     /// Timestamp when the current counting window started.
     window_start: std::sync::Mutex<DateTime<Utc>>,
     /// Whether a burst summary has already been sent for this window.
@@ -387,32 +411,79 @@ impl BurstTracker {
     pub fn new() -> Self {
         Self {
             contained_count: AtomicU64::new(0),
+            categories: std::sync::Mutex::new(HashMap::new()),
+            sources: std::sync::Mutex::new(HashSet::new()),
             window_start: std::sync::Mutex::new(Utc::now()),
             summary_sent: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Record a contained threat. Returns Some(count) if the burst threshold
-    /// has been reached and a summary should be sent.
-    pub fn record_contained(&self) -> Option<u64> {
+    /// Record a contained threat with its coarse category and (optional)
+    /// attacker source IP. Accumulates the breakdown over the window.
+    ///
+    /// Returns `Some(BurstSummary)` exactly once per window — the first time
+    /// the running total crosses the threshold — carrying the breakdown of
+    /// what has been blocked so far. The `host` field of the returned summary
+    /// is left empty for the caller/formatter to fill.
+    pub fn record_contained(
+        &self,
+        category: &str,
+        source_ip: Option<&str>,
+    ) -> Option<BurstSummary> {
         let now = Utc::now();
 
-        // Check if window expired — reset if so.
+        // Check if window expired — reset everything if so.
         {
             let mut start = self.window_start.lock().unwrap();
             if (now - *start).num_seconds() >= BURST_WINDOW_SECS {
                 *start = now;
                 self.contained_count.store(0, Ordering::Relaxed);
                 self.summary_sent.store(false, Ordering::Relaxed);
+                self.categories.lock().unwrap().clear();
+                self.sources.lock().unwrap().clear();
+            }
+        }
+
+        // Accumulate the breakdown for this event.
+        {
+            let mut cats = self.categories.lock().unwrap();
+            *cats.entry(category.to_string()).or_insert(0) += 1;
+        }
+        if let Some(ip) = source_ip {
+            if !ip.is_empty() {
+                self.sources.lock().unwrap().insert(ip.to_string());
             }
         }
 
         let count = self.contained_count.fetch_add(1, Ordering::Relaxed) + 1;
 
         if count >= BURST_THRESHOLD && !self.summary_sent.swap(true, Ordering::Relaxed) {
-            Some(count)
+            Some(self.snapshot(count))
         } else {
             None
+        }
+    }
+
+    /// Build a `BurstSummary` snapshot of the current window state.
+    fn snapshot(&self, total: u64) -> BurstSummary {
+        let mut top_categories: Vec<(String, u64)> = self
+            .categories
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        // Sort by count desc, then name asc for a stable, deterministic order.
+        top_categories.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_categories.truncate(3);
+
+        let distinct_sources = self.sources.lock().unwrap().len();
+
+        BurstSummary {
+            host: String::new(),
+            total,
+            top_categories,
+            distinct_sources,
         }
     }
 
@@ -423,14 +494,161 @@ impl BurstTracker {
     }
 }
 
-/// Format the burst summary message as HTML for Telegram.
-pub(crate) fn format_burst_summary(count: u64) -> String {
-    format!(
-        "\u{1f6e1}\u{fe0f} <b>Under heavy attack</b>\n\n\
-         <b>{count}</b> threats auto-blocked this hour.\n\
-         All contained. No action needed.\n\n\
-         <i>Details in daily briefing.</i>"
-    )
+/// Map a detector / incident kind to a coarse plain-language bucket for the
+/// burst summary. Deterministic and substring-based so kill-chain patterns
+/// (`killchain.reverse_shell`), shield kinds (`shield`), and raw detector
+/// names all collapse to the same ~7 human buckets the operator reads.
+pub(crate) fn burst_category(detector: &str) -> &'static str {
+    let d = detector.to_ascii_lowercase();
+    let has = |needle: &str| d.contains(needle);
+
+    // Order matters: more specific intent before generic.
+    if has("data_exfil") || has("exfiltration") || has("exfil") {
+        "Data-exfiltration attempts"
+    } else if has("container_escape")
+        || has("privesc")
+        || has("privilege_escalation")
+        || has("setns")
+        || has("kernel_module")
+        || has("escape")
+    {
+        "Privilege-escalation / escape"
+    } else if has("reverse_shell")
+        || has("web_shell")
+        || has("exploit_c2")
+        || has("c2_")
+        || has("c2")
+        || has("process_injection")
+        || has("fileless")
+        || has("exploit")
+    {
+        "Exploit / C2 attempts"
+    } else if has("ssh_bruteforce")
+        || has("credential_stuffing")
+        || has("distributed_ssh")
+        || has("brute")
+    {
+        "Password-guessing (brute force)"
+    } else if has("port_scan")
+        || has("web_scan")
+        || has("nmap")
+        || has("wordlist")
+        || has("user_agent_scanner")
+        || has("discovery")
+        || has("scan")
+    {
+        "Scans & probes"
+    } else if has("flood")
+        || has("syn")
+        || has("packet")
+        || has("shield")
+        || has("ddos")
+        || has("rate")
+    {
+        "DDoS / flood"
+    } else {
+        "Other suspicious activity"
+    }
+}
+
+/// Format the burst summary message as well-explained HTML for Telegram.
+///
+/// Names the server, breaks down WHAT kind of attack hit (top categories),
+/// HOW many distinct sources, and reassures (honestly) that everything was
+/// auto-contained. Uses `{total}+` because the summary fires the moment the
+/// count crosses the threshold, not at the final window total.
+pub(crate) fn format_burst_summary(host: &str, s: &BurstSummary) -> String {
+    let mut out = String::with_capacity(512);
+
+    // Header — name the server if we have one.
+    let prefix = if host.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", crate::telegram::escape_html_pub(host))
+    };
+    out.push_str(&format!(
+        "\u{1f6e1}\u{fe0f} <b>{prefix}Under attack \u{2014} auto-contained</b>\n\n"
+    ));
+
+    out.push_str(&format!(
+        "Blocked <b>{}+</b> attack attempts in the last hour \u{2014} all stopped \
+         automatically, nothing got through.\n\n",
+        s.total
+    ));
+
+    // What hit you — only render categories we actually have a count for.
+    if !s.top_categories.is_empty() {
+        out.push_str("<b>What hit you</b>\n");
+        for (cat, n) in &s.top_categories {
+            out.push_str(&format!(
+                "\u{2022} {} \u{2014} {}\n",
+                crate::telegram::escape_html_pub(cat),
+                n
+            ));
+        }
+        if s.distinct_sources > 0 {
+            out.push_str(&format!("From ~{} different IPs.\n", s.distinct_sources));
+        }
+        out.push('\n');
+    }
+
+    out.push_str(
+        "<b>Should you worry?</b> No \u{2014} your defenses caught all of it. This is the \
+         normal background noise of any internet-facing server: automated bots constantly \
+         scan and probe the whole internet; it is almost never aimed at you specifically.\n\n",
+    );
+
+    out.push_str(
+        "You only get this alert when blocks spike past 50/hour. The full list of IPs + \
+         detectors is in the daily briefing.",
+    );
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Host identity resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve the operator-facing "which server" identity for notifications.
+///
+/// Priority order:
+///   (a) first entry of `[agent] tags` (spec-058 per-host tags) if non-empty;
+///   (b) the knowledge-graph system-node label (the hostname);
+///   (c) `/etc/hostname`;
+///   (d) the literal "this server" as a last resort.
+///
+/// Cheap by design — resolve once and store/clone the result; do NOT call it
+/// per-event. The graph label is read under a short read-lock.
+pub(crate) fn resolve_host_id(
+    tags: &[String],
+    graph: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+) -> String {
+    // (a) operator-set asset tag wins (e.g. "env=prod", "web-01").
+    if let Some(first) = tags.iter().find(|t| !t.trim().is_empty()) {
+        return first.trim().to_string();
+    }
+
+    // (b) knowledge-graph system-node label (same source slow_loop uses).
+    if let Ok(g) = graph.read() {
+        if let Some(label) = g
+            .system_node()
+            .and_then(|id| g.get_node(id))
+            .map(|n| n.label())
+        {
+            let label = label.trim();
+            if !label.is_empty() && label != "unknown" {
+                return label.to_string();
+            }
+        }
+    }
+
+    // (c) /etc/hostname, then (d) a friendly fallback.
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "this server".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -466,8 +684,9 @@ where
                 "notification gate: deferred to daily briefing"
             );
             if ctx.is_contained {
-                if let Some(count) = burst_tracker.record_contained() {
-                    let msg = format_burst_summary(count);
+                let category = burst_category(&ctx.detector);
+                if let Some(summary) = burst_tracker.record_contained(category, None) {
+                    let msg = format_burst_summary("", &summary);
                     let tg = tg.clone();
                     tokio::spawn(async move {
                         let _ = tg.send_alert_html(&msg).await;
@@ -663,32 +882,292 @@ mod tests {
     fn burst_tracker_fires_at_threshold() {
         let tracker = BurstTracker::new();
         for _ in 0..49 {
-            assert!(tracker.record_contained().is_none());
+            assert!(tracker
+                .record_contained("DDoS / flood", Some("1.1.1.1"))
+                .is_none());
         }
         // 50th should trigger.
-        let result = tracker.record_contained();
+        let result = tracker.record_contained("DDoS / flood", Some("1.1.1.1"));
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), 50);
+        assert_eq!(result.unwrap().total, 50);
     }
 
     #[test]
     fn burst_tracker_fires_only_once() {
         let tracker = BurstTracker::new();
         for _ in 0..50 {
-            tracker.record_contained();
+            tracker.record_contained("Scans & probes", Some("2.2.2.2"));
         }
-        // Additional records should not fire again.
-        assert!(tracker.record_contained().is_none());
-        assert!(tracker.record_contained().is_none());
+        // Additional records should not fire again (fire-once-per-window).
+        assert!(tracker
+            .record_contained("Scans & probes", Some("2.2.2.2"))
+            .is_none());
+        assert!(tracker
+            .record_contained("Scans & probes", Some("2.2.2.2"))
+            .is_none());
     }
 
     #[test]
     fn burst_tracker_count() {
         let tracker = BurstTracker::new();
-        tracker.record_contained();
-        tracker.record_contained();
-        tracker.record_contained();
+        tracker.record_contained("Scans & probes", None);
+        tracker.record_contained("Scans & probes", None);
+        tracker.record_contained("Scans & probes", None);
         assert_eq!(tracker.count(), 3);
+    }
+
+    /// The whole point of this PR: feeding 50 mixed-category contained
+    /// threats returns a summary whose breakdown is correct — total, the
+    /// top categories sorted by count descending, and distinct sources.
+    #[test]
+    fn burst_tracker_breakdown_is_correct_on_fire() {
+        let tracker = BurstTracker::new();
+        // 30 scans (from 3 IPs), 15 brute force (from 2 IPs), 5 ddos (no IP).
+        // Mixed interleaving so the threshold lands on event 50 regardless.
+        for i in 0..30 {
+            let ip = format!("10.0.0.{}", i % 3); // 3 distinct scan IPs
+            assert!(tracker
+                .record_contained("Scans & probes", Some(&ip))
+                .is_none());
+        }
+        for i in 0..15 {
+            let ip = format!("10.1.1.{}", i % 2); // 2 distinct brute IPs
+            assert!(tracker
+                .record_contained("Password-guessing (brute force)", Some(&ip))
+                .is_none());
+        }
+        // events 46..49 are ddos (no IP), the 50th fires.
+        for _ in 0..4 {
+            assert!(tracker.record_contained("DDoS / flood", None).is_none());
+        }
+        let summary = tracker
+            .record_contained("DDoS / flood", None)
+            .expect("50th contained threat fires the burst summary");
+
+        assert_eq!(summary.total, 50);
+        // Sorted desc by count: scans(30) > brute(15) > ddos(5).
+        assert_eq!(
+            summary.top_categories,
+            vec![
+                ("Scans & probes".to_string(), 30),
+                ("Password-guessing (brute force)".to_string(), 15),
+                ("DDoS / flood".to_string(), 5),
+            ]
+        );
+        // 3 scan IPs + 2 brute IPs = 5 distinct (ddos had no IP).
+        assert_eq!(summary.distinct_sources, 5);
+        // The tracker is host-agnostic; the caller fills host.
+        assert!(summary.host.is_empty());
+
+        // 51st returns None (fire-once-per-window).
+        assert!(tracker.record_contained("DDoS / flood", None).is_none());
+    }
+
+    #[test]
+    fn burst_tracker_top_categories_capped_at_three() {
+        let tracker = BurstTracker::new();
+        // 5 distinct categories, decreasing counts so the order is unambiguous.
+        let plan = [
+            ("Scans & probes", 20),
+            ("DDoS / flood", 15),
+            ("Exploit / C2 attempts", 8),
+            ("Password-guessing (brute force)", 4),
+            ("Other suspicious activity", 3),
+        ];
+        let mut fired = None;
+        for (cat, n) in plan {
+            for _ in 0..n {
+                if let Some(s) = tracker.record_contained(cat, None) {
+                    fired = Some(s);
+                }
+            }
+        }
+        let summary = fired.expect("threshold crossed");
+        // Only the top 3 by count survive.
+        assert_eq!(summary.top_categories.len(), 3);
+        assert_eq!(summary.top_categories[0].0, "Scans & probes");
+        assert_eq!(summary.top_categories[1].0, "DDoS / flood");
+        assert_eq!(summary.top_categories[2].0, "Exploit / C2 attempts");
+    }
+
+    #[test]
+    fn burst_tracker_window_reset_clears_breakdown() {
+        let tracker = BurstTracker::new();
+        for _ in 0..10 {
+            tracker.record_contained("Scans & probes", Some("9.9.9.9"));
+        }
+        assert_eq!(tracker.count(), 10);
+        // Force the window to have started > BURST_WINDOW_SECS ago.
+        {
+            let mut start = tracker.window_start.lock().unwrap();
+            *start = Utc::now() - chrono::Duration::seconds(BURST_WINDOW_SECS + 1);
+        }
+        // Next record sees the expired window, resets count + categories + sources.
+        let _ = tracker.record_contained("DDoS / flood", Some("8.8.8.8"));
+        assert_eq!(tracker.count(), 1);
+        assert_eq!(
+            tracker.categories.lock().unwrap().get("Scans & probes"),
+            None
+        );
+        assert_eq!(
+            tracker.categories.lock().unwrap().get("DDoS / flood"),
+            Some(&1)
+        );
+        assert!(!tracker.sources.lock().unwrap().contains("9.9.9.9"));
+        assert!(tracker.sources.lock().unwrap().contains("8.8.8.8"));
+    }
+
+    // -- burst_category classifier tests --
+
+    #[test]
+    fn burst_category_buckets() {
+        // DDoS / flood
+        assert_eq!(burst_category("packet_flood"), "DDoS / flood");
+        assert_eq!(burst_category("shield"), "DDoS / flood");
+        assert_eq!(burst_category("syn_flood"), "DDoS / flood");
+        assert_eq!(burst_category("ddos"), "DDoS / flood");
+
+        // Password-guessing (brute force)
+        assert_eq!(
+            burst_category("ssh_bruteforce"),
+            "Password-guessing (brute force)"
+        );
+        assert_eq!(
+            burst_category("credential_stuffing"),
+            "Password-guessing (brute force)"
+        );
+        assert_eq!(
+            burst_category("distributed_ssh"),
+            "Password-guessing (brute force)"
+        );
+
+        // Scans & probes
+        assert_eq!(burst_category("port_scan"), "Scans & probes");
+        assert_eq!(burst_category("web_scan"), "Scans & probes");
+        assert_eq!(burst_category("nmap_scan"), "Scans & probes");
+        assert_eq!(burst_category("wordlist_scan"), "Scans & probes");
+        assert_eq!(burst_category("user_agent_scanner"), "Scans & probes");
+
+        // Exploit / C2 attempts (incl. killchain.* patterns)
+        assert_eq!(
+            burst_category("killchain.reverse_shell"),
+            "Exploit / C2 attempts"
+        );
+        assert_eq!(burst_category("web_shell"), "Exploit / C2 attempts");
+        assert_eq!(
+            burst_category("killchain.exploit_c2"),
+            "Exploit / C2 attempts"
+        );
+        assert_eq!(burst_category("process_injection"), "Exploit / C2 attempts");
+        assert_eq!(burst_category("fileless"), "Exploit / C2 attempts");
+
+        // Data-exfiltration attempts (must win over the generic c2/exploit bucket)
+        assert_eq!(
+            burst_category("killchain.data_exfil"),
+            "Data-exfiltration attempts"
+        );
+        assert_eq!(
+            burst_category("data_exfiltration"),
+            "Data-exfiltration attempts"
+        );
+
+        // Privilege-escalation / escape
+        assert_eq!(
+            burst_category("container_escape"),
+            "Privilege-escalation / escape"
+        );
+        assert_eq!(burst_category("privesc"), "Privilege-escalation / escape");
+        assert_eq!(
+            burst_category("setns_owner"),
+            "Privilege-escalation / escape"
+        );
+        assert_eq!(
+            burst_category("kernel_module_load"),
+            "Privilege-escalation / escape"
+        );
+
+        // Default bucket
+        assert_eq!(burst_category("honeypot"), "Other suspicious activity");
+        assert_eq!(burst_category("something_new"), "Other suspicious activity");
+    }
+
+    #[test]
+    fn burst_category_is_deterministic_and_case_insensitive() {
+        assert_eq!(burst_category("PORT_SCAN"), burst_category("port_scan"));
+        assert_eq!(
+            burst_category("KillChain.Reverse_Shell"),
+            "Exploit / C2 attempts"
+        );
+    }
+
+    // -- format_burst_summary tests --
+
+    fn sample_summary(host: &str) -> BurstSummary {
+        BurstSummary {
+            host: host.to_string(),
+            total: 50,
+            top_categories: vec![
+                ("Scans & probes".to_string(), 30),
+                ("Password-guessing (brute force)".to_string(), 15),
+                ("DDoS / flood".to_string(), 5),
+            ],
+            distinct_sources: 12,
+        }
+    }
+
+    #[test]
+    fn format_burst_summary_renders_host_total_categories_and_sources() {
+        let s = sample_summary("web-01");
+        let msg = format_burst_summary("web-01", &s);
+
+        // Host prefix present in the header.
+        assert!(msg.contains("[web-01] Under attack"), "msg was: {msg}");
+        // {total}+ (honest — fires at the threshold, not the final total).
+        assert!(msg.contains("<b>50+</b>"), "msg was: {msg}");
+        // Each category line with its count.
+        assert!(msg.contains("\u{2022} Scans &amp; probes \u{2014} 30"));
+        assert!(msg.contains("\u{2022} Password-guessing (brute force) \u{2014} 15"));
+        assert!(msg.contains("\u{2022} DDoS / flood \u{2014} 5"));
+        // Source count.
+        assert!(msg.contains("From ~12 different IPs."));
+        // Reassurance section present.
+        assert!(msg.contains("<b>Should you worry?</b> No"));
+    }
+
+    #[test]
+    fn format_burst_summary_escapes_host_html() {
+        let s = sample_summary("<b>evil</b>&host");
+        let msg = format_burst_summary("<b>evil</b>&host", &s);
+        // The raw host markup must be escaped, never injected as live HTML.
+        assert!(
+            msg.contains("[&lt;b&gt;evil&lt;/b&gt;&amp;host]"),
+            "msg was: {msg}"
+        );
+        assert!(!msg.contains("[<b>evil</b>&host]"));
+    }
+
+    #[test]
+    fn format_burst_summary_empty_host_omits_prefix() {
+        let s = sample_summary("");
+        let msg = format_burst_summary("", &s);
+        // No leading "[...] " bracket when host is unknown.
+        assert!(
+            msg.starts_with("\u{1f6e1}\u{fe0f} <b>Under attack"),
+            "msg was: {msg}"
+        );
+        assert!(!msg.contains("[] "));
+    }
+
+    #[test]
+    fn format_burst_summary_renders_only_present_categories() {
+        let mut s = sample_summary("h");
+        s.top_categories = vec![("DDoS / flood".to_string(), 50)];
+        s.distinct_sources = 0;
+        let msg = format_burst_summary("h", &s);
+        assert!(msg.contains("\u{2022} DDoS / flood \u{2014} 50"));
+        assert!(!msg.contains("Scans &amp; probes"));
+        // distinct_sources == 0 -> no "From ~N IPs" line.
+        assert!(!msg.contains("different IPs"));
     }
 
     // -- NotificationContext builder tests --

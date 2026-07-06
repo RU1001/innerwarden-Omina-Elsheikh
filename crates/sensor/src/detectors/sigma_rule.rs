@@ -46,6 +46,8 @@ pub struct SigmaRule {
     pub level: Severity,
     /// Field matchers: field_name → (modifier, value).
     pub selection: Vec<FieldMatcher>,
+    /// Exclusion matchers (`selection and not filter` in Sigma YAML).
+    pub filter: Vec<FieldMatcher>,
     pub tags: Vec<String>,
 }
 
@@ -188,6 +190,12 @@ impl SigmaRuleDetector {
 
             // Check if ALL field matchers match (AND condition)
             if rule.selection.iter().all(|m| matches_field(event, m)) {
+                // Sigma `selection and not filter`: when every filter matcher
+                // hits, the rule must not fire (e.g. allowlisted metadata clients).
+                if !rule.filter.is_empty() && rule.filter.iter().all(|m| matches_field(event, m)) {
+                    continue;
+                }
+
                 self.alerted.insert(rule.id.clone(), now);
 
                 let mut tags = vec!["sigma".to_string()];
@@ -559,21 +567,20 @@ fn parse_sigma_yaml(content: &str) -> Option<SigmaRule> {
     }
 
     // Build the final selection based on condition
-    // Merge all selection* sections (OR between selections, AND within each)
-    // For "selection and not filter": use selection, ignore filter (conservative)
+    // Merge all selection* sections (OR between selections, AND within each).
     let mut selection: Vec<FieldMatcher> = Vec::new();
+    let mut filter: Vec<FieldMatcher> = Vec::new();
 
     if sections.contains_key("selection") && sections.len() == 1 {
-        // Simple case: single selection
+        // Simple case: single selection block only
         selection = sections.remove("selection").unwrap_or_default();
     } else {
-        // Multiple selections or complex conditions
-        // Strategy: merge all selection* fields as OR (any match triggers)
-        // This is conservative — may generate more alerts than intended
-        // but never misses a true positive
+        // Multiple selections or selection + filter blocks
         for (name, matchers) in &sections {
             if name.starts_with("selection") {
                 selection.extend(matchers.iter().cloned());
+            } else if name.starts_with("filter") {
+                filter.extend(matchers.iter().cloned());
             }
         }
     }
@@ -587,6 +594,7 @@ fn parse_sigma_yaml(content: &str) -> Option<SigmaRule> {
         title,
         level,
         selection,
+        filter,
         tags,
     })
 }
@@ -606,6 +614,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                 op: MatchOp::Contains,
                 values: vec!["crontab".into(), "cron".into()],
             }],
+            filter: vec![],
             tags: vec!["persistence".into(), "t1053".into()],
         },
         SigmaRule {
@@ -624,6 +633,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                     values: vec!["created".into(), "new service".into()],
                 },
             ],
+            filter: vec![],
             tags: vec!["persistence".into(), "t1543".into()],
         },
         SigmaRule {
@@ -642,6 +652,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                     values: vec!["authorized_keys".into()],
                 },
             ],
+            filter: vec![],
             tags: vec!["persistence".into(), "t1098".into()],
         },
         SigmaRule {
@@ -660,6 +671,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                     values: vec!["/etc/shadow".into()],
                 },
             ],
+            filter: vec![],
             tags: vec!["credential_access".into(), "t1003".into()],
         },
         SigmaRule {
@@ -678,6 +690,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                     values: vec!["/tmp/".into(), "/dev/shm/".into(), "/var/tmp/".into()],
                 },
             ],
+            filter: vec![],
             tags: vec!["execution".into(), "defense_evasion".into(), "t1059".into()],
         },
         SigmaRule {
@@ -696,6 +709,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                     values: vec!["loaded".into(), "insmod".into(), "modprobe".into()],
                 },
             ],
+            filter: vec![],
             tags: vec!["persistence".into(), "rootkit".into(), "t1547".into()],
         },
         SigmaRule {
@@ -714,6 +728,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                     values: vec!["file.write".into()],
                 },
             ],
+            filter: vec![],
             tags: vec!["privilege_escalation".into(), "t1548".into()],
         },
         SigmaRule {
@@ -725,6 +740,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                 op: MatchOp::Contains,
                 values: vec!["docker.sock".into()],
             }],
+            filter: vec![],
             tags: vec![
                 "privilege_escalation".into(),
                 "container".into(),
@@ -763,6 +779,7 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                     ],
                 },
             ],
+            filter: vec![],
             tags: vec![
                 "initial_access".into(),
                 "exploitation".into(),
@@ -780,6 +797,11 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Rule id from `rules/sigma/network/lnx_imds_access_from_non_metadata_client.yml`.
+    const IMDS_RULE_ID: &str = "86157017-c2b1-4d4a-8c33-93b8e67e4af4";
+    const IMDS_IPV4: &str = "169.254.169.254";
 
     fn make_event(kind: &str, source: &str, summary: &str) -> Event {
         Event {
@@ -903,6 +925,90 @@ mod tests {
             "GET /index.html Mozilla/5.0",
         );
         assert!(det.process(&ev).is_none(), "benign request must not match");
+    }
+
+    /// Path to the repo's Sigma rules (relative to this crate's `Cargo.toml`).
+    fn sigma_rules_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/sigma")
+    }
+
+    /// Build a synthetic outbound-connect event matching the eBPF collector shape.
+    fn imds_connect_event(comm: &str, dst_ip: &str) -> Event {
+        make_event_with_details(
+            "network.outbound_connect",
+            serde_json::json!({
+                "pid": 1234,
+                "uid": 1000,
+                "comm": comm,
+                "dst_ip": dst_ip,
+                "dst_port": 80,
+            }),
+        )
+    }
+
+    /// Load disk rules plus built-in fallbacks (same as production).
+    fn imds_detector() -> SigmaRuleDetector {
+        SigmaRuleDetector::new("test", &sigma_rules_dir(), 300)
+    }
+
+    /// True when this incident came from our IMDS Sigma rule (not some other rule).
+    fn is_imds_rule_incident(inc: &Incident) -> bool {
+        inc.incident_id
+            .starts_with(&format!("sigma:{IMDS_RULE_ID}:"))
+    }
+
+    #[test]
+    fn sigma_matches_imds_access_from_non_metadata_client() {
+        // Positive case: curl (or any non-allowlisted comm) → metadata IP should alert.
+        let mut det = imds_detector();
+        let ev = imds_connect_event("curl", IMDS_IPV4);
+
+        let inc = det
+            .process(&ev)
+            .expect("curl connecting to IMDS must match a Sigma rule");
+        assert!(
+            is_imds_rule_incident(&inc),
+            "expected IMDS rule {}, got incident_id={}",
+            IMDS_RULE_ID,
+            inc.incident_id
+        );
+        assert_eq!(inc.severity, Severity::Medium);
+        assert!(inc.title.contains("IMDS"));
+    }
+
+    #[test]
+    fn sigma_no_match_imds_access_from_metadata_client() {
+        // Allowlisted metadata clients must not trigger the IMDS rule.
+        let allowlisted = [
+            "cloud-init",
+            "ec2-metadata-collector",
+            "instance-controller",
+            "gcp-metadata-server",
+            "azure-metadata-monitor",
+        ];
+
+        for comm in allowlisted {
+            let mut det = imds_detector();
+            let ev = imds_connect_event(comm, IMDS_IPV4);
+            let inc = det.process(&ev);
+            assert!(
+                inc.as_ref().is_none_or(|i| !is_imds_rule_incident(i)),
+                "allowlisted comm {comm:?} must not fire IMDS rule"
+            );
+        }
+    }
+
+    #[test]
+    fn sigma_no_match_imds_access_to_non_metadata_ip() {
+        // Wrong destination IP — even a suspicious comm should not match IMDS rule.
+        let mut det = imds_detector();
+        let ev = imds_connect_event("curl", "8.8.8.8");
+
+        let inc = det.process(&ev);
+        assert!(
+            inc.as_ref().is_none_or(|i| !is_imds_rule_incident(i)),
+            "non-IMDS destination must not fire IMDS rule"
+        );
     }
 
     #[test]

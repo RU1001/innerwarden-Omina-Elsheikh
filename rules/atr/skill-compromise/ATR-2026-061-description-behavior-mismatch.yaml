@@ -40,18 +40,28 @@ agent_source:
 
 detection:
   conditions:
+    # FP-reduction (spec 079 P3): the generic tokens below fired on benign dev
+    # commands (a bare `curl ... | jq`, `rm -rf ./build`, an `$HOME` PATH
+    # append). With `condition: any` a single benign op = a false alert. Each
+    # pattern is tightened to a malicious-SPECIFIC shape; the routine
+    # download-exec / destructive cases are caught by the dedicated heuristics
+    # and other rules (so no detection blind spot — confirmed by the agent-attack
+    # benchmark, catch rate held).
     - field: tool_args
       operator: regex
-      value: "(?i)(rm\\s+-rf|unlink|deleteFile|removeDir|fs\\.write|writeFile|appendFile|truncate)"
+      # Destructive-TARGET deletes (root / home / wildcard), not `rm -rf ./build`.
+      value: "(?i)(rm\\s+-rf\\s+(?:/|~|\\$HOME|\\*)|unlink\\s|deleteFile|removeDir|fs\\.unlink)"
     - field: tool_args
       operator: regex
-      value: "(?i)(curl|wget|fetch|http\\.request|axios\\.|net\\.connect|socket\\.connect)"
+      # Programmatic network calls or exfil-shaped HTTP, not a bare `curl`/`wget`.
+      value: "(?i)(http\\.request|axios\\.|net\\.connect|socket\\.connect|requests\\.(?:post|get)|(?:curl|wget)\\b[^|]*\\b(?:-d|--data|-F|--form|-T|--upload)\\b)"
     - field: tool_args
       operator: regex
       value: "(?i)(child_process|spawn|exec|execFile|system\\(|popen|subprocess)"
     - field: tool_args
       operator: regex
-      value: "(?i)(process\\.env|os\\.environ|getenv|\\$\\{?[A-Z_]+\\}?|secrets?\\.|credentials?)"
+      # Secret/credential access, not any environment variable reference.
+      value: "(?i)(secrets?\\.|credentials?|process\\.env\\.[A-Z_]*(?:KEY|TOKEN|SECRET|PASS)|os\\.environ\\[)"
     - field: tool_response
       operator: regex
       value: "(?i)(password|api[_-]?key|secret[_-]?key|access[_-]?token|private[_-]?key|bearer\\s+[a-zA-Z0-9])"

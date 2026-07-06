@@ -187,6 +187,18 @@ impl OutboundAnomalyDetector {
             return None;
         }
 
+        // Cloud-platform guest-agent gate (NON-IP). The platform's own agents
+        // (Azure waagent, AWS SSM/cloud-init, GCP/OCI agents) poll the control
+        // plane (WireServer/IMDS) often enough to trip connection_flood. They
+        // are recognised by non-forgeable /proc lineage (see
+        // `crate::cloud_platform`), gated on a detected cloud VM + uid 0.
+        // Downgrade-only: an untrusted process flooding still fires. On Azure
+        // waagent alone produced 1034 connection_flood incidents to WireServer
+        // (prod audit 2026-06-26).
+        if crate::cloud_platform::is_guest_agent(pid, uid as u32) {
+            return None;
+        }
+
         let now = event.ts;
         let flood_cutoff = now - self.flood_window;
         let spray_cutoff = now - self.spray_window;

@@ -22,6 +22,12 @@
 //! 3. `shred_burst`: exec of `shred` with the `-u` flag (deletes after
 //!    overwrite) AND 3+ target paths.
 //!
+//! 3b. `find_delete_bulk`: exec of `find <user-data-path> ... -delete` with no
+//!    name/path/regex filter. The GuardFall class-E destructive tool a
+//!    `rm`-watching text blocklist misses; the sensor catches it on the REAL
+//!    post-shell-rewrite argv the kernel exec'd. Filtered cleanups
+//!    (`find . -name '*.tmp' -delete`), `/tmp`, and build-cache dirs stay silent.
+//!
 //! 4. `mkfs_on_running_volume`: exec of `mkfs.*` against a block device
 //!    (`/dev/sd*`, `/dev/nvme*`, `/dev/xvd*`, `/dev/mapper/*`). Always
 //!    suspicious post-boot since legit filesystem creation happens
@@ -230,6 +236,10 @@ impl DataDestructionPatternDetector {
                 Some(t) => ("shred_burst", t),
                 None => return None,
             },
+            "find" => match detect_find_delete(&argv) {
+                Some(t) => ("find_delete_bulk", t),
+                None => return None,
+            },
             "cryptsetup" => match detect_luksformat(&argv) {
                 Some(t) => ("cryptsetup_luksformat", t),
                 None => return None,
@@ -371,6 +381,75 @@ fn detect_rm_rf_user_data(argv: &[String]) -> Option<String> {
     None
 }
 
+/// `find <path> -delete` is the GuardFall class-E destructive tool a text
+/// blocklist watching for `rm` misses, but the sensor sees the REAL argv the
+/// kernel exec'd (post shell-rewrite: `r''m`, `$IFS`, `$(...)` are already
+/// resolved by the time execve fires), so it is caught here regardless of how
+/// the command was obfuscated in the shell.
+///
+/// Fires only on an UNFILTERED bulk delete under a user-data prefix. A
+/// name/path/regex filter (`find . -name '*.tmp' -delete`) is the ubiquitous
+/// targeted cleanup and stays silent, as do build-cache dirs, `/tmp`, and
+/// package-manager scratch space - the same target discrimination the `rm -rf`
+/// path uses. The parent process is deliberately NOT the discriminator: a
+/// malicious `make test` that wipes `/home/user` fires, while a legit `make
+/// clean` that deletes `target/` is silenced by the build-cache exclusion.
+fn detect_find_delete(argv: &[String]) -> Option<String> {
+    let mut has_delete = false;
+    let mut has_name_filter = false;
+    let mut paths: Vec<&String> = Vec::new();
+    let mut in_expression = false;
+    for a in argv.iter().skip(1) {
+        if a == "-delete" {
+            has_delete = true;
+            in_expression = true;
+            continue;
+        }
+        // A name/path/regex predicate makes this a targeted cleanup, not an
+        // indiscriminate bulk wipe. (`-type`/`-mtime` restrict but do not
+        // target by name, so they do NOT exempt.)
+        if matches!(
+            a.as_str(),
+            "-name" | "-iname" | "-path" | "-ipath" | "-regex" | "-iregex" | "-wholename"
+        ) {
+            has_name_filter = true;
+            in_expression = true;
+            continue;
+        }
+        if a.starts_with('-') {
+            // Any other predicate (-type, -mtime, -exec, ...) begins the
+            // expression; nothing after it is a starting path.
+            in_expression = true;
+            continue;
+        }
+        // A non-flag token before the expression is a find starting path.
+        if !in_expression {
+            paths.push(a);
+        }
+    }
+    if !has_delete || has_name_filter {
+        return None;
+    }
+    for t in &paths {
+        if RM_SAFE_EXACT_PATHS.iter().any(|p| t.starts_with(p)) {
+            continue;
+        }
+        if path_has_build_cache_segment(t) {
+            continue;
+        }
+        if is_pkg_manager_state_path(t) {
+            continue;
+        }
+        if USER_DATA_PATH_PREFIXES.iter().any(|p| t.starts_with(p)) {
+            return Some(t.to_string());
+        }
+        if *t == "/" || *t == "/*" {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
 fn detect_disk_wipe(argv: &[String]) -> Option<String> {
     let mut input_is_zero_or_random = false;
     let mut output_block_dev: Option<String> = None;
@@ -453,6 +532,7 @@ fn mitre_ids(sub_kind: &str) -> Vec<&'static str> {
         "rm_rf_user_data" => vec!["T1485"],
         "disk_wipe" => vec!["T1561.001"],
         "shred_burst" => vec!["T1485"],
+        "find_delete_bulk" => vec!["T1485"],
         "mkfs_on_running_volume" => vec!["T1561.001"],
         "cryptsetup_luksformat" => vec!["T1486", "T1561.001"],
         _ => vec!["T1485"],
@@ -492,6 +572,90 @@ mod tests {
         let ev = exec_event(&["rm", "-rf", "/home/ubuntu/work"], "bash");
         let inc = det.process(&ev).expect("should fire");
         assert_eq!(inc.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn fires_on_unfiltered_find_delete_under_user_data() {
+        let mut det = DataDestructionPatternDetector::new("test");
+        // GuardFall class-E: a rm-watching blocklist misses find -delete.
+        let ev = exec_event(
+            &["find", "/home/ubuntu/work", "-type", "f", "-delete"],
+            "bash",
+        );
+        let inc = det.process(&ev).expect("should fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("find_delete_bulk"));
+    }
+
+    #[test]
+    fn find_delete_silent_on_filtered_cleanup_and_safe_targets() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // The ubiquitous filtered cleanup - a name filter means targeted, not bulk.
+        assert_eq!(
+            detect_find_delete(&s(&["find", ".", "-name", "*.tmp", "-delete"])),
+            None
+        );
+        assert_eq!(
+            detect_find_delete(&s(&[
+                "find",
+                "/home/me/logs",
+                "-path",
+                "*/cache/*",
+                "-delete"
+            ])),
+            None
+        );
+        // /tmp and build caches stay silent (same target discrimination as rm -rf).
+        assert_eq!(
+            detect_find_delete(&s(&["find", "/tmp/scratch", "-delete"])),
+            None
+        );
+        assert_eq!(
+            detect_find_delete(&s(&["find", "/home/me/project/target", "-delete"])),
+            None
+        );
+        // No -delete at all = a plain search, not destruction.
+        assert_eq!(
+            detect_find_delete(&s(&["find", "/home/me", "-type", "f"])),
+            None
+        );
+    }
+
+    #[test]
+    fn find_delete_fires_on_bulk_user_data() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            detect_find_delete(&s(&["find", "/home/ubuntu/docs", "-type", "f", "-delete"])),
+            Some("/home/ubuntu/docs".to_string())
+        );
+        // Unfiltered delete from filesystem root.
+        assert_eq!(
+            detect_find_delete(&s(&["find", "/", "-delete"])),
+            Some("/".to_string())
+        );
+    }
+
+    /// The runtime layer is inherently GuardFall-resistant: whatever shell
+    /// obfuscation the agent used (`r''m -rf /home/user`, `rm$IFS-rf$IFS...`,
+    /// `$(echo rm) -rf ...`), the kernel exec'd the REAL, already-resolved argv,
+    /// which is exactly what the eBPF collector puts in `argv`. So the detector
+    /// fires on the real command the static text-check would have been fooled by.
+    #[test]
+    fn fires_on_guardfall_rewritten_command_real_argv() {
+        let mut det = DataDestructionPatternDetector::new("test");
+        // What the kernel/eBPF sees after the shell resolved `r''m -rf ...`.
+        let ev = exec_event(&["rm", "-rf", "/home/user/data"], "make");
+        assert!(
+            det.process(&ev).is_some(),
+            "runtime must catch the post-rewrite real command regardless of shell obfuscation"
+        );
+        // And the malicious-repo vector: make spawns an unfiltered find -delete.
+        let mut det2 = DataDestructionPatternDetector::new("test");
+        let ev2 = exec_event(&["find", "/home/user", "-type", "f", "-delete"], "make");
+        assert!(
+            det2.process(&ev2).is_some(),
+            "make-spawned bulk delete must fire"
+        );
     }
 
     #[test]

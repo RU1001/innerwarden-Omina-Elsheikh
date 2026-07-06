@@ -22,7 +22,7 @@
 // (an explicit `compile_error!` macro cannot observe the state of
 // another cfg-gated item without producing the same duplicate-lang
 // error first).
-#[cfg(all(not(target_os = "macos"), not(feature = "dhat-heap")))]
+#[cfg(all(target_os = "linux", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -50,9 +50,9 @@ static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
 //   between "dirty" and "returned to the OS"). Matching the dirty
 //   interval gives a single predictable decay window.
 //
-// Linux-only; the macOS build uses the system allocator so this
-// symbol is not needed there.
-#[cfg(all(not(target_os = "macos"), not(test)))]
+// Linux-only; the macOS and Windows builds use the system allocator so
+// this symbol is not needed there.
+#[cfg(all(target_os = "linux", not(test)))]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]
 pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
@@ -61,6 +61,7 @@ mod abuseipdb;
 mod abuseipdb_report_budget;
 mod agent_context;
 mod agent_discovery;
+mod agent_registry_reconcile;
 mod ai;
 mod allowlist;
 mod attacker_intel;
@@ -89,9 +90,15 @@ mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
 mod detector_catalog;
+mod discord;
 mod dna_inline;
+mod dns_guard_export;
+mod dns_guard_ingest;
 mod dshield;
 mod environment_profile;
+mod execution_gate_arm;
+mod execution_gate_aya;
+mod execution_gate_monitor;
 mod firmware_tick;
 mod fleet;
 mod forensics;
@@ -132,6 +139,7 @@ mod knowledge_graph;
 mod learned_suppression;
 mod loops;
 mod lsm_policy;
+mod managed_agent_guard;
 mod mesh;
 mod mitre;
 mod narrative;
@@ -148,10 +156,13 @@ mod needs_review_timeout;
     clippy::needless_range_loop
 )]
 mod neural_lifecycle;
+mod notification_channels;
 mod notification_gate;
 mod notification_pipeline;
 mod observation_verify;
 mod operator_actions;
+mod operator_exec_trust;
+mod operator_trust;
 mod orphan_recovery;
 mod pcap_capture;
 mod playbook_engine;
@@ -180,6 +191,7 @@ mod task_group;
 mod telegram;
 mod telemetry;
 mod telemetry_tick;
+mod tenancy;
 mod text_util;
 mod threat_feeds;
 mod threat_report;
@@ -469,6 +481,18 @@ impl NarrativeAccumulator {
     }
 }
 
+/// A queued UI setting change from a Telegram Settings button, applied by the
+/// main loop (which owns `cfg`). Lets those buttons actuate at runtime instead
+/// of printing a "run on server" CLI hint.
+#[derive(Debug, Clone)]
+pub(crate) enum SettingChange {
+    /// Operator profile: `true` = simple (lay), `false` = technical. Flips alert
+    /// language + re-registers the profile-scoped command menu.
+    Profile(bool),
+    /// Alert sensitivity for the bot channel: `"quiet" | "normal" | "verbose"`.
+    Sensitivity(String),
+}
+
 struct AgentState {
     skill_registry: skills::SkillRegistry,
     blocklist: skills::Blocklist,
@@ -545,6 +569,8 @@ struct AgentState {
     geoip_client: Option<geoip::GeoIpClient>,
     /// Slack client for incident notifications (None when disabled).
     slack_client: Option<slack::SlackClient>,
+    /// Discord client for incident notifications (None when disabled).
+    discord_client: Option<discord::DiscordClient>,
     /// Cloudflare integration client (None when disabled).
     cloudflare_client: Option<cloudflare::CloudflareClient>,
     /// Circuit breaker: when tripped by a high-volume incident burst, AI analysis
@@ -567,6 +593,15 @@ struct AgentState {
     /// XDP blocklist entries with timestamps and per-IP TTL for adaptive expiration.
     /// Periodically cleaned: IPs older than their individual TTL are removed.
     xdp_block_times: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)>,
+    /// Per-IP exponential backoff for XDP cleanup that keeps failing for a
+    /// NON-transient reason (e.g. the agent lacks sudo/privilege to run
+    /// `bpftool map delete`, so every tick's retry is futile). Value is
+    /// `(consecutive_failures, next_retry_at)`. Without this, a single stuck
+    /// entry re-spawns `sudo bpftool` every slow-loop tick forever — observed
+    /// on a non-root deploy as 44k failed sudo-auths + 44k WARN lines in 7
+    /// days. Runtime-only (not persisted); a fresh boot retries immediately,
+    /// which is correct because privilege may have been granted since.
+    xdp_cleanup_backoff: HashMap<String, (u32, chrono::DateTime<chrono::Utc>)>,
     /// Unified response lifecycle: tracks all active responses (block IP, container,
     /// nginx, sudo) with TTL, auto-revert, manual revert, and Prometheus metrics.
     response_lifecycle: response_lifecycle::ResponseLifecycle,
@@ -645,6 +680,24 @@ struct AgentState {
     /// Spec 076 phase 2 — last block-enforcement reconcile tick (re-applies
     /// firewall rules that silently dropped while their record stayed Active).
     last_block_enforcement_reconcile: std::time::Instant,
+    /// Spec 081 follow-up — last agent-guard registry reconcile tick. Throttles
+    /// the slow-loop auto-registration / dead-pid pruning of co-located AI agents
+    /// (see `agent_registry_reconcile`) to ~5 min so the response-side verifier's
+    /// `by_pid` hint survives agent restarts without a per-tick `/proc` scan.
+    last_agent_registry_reconcile: std::time::Instant,
+    /// One-shot signal from the Telegram `/mode` command (set deep in the
+    /// command handler, which only has `&mut state`) up to the main loop, which
+    /// owns `cfg`, applies the change via `agent_context::apply_guardian_mode`,
+    /// then persists it to agent.toml. Kept as a signal (not a separate
+    /// override) so the mutated `cfg` stays the single source of truth for every
+    /// `cfg.responder.*` enforcement read, with no per-site threading and no gap.
+    pending_mode_change: Option<telegram::GuardianMode>,
+    /// One-shot signals from the Telegram Settings buttons (profile / alert
+    /// sensitivity) up to the main loop, same pattern as `pending_mode_change`:
+    /// the handler only has `&mut state`, the loop owns `cfg`, applies +
+    /// persists, and re-registers the command menu when the profile flips. This
+    /// is what makes those buttons ACTUATE instead of printing a CLI hint.
+    pending_setting_changes: Vec<SettingChange>,
     /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
     /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
     dynamic_trusted_ips: Vec<String>,
@@ -668,6 +721,16 @@ struct AgentState {
     latest_anomaly_score: Option<f32>,
     /// Two-factor authentication state (pending actions, brute force protection).
     two_factor_state: two_factor::TwoFactorState,
+    /// Issue #71: shared map bridging the agent loop and dashboard 2FA endpoints.
+    /// Populated by `decision_confirmation.rs` when a pending confirmation is created;
+    /// the dashboard `/api/2fa/pending` handler reads from it.
+    dashboard_pending: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::telegram::PendingConfirmation>>,
+    >,
+    /// Issue #71: receives approve/deny outcomes from the dashboard 2FA endpoints.
+    /// Drained at the start of every incident tick, parallel to `approval_rx`.
+    dashboard_approval_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::dashboard::state::DashboardApprovalOutcome>>,
     /// Knowledge graph — in-memory directed graph for attack context (shared with dashboard).
     knowledge_graph: std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
     /// Graph-based detector state (cooldowns).
@@ -690,6 +753,14 @@ struct AgentState {
     /// running until the process exits, same as before. The group
     /// becomes load-bearing the moment the signal handler lands.
     task_group: task_group::TaskGroup,
+    /// Spec 081 — managed-agent coexistence. The SAME live agent-guard registry
+    /// the dashboard mutates via `agent connect` (shared `Arc`), so the
+    /// response-side `managed_agent_guard` verifier consulted in the slow-loop
+    /// (kernel PID-block + userspace IP-block paths) sees operator-vouched
+    /// agents the instant they connect. Plus a shared signature index for the
+    /// live cmdline re-ID step.
+    agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>>,
+    signature_index: Arc<innerwarden_agent_guard::signatures::SignatureIndex>,
 }
 
 /// Tracks a deferred honeypot-or-block decision waiting for operator input via Telegram.
@@ -830,6 +901,7 @@ async fn run_playbook_replay(cli: Cli) -> Result<()> {
     // cloud ranges, which are lazily populated by this init (the live agent
     // does it at boot).
     crate::cloud_safelist::init();
+    crate::cloud_safelist::init_operator_self_infra(&cfg.allowlist.self_infra_ips);
 
     let rules_dir = std::path::Path::new(&cfg.playbooks.rules_dir);
     let playbooks = playbook_engine::load_dir(rules_dir).unwrap_or_else(|e| {

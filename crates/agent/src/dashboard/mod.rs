@@ -14,6 +14,7 @@ use types::*;
 
 mod actions;
 mod agent_api;
+pub(crate) mod agent_guard_incident;
 mod audit_export_csv;
 mod audit_export_signing;
 mod auth;
@@ -35,6 +36,7 @@ mod sensors;
 mod sse;
 mod still_active_now;
 mod threat_contract;
+mod two_fa;
 
 #[cfg(test)]
 mod consistency_block_counts;
@@ -69,6 +71,8 @@ use push::*;
 use sensors::*;
 #[allow(unused_imports)]
 use sse::*;
+#[allow(unused_imports)]
+use two_fa::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -104,6 +108,44 @@ use innerwarden_core::audit::{append_admin_action, AdminActionEntry};
 use innerwarden_core::entities::{EntityRef, EntityType};
 use innerwarden_core::event::Severity;
 use innerwarden_core::incident::Incident;
+
+// ---------------------------------------------------------------------------
+// Live "Needs review" count for the Daily Security Briefing
+// ---------------------------------------------------------------------------
+
+/// The number of open cases that still need an operator decision RIGHT NOW,
+/// computed from the SAME canonical source the dashboard "Needs review" tile
+/// reads (`data_api::compute_overview_counts_from_sqlite`, whose
+/// `attention_count` is the per-attacker `KpiBucket::Attention` aggregate /
+/// `case_metrics::KpiBucket::Attention -> NeedsReview`).
+///
+/// The daily briefing MUST use this, not
+/// `grouping_engine.drain_digest_stats().needs_review_groups` — that is a
+/// transient per-window group counter drained on every send, so it diverges
+/// from the live dashboard number (e.g. a Low/Medium `needs_review` incident
+/// auto-dismissed by the spec-062 24h timeout is still counted by the grouped
+/// counter but has already dropped out of the live `attention_count`). Reading
+/// the live source at send time means the briefing can never tell the operator
+/// to "review N items" that the dashboard shows as zero.
+///
+/// `date` is the local-day key (`%Y-%m-%d`) the briefing is for; the function
+/// returns 0 on any store/query error so a transient SQLite hiccup degrades to
+/// the honest "nothing needs you" rather than a fabricated number.
+pub(crate) fn live_needs_review_count(store: &innerwarden_store::Store, date: &str) -> usize {
+    let now = chrono::Utc::now();
+    data_api::compute_overview_counts_from_sqlite(
+        store,
+        date,
+        0,    // sev_min_rank: no severity floor — count every open case
+        None, // detector_substring: all detectors
+        None, // hour_filter: the whole day
+        now,
+        &data_api::DegradedSignals::default(),
+        std::path::Path::new(""), // data_dir: unused for the attention tally
+    )
+    .map(|c| c.attention_count)
+    .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // Security headers middleware
@@ -410,6 +452,9 @@ pub async fn serve(
     max_sessions: usize,
     advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>>,
     rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
+    // Spec 081: shared agent-guard registry (also held by the main agent loop's
+    // response gate) so `agent connect` mutations are visible to the verifier.
+    agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>>,
     agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
     deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
     knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
@@ -424,11 +469,28 @@ pub async fn serve(
     insecure_no_tls: bool,
     two_factor: state::TwoFactorSettings,
     playbook_sim: state::PlaybookSimContext,
+    // Issue #71: shared pending map (bridge between agent loop and dashboard).
+    pending_approvals: Arc<Mutex<HashMap<String, crate::telegram::PendingConfirmation>>>,
+    // Issue #71: channel to notify the agent loop of approve/deny outcomes.
+    approval_outcome_tx: tokio::sync::mpsc::Sender<state::DashboardApprovalOutcome>,
 ) -> Result<()> {
     // SEC-005: Reject non-loopback bind without authentication.
     let is_loopback_bind = is_loopback_address(&bind);
     if let Err(e) = validate_bind_auth(&bind, auth.is_some()) {
         anyhow::bail!("{}", e);
+    }
+    // SEC: plain HTTP (`--insecure-no-tls`) leaks credentials + data in
+    // cleartext. `validate_bind_auth` already blocks a non-loopback bind with no
+    // auth, but plain HTTP on a public interface is unacceptable even WITH auth
+    // (the Basic-Auth header crosses the wire in the clear). Refuse to start
+    // rather than just warn — a warning is not enough for a security product to
+    // expose itself unencrypted on a public interface.
+    if reject_insecure_public_bind(&bind, insecure_no_tls) {
+        anyhow::bail!(
+            "refusing to serve the dashboard over plain HTTP (--insecure-no-tls) on the \
+             non-loopback bind {bind}: use --tls-cert/--tls-key, bind to 127.0.0.1, or \
+             remove --insecure-no-tls"
+        );
     }
     if auth.is_none() && is_loopback_bind {
         warn!(
@@ -501,35 +563,14 @@ pub async fn serve(
         session_timeout_minutes,
         max_sessions,
         advisory_cache: advisory_cache.clone(),
-        // 2026-05-18: rehydrate the agent-guard registry from the
-        // on-disk snapshot so `agent connect` survives an agent
-        // restart. The watchdog dance from #681 swaps the agent
-        // binary every deploy; before persistence the registry came
-        // back empty and the operator had to re-run `innerwarden
-        // agent connect` after every release. A missing snapshot
-        // (clean install) returns an empty registry — not an error.
-        // A corrupt snapshot is surfaced as a warning and we fall
-        // back to empty so the dashboard still starts.
-        agent_registry: Arc::new(tokio::sync::Mutex::new({
-            let snapshot_path = data_dir.join("agent-guard-registry.json");
-            match innerwarden_agent_guard::registry::Registry::restore_from(&snapshot_path) {
-                Ok(reg) => {
-                    if reg.count_total() > 0 {
-                        info!(
-                            path = %snapshot_path.display(),
-                            agents = reg.count_agents(),
-                            tools = reg.count_tools(),
-                            "agent-guard registry restored from snapshot",
-                        );
-                    }
-                    reg
-                }
-                Err(e) => {
-                    warn!(error = %e, path = %snapshot_path.display(), "failed to restore agent-guard registry; starting empty");
-                    innerwarden_agent_guard::registry::Registry::new()
-                }
-            }
-        })),
+        // 2026-05-18 + spec 081: the agent-guard registry is now built ONCE in
+        // `loops::boot` (rehydrated from the on-disk snapshot so `agent connect`
+        // survives a watchdog binary swap) and the SAME `Arc<Mutex<Registry>>`
+        // is shared between this dashboard and the main agent loop's
+        // `managed_agent_guard` response gate. The dashboard receives it as a
+        // parameter rather than restoring its own copy, so a connect made via
+        // the dashboard API is immediately visible to the response gate.
+        agent_registry,
         rule_engine,
         agent_alert_tx,
         deep_security,
@@ -542,6 +583,8 @@ pub async fn serve(
         fleet_state,
         two_factor: Arc::new(two_factor),
         playbook_sim: Arc::new(playbook_sim),
+        pending_approvals,
+        approval_outcome_tx: Some(approval_outcome_tx),
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -552,6 +595,8 @@ pub async fn serve(
         ),
         require_auth,
     );
+    // Issue #71: clone before `state` is moved into the router builders below.
+    let cleanup_pending_approvals = state.pending_approvals.clone();
     let activity_state = state.last_activity.clone();
     let activity_layer = middleware::from_fn(move |req: Request<Body>, next: Next| {
         let ts = activity_state.clone();
@@ -702,6 +747,16 @@ pub async fn serve(
         // operator-action decision rows the read path classifies.
         .route("/api/action/unblock-ip", post(api_action_unblock_ip))
         .route("/api/action/triage-case", post(api_action_triage_case))
+        // Operator "Trust IP" — monitor-only allowlist (still detected/logged/
+        // notified, only auto-block suppressed). add / remove / list.
+        .route("/api/action/trust-ip", post(api_action_trust_ip))
+        .route("/api/action/untrust-ip", post(api_action_untrust_ip))
+        .route("/api/action/trusted-ips", get(api_action_trusted_ips))
+        // Execution Gate operator "Trust Exec" — authorise a binary path (2FA-
+        // gated). Writes an allow_exec rule the paid watch daemon hot-reloads.
+        .route("/api/action/trust-exec", post(api_action_trust_exec))
+        .route("/api/action/untrust-exec", post(api_action_untrust_exec))
+        .route("/api/action/trusted-execs", get(api_action_trusted_execs))
         // 2026-05-01 (`tracked-spec-ai-override`): operator
         // overrides AI decisions / re-opens dismissed incidents /
         // labels decisions for retraining. Audit-only for v1.
@@ -777,6 +832,10 @@ pub async fn serve(
             "/api/push/subscribe",
             post(api_push_subscribe).delete(api_push_unsubscribe),
         )
+        // Issue #71: Dashboard 2FA approval endpoints
+        .route("/api/2fa/pending", get(api_2fa_pending))
+        .route("/api/2fa/approve/:approval_id", post(api_2fa_approve))
+        .route("/api/2fa/deny/:approval_id", post(api_2fa_deny))
         // Session management endpoints (auth-protected)
         .route("/api/auth/logout", post(api_auth_logout))
         .route("/api/auth/sessions", get(api_auth_sessions))
@@ -855,7 +914,7 @@ pub async fn serve(
         }
     });
 
-    // Session + advisory cleanup: remove expired entries every 60 seconds
+    // Session + advisory + pending-approval cleanup: remove expired entries every 60 seconds
     let cleanup_sessions = sessions;
     let cleanup_timeout = session_timeout_minutes;
     let cleanup_advisory_cache = advisory_cache.clone();
@@ -869,6 +928,15 @@ pub async fn serve(
             if let Ok(mut cache) = cleanup_advisory_cache.write() {
                 let cutoff = Utc::now() - chrono::Duration::hours(1);
                 cache.retain(|e| e.ts > cutoff);
+            }
+            // Issue #71: evict expired 2FA approval requests so the map
+            // does not grow unbounded when the operator never acts on them.
+            {
+                let now = Utc::now();
+                let mut approvals = cleanup_pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                approvals.retain(|_, pc| pc.expires_at > now);
             }
         }
     });
@@ -1169,6 +1237,14 @@ pub(crate) fn validate_bind_auth(bind: &str, has_auth: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// SEC: true when the dashboard would serve plain HTTP (`--insecure-no-tls`) on
+/// a non-loopback bind — which leaks Basic-Auth credentials + data in cleartext
+/// over a public interface, even when auth is configured. The caller refuses to
+/// start in that case.
+pub(crate) fn reject_insecure_public_bind(bind: &str, insecure_no_tls: bool) -> bool {
+    insecure_no_tls && !is_loopback_address(bind)
+}
+
 /// SEC-013: Compute TLS certificate expiry date (year, month, day).
 pub(crate) fn cert_expiry_ymd(days_valid: i64) -> (i32, u8, u8) {
     let expiry = chrono::Utc::now() + chrono::Duration::days(days_valid);
@@ -1194,6 +1270,21 @@ pub(crate) fn cert_expiry_ymd(days_valid: i64) -> (i32, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SEC: plain HTTP is rejected on a public bind (even with auth), allowed on loopback.
+    #[test]
+    fn insecure_plain_http_rejected_on_public_bind() {
+        assert!(reject_insecure_public_bind("0.0.0.0:8787", true));
+        assert!(reject_insecure_public_bind("192.168.0.10:8787", true));
+        assert!(reject_insecure_public_bind("[::]:8787", true));
+        // loopback plain HTTP is fine (local dev)
+        assert!(!reject_insecure_public_bind("127.0.0.1:8787", true));
+        assert!(!reject_insecure_public_bind("[::1]:8787", true));
+        assert!(!reject_insecure_public_bind("localhost:8787", true));
+        // TLS path (insecure_no_tls=false) never rejected here regardless of bind
+        assert!(!reject_insecure_public_bind("0.0.0.0:8787", false));
+    }
+
     use crate::telemetry::TelemetrySnapshot;
     use argon2::password_hash::SaltString;
     use argon2::PasswordHasher;
@@ -3669,6 +3760,7 @@ mod tests {
             events_by_collector: BTreeMap::new(),
             incidents_by_detector: BTreeMap::new(),
             gate_pass_count: 1,
+            incidents_by_tenant: Default::default(),
             ai_sent_count: 1,
             ai_decision_count: 1,
             avg_decision_latency_ms: 120.0,
@@ -7103,6 +7195,9 @@ mod tests {
             16,
             Arc::new(RwLock::new(VecDeque::new())),
             Arc::new(innerwarden_agent_guard::rules::RuleEngine::empty()),
+            Arc::new(tokio::sync::Mutex::new(
+                innerwarden_agent_guard::registry::Registry::new(),
+            )),
             agent_alert_tx,
             Arc::new(RwLock::new(DeepSecuritySnapshot::default())),
             Arc::new(std::sync::RwLock::new(
@@ -7119,6 +7214,8 @@ mod tests {
             true,
             state::TwoFactorSettings::default(),
             state::PlaybookSimContext::default(),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tokio::sync::mpsc::channel::<state::DashboardApprovalOutcome>(1).0,
         )
         .await;
 

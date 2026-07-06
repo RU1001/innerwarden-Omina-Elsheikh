@@ -204,6 +204,37 @@ impl Store {
         Ok(results)
     }
 
+    /// Events of a given `kind` recorded at or after `since_ts_iso` (RFC3339;
+    /// lexicographic `>=`, the same convention as the other ts queries). Used by
+    /// the Execution Gate rehearsal to count `lsm.exec_gate_would_block` events
+    /// for a cgroup over a recent window before flipping to enforce. Uses the
+    /// `idx_events_kind` index.
+    pub fn events_by_kind_since(
+        &self,
+        kind: &str,
+        since_ts_iso: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, Event)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, data FROM events WHERE kind = ?1 AND ts >= ?2 ORDER BY ts LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![kind, since_ts_iso, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            let (id, data) = row?;
+            match serde_json::from_str::<Event>(&data) {
+                Ok(event) => results.push((id, event)),
+                Err(e) => {
+                    tracing::warn!(id, error = %e, "skipping malformed event row");
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Count total events.
     pub fn events_count(&self) -> Result<u64> {
         let conn = self.conn()?;
@@ -329,6 +360,34 @@ mod tests {
         let events = store.events_since(id1, 100).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1.kind, "port_scan");
+    }
+
+    #[test]
+    fn events_by_kind_since_filters_kind_and_window() {
+        let store = Store::open_memory().unwrap();
+        // a recent would-block for cgroup 9772
+        let mut wb = sample_event("lsm.exec_gate_would_block");
+        wb.details = serde_json::json!({"cgroup_id": 9772u64, "filename": "/tmp/x"});
+        store.insert_event(&wb).unwrap();
+        // a different kind — excluded
+        store.insert_event(&sample_event("ssh_bruteforce")).unwrap();
+        // an OLD would-block — excluded by the window
+        let mut old = sample_event("lsm.exec_gate_would_block");
+        old.ts = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.insert_event(&old).unwrap();
+
+        let got = store
+            .events_by_kind_since(
+                "lsm.exec_gate_would_block",
+                "2025-01-01T00:00:00+00:00",
+                100,
+            )
+            .unwrap();
+        assert_eq!(got.len(), 1, "only the recent would-block of that kind");
+        assert_eq!(got[0].1.details["cgroup_id"], 9772);
+        assert_eq!(got[0].1.details["filename"], "/tmp/x");
     }
 
     #[test]

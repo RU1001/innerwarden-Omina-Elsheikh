@@ -16,6 +16,15 @@ pub struct PidChainState {
     pub last_seen: DateTime<Utc>,
     pub last_connect_ip: Option<String>,
     pub last_connect_port: Option<u16>,
+    /// The most recent sensitive file path that set the `CHAIN_SENSITIVE_READ`
+    /// flag (e.g. `/etc/shadow`, `/home/lab/.env`). Surfaced into the DATA_EXFIL
+    /// incident evidence as `sensitive_file` so the spec-081 managed-agent
+    /// verifier can apply its OWN-CONFIG gate on the kernel-block path, exactly
+    /// like the userspace IP-block path already does. Without it the kernel path
+    /// could only verify identity, never WHAT was read — a subverted-but-genuine
+    /// managed agent reading `/etc/shadow` would wrongly buy the execve-deny
+    /// exemption. `None` until a sensitive read is observed.
+    pub last_sensitive_read_path: Option<String>,
     /// Track which pre-chain alerts have been emitted (to avoid duplicates)
     pub emitted_pre_chain: Vec<String>,
     /// Track which full-match alerts have been emitted
@@ -45,6 +54,7 @@ impl PidChainState {
             last_seen: ts,
             last_connect_ip: None,
             last_connect_port: None,
+            last_sensitive_read_path: None,
             emitted_pre_chain: Vec::new(),
             emitted_full_match: Vec::new(),
         }

@@ -221,6 +221,12 @@ const TRUSTED_OWNER_PREFIXES: &[&str] = &[
     "ntfs-3g",
     "bubblewrap", // /usr/bin/bwrap
     "uidmap",     // /usr/bin/newuidmap, newgidmap (rootless containers)
+    // 2026-06-14: mount helpers that ship a SUID-root binary on a clean
+    // install. Observed on an Azure host where cifs-utils' /usr/sbin/mount.cifs
+    // raised a medium false positive — it is a packaged mount helper, not an
+    // attacker-planted SUID (a planted binary would not be dpkg-owned).
+    "cifs-utils",     // /usr/sbin/mount.cifs
+    "ecryptfs-utils", // /usr/bin/mount.ecryptfs_private
 ];
 
 /// Returns true when `dpkg-query -S` reports the path as owned by a
@@ -238,7 +244,43 @@ const TRUSTED_OWNER_PREFIXES: &[&str] = &[
 /// Splitting on the first ':' isolates the package name in every
 /// case because arch suffixes always appear AFTER the package name
 /// and BEFORE the path separator.
+///
+/// Queries both the given path AND its usrmerge alias. `find /usr -perm -4000`
+/// reports canonical paths (`/usr/sbin/mount.cifs`), but some packages still
+/// record the pre-merge alias in their dpkg file list (cifs-utils ships
+/// `/sbin/mount.cifs`). Without the alias retry, the dpkg lookup misses and a
+/// perfectly normal packaged SUID helper is reported as anomalous.
 fn is_owned_by_trusted_package(env: &impl HardenEnv, path: &str) -> bool {
+    if dpkg_owner_is_trusted(env, path) {
+        return true;
+    }
+    if let Some(alias) = usrmerge_alias(path) {
+        if dpkg_owner_is_trusted(env, &alias) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Toggle the `/usr` prefix for usrmerge-aliased paths so a dpkg lookup
+/// succeeds whether dpkg recorded the canonical (`/usr/sbin/x`) or the
+/// pre-merge alias (`/sbin/x`). Returns `None` for paths outside the
+/// merged directories (nothing to toggle).
+fn usrmerge_alias(path: &str) -> Option<String> {
+    const MERGED: [&str; 4] = ["/sbin/", "/bin/", "/lib/", "/lib64/"];
+    if let Some(rest) = path.strip_prefix("/usr") {
+        if MERGED.iter().any(|d| rest.starts_with(d)) {
+            return Some(rest.to_string()); // /usr/sbin/x -> /sbin/x
+        }
+    }
+    if MERGED.iter().any(|d| path.starts_with(d)) {
+        return Some(format!("/usr{path}")); // /sbin/x -> /usr/sbin/x
+    }
+    None
+}
+
+/// Single-path dpkg ownership check against [`TRUSTED_OWNER_PREFIXES`].
+fn dpkg_owner_is_trusted(env: &impl HardenEnv, path: &str) -> bool {
     let Some(raw) = env.command_stdout("dpkg-query", &["-S", path]) else {
         return false;
     };
@@ -344,6 +386,29 @@ mod tests {
         // what gets matched, not the binary path.
         let env = MockEnv::new().with_dpkg("/usr/bin/sudo.ws", Some("sudo: /usr/bin/sudo.ws"));
         assert!(is_owned_by_trusted_package(&env, "/usr/bin/sudo.ws"));
+    }
+
+    #[test]
+    fn trusted_owner_matches_cifs_utils_via_usrmerge_alias() {
+        // 2026-06-14: the exact Azure repro. `find` reports the canonical
+        // /usr/sbin/mount.cifs, but cifs-utils records /sbin/mount.cifs in its
+        // dpkg file list, so a direct lookup on the canonical path MISSES.
+        // The usrmerge-alias retry must still resolve it as trusted.
+        let env = MockEnv::new()
+            .with_dpkg("/usr/sbin/mount.cifs", None) // canonical: dpkg "no path found"
+            .with_dpkg("/sbin/mount.cifs", Some("cifs-utils: /sbin/mount.cifs"));
+        assert!(is_owned_by_trusted_package(&env, "/usr/sbin/mount.cifs"));
+    }
+
+    #[test]
+    fn usrmerge_alias_toggles_usr_prefix_both_ways() {
+        assert_eq!(usrmerge_alias("/usr/sbin/x").as_deref(), Some("/sbin/x"));
+        assert_eq!(usrmerge_alias("/usr/bin/x").as_deref(), Some("/bin/x"));
+        assert_eq!(usrmerge_alias("/sbin/x").as_deref(), Some("/usr/sbin/x"));
+        assert_eq!(usrmerge_alias("/lib/x").as_deref(), Some("/usr/lib/x"));
+        // Non-merged paths have no alias.
+        assert_eq!(usrmerge_alias("/opt/x"), None);
+        assert_eq!(usrmerge_alias("/usr/local/sbin/x"), None);
     }
 
     #[test]

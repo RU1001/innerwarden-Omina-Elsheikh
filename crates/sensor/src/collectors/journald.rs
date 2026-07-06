@@ -38,7 +38,7 @@ impl JournaldCollector {
         // Verify journalctl is available AND the current user can read the journal.
         // Using `-n 0` actually queries the journal (unlike --version which is always ok).
         let check = Command::new("journalctl")
-            .args(["-n", "0", "--output=json"])
+            .args(journalctl_check_args())
             .output()
             .await;
         match check {
@@ -67,16 +67,8 @@ impl JournaldCollector {
                 .arg("--output=json")
                 .stdout(std::process::Stdio::piped());
 
-            // Resume from cursor or tail-only (no history on first run)
-            if let Some(ref c) = current_cursor {
-                cmd.arg(format!("--after-cursor={c}"));
-            } else {
-                cmd.arg("-n").arg("0");
-            }
-
-            // Filter to specific systemd units
-            for unit in &self.units {
-                cmd.arg("-t").arg(unit);
+            for arg in journalctl_follow_args(current_cursor.as_deref(), &self.units) {
+                cmd.arg(arg);
             }
 
             let mut child = cmd.spawn()?;
@@ -88,23 +80,16 @@ impl JournaldCollector {
                     result = lines.next_line() => {
                         match result {
                             Ok(Some(line)) => {
-                                // parse_journal_line now always returns the cursor when JSON is
-                                // valid, so we never need to re-parse just to advance the cursor.
-                                match parse_journal_line(&line, &self.host) {
-                                    Some((cursor, Some(event))) => {
-                                        current_cursor = Some(cursor.clone());
-                                        *shared_cursor.lock().unwrap() = Some(cursor);
-                                        if tx.send(event).await.is_err() {
-                                            let _ = child.kill().await;
-                                            return Ok(());
-                                        }
+                                let parsed = parse_journal_line(&line, &self.host);
+                                if let Some(event) = handle_parsed_journal_line(
+                                    parsed,
+                                    &mut current_cursor,
+                                    &shared_cursor,
+                                ) {
+                                    if tx.send(event).await.is_err() {
+                                        let _ = child.kill().await;
+                                        return Ok(());
                                     }
-                                    Some((cursor, None)) => {
-                                        // Valid JSON but not an event we care about - still advance cursor
-                                        current_cursor = Some(cursor.clone());
-                                        *shared_cursor.lock().unwrap() = Some(cursor);
-                                    }
-                                    None => {} // Malformed JSON - skip
                                 }
                             }
                             Ok(None) => break, // journalctl exited
@@ -132,6 +117,46 @@ impl JournaldCollector {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Command helpers
+// ---------------------------------------------------------------------------
+
+/// Args for the availability check: queries the journal without following.
+pub(crate) fn journalctl_check_args() -> &'static [&'static str] {
+    &["-n", "0", "--output=json"]
+}
+
+/// Args appended after `journalctl --follow --output=json`.
+/// Resumes from `cursor` when present; otherwise tails from now (`-n 0`).
+/// One `-t <unit>` flag is appended for each unit.
+pub(crate) fn journalctl_follow_args(cursor: Option<&str>, units: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(c) = cursor {
+        args.push(format!("--after-cursor={c}"));
+    } else {
+        args.push("-n".to_string());
+        args.push("0".to_string());
+    }
+    for unit in units {
+        args.push("-t".to_string());
+        args.push(unit.clone());
+    }
+    args
+}
+
+/// Advances both cursor fields and returns any event to emit.
+/// `None` parse result (malformed JSON) is a no-op.
+pub(crate) fn handle_parsed_journal_line(
+    parsed: Option<(String, Option<Event>)>,
+    current_cursor: &mut Option<String>,
+    shared_cursor: &Mutex<Option<String>>,
+) -> Option<Event> {
+    let (cursor, event) = parsed?;
+    *current_cursor = Some(cursor.clone());
+    *shared_cursor.lock().unwrap() = Some(cursor);
+    event
 }
 
 // ---------------------------------------------------------------------------
@@ -473,5 +498,93 @@ mod tests {
         let (_, ev) = parse_journal_line(&line, "host").unwrap();
         let ev = ev.unwrap();
         assert_eq!(ev.entities.len(), 1); // should only have one entity since SRC == DST
+    }
+
+    // --- journalctl_check_args ---
+
+    #[test]
+    fn check_args_are_correct() {
+        let args = journalctl_check_args();
+        assert_eq!(args, &["-n", "0", "--output=json"]);
+    }
+
+    // --- journalctl_follow_args ---
+
+    #[test]
+    fn follow_args_no_cursor_no_units() {
+        // Without a cursor we tail from now: -n 0
+        let args = journalctl_follow_args(None, &[]);
+        assert_eq!(args, vec!["-n", "0"]);
+    }
+
+    #[test]
+    fn follow_args_with_cursor_no_units() {
+        // With a cursor we resume from that position
+        let args = journalctl_follow_args(Some("s=abc;i=1"), &[]);
+        assert_eq!(args, vec!["--after-cursor=s=abc;i=1"]);
+    }
+
+    #[test]
+    fn follow_args_no_cursor_with_units() {
+        let units = vec!["sshd".to_string(), "sudo".to_string()];
+        let args = journalctl_follow_args(None, &units);
+        assert_eq!(args, vec!["-n", "0", "-t", "sshd", "-t", "sudo"]);
+    }
+
+    #[test]
+    fn follow_args_with_cursor_and_units() {
+        let units = vec!["kernel".to_string()];
+        let args = journalctl_follow_args(Some("s=xyz;i=9"), &units);
+        assert_eq!(args, vec!["--after-cursor=s=xyz;i=9", "-t", "kernel"]);
+    }
+
+    // --- handle_parsed_journal_line ---
+
+    #[test]
+    fn handle_malformed_json_is_noop() {
+        let mut cursor: Option<String> = None;
+        let shared = Mutex::new(None::<String>);
+        let result = handle_parsed_journal_line(None, &mut cursor, &shared);
+        assert!(result.is_none());
+        assert!(cursor.is_none());
+        assert!(shared.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn handle_valid_no_event_advances_cursor() {
+        // Valid JSON for an identifier we don't care about: cursor advances, no event
+        let mut cursor: Option<String> = None;
+        let shared = Mutex::new(None::<String>);
+        let parsed = Some(("cur-1".to_string(), None));
+        let result = handle_parsed_journal_line(parsed, &mut cursor, &shared);
+        assert!(result.is_none());
+        assert_eq!(cursor.as_deref(), Some("cur-1"));
+        assert_eq!(shared.lock().unwrap().as_deref(), Some("cur-1"));
+    }
+
+    #[test]
+    fn handle_valid_with_event_advances_cursor_and_returns_event() {
+        use chrono::Utc;
+        use innerwarden_core::event::Severity;
+
+        let mut cursor: Option<String> = None;
+        let shared = Mutex::new(None::<String>);
+        let event = Event {
+            ts: Utc::now(),
+            host: "h".to_string(),
+            source: "journald".to_string(),
+            kind: "ssh.login_failed".to_string(),
+            severity: Severity::Info,
+            summary: "test".to_string(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+        let parsed = Some(("cur-2".to_string(), Some(event)));
+        let result = handle_parsed_journal_line(parsed, &mut cursor, &shared);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().kind, "ssh.login_failed");
+        assert_eq!(cursor.as_deref(), Some("cur-2"));
+        assert_eq!(shared.lock().unwrap().as_deref(), Some("cur-2"));
     }
 }

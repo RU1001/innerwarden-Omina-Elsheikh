@@ -11,6 +11,31 @@ use tracing::{info, warn};
 
 use super::auth_log::parse_sshd_message;
 
+/// Whether the host `log` binary is the real macOS unified-logging tool that
+/// can stream. `spawned` is whether `log --help` executed at all; `help_output`
+/// is its combined stdout+stderr. We check for the `stream` subcommand rather
+/// than the exit code because Apple's `log` returns 64 for usage output
+/// (finding F10: the old `log version` gate exited 64 and wrongly disabled the
+/// collector on every macOS).
+fn log_tool_usable(spawned: bool, help_output: &str) -> bool {
+    spawned && help_output.contains("stream")
+}
+
+/// Decide usability from the `log --help` probe result: map a spawn error to
+/// "unusable", otherwise combine stdout+stderr and check for the `stream`
+/// subcommand (ignoring the exit code, since Apple's `log` exits 64 for usage).
+/// Pure over the injected `Output` so the probe branch is unit-tested.
+fn probe_says_usable(probe: &std::io::Result<std::process::Output>) -> bool {
+    match probe {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            log_tool_usable(true, &text)
+        }
+        Err(_) => log_tool_usable(false, ""),
+    }
+}
+
 pub struct MacosLogCollector {
     host: String,
 }
@@ -23,18 +48,19 @@ impl MacosLogCollector {
     /// Stream macOS system log events via `log stream`.
     /// Parses SSH and sudo events from the output.
     pub async fn run(self, tx: mpsc::Sender<Event>) -> Result<()> {
-        // Check if `log` binary is available
-        let check = Command::new("log").arg("version").output().await;
-        match check {
-            Err(_) => {
-                warn!("log binary not found - macos_log collector disabled");
-                return Ok(());
-            }
-            Ok(out) if !out.status.success() => {
-                warn!("log version check failed - macos_log collector disabled");
-                return Ok(());
-            }
-            _ => {}
+        // Confirm the host `log` binary is the real macOS unified-logging tool.
+        //
+        // The old probe ran `log version`, but `version` is NOT a valid
+        // subcommand (`log: Unknown subcommand 'version'`, exit 64), so the
+        // check ALWAYS failed and this collector disabled itself on every
+        // modern macOS (2026-07-01 finding F10 — the sensor's primary macOS
+        // log source never ran). `log --help` ALSO exits 64 (Apple returns 64
+        // for usage), so we must ignore the exit code entirely and instead
+        // confirm the usage output advertises the `stream` subcommand we need.
+        let probe = Command::new("log").arg("--help").output().await;
+        if !probe_says_usable(&probe) {
+            warn!("macOS `log` tool unavailable (no `stream` subcommand) - macos_log collector disabled");
+            return Ok(());
         }
 
         info!(host = %self.host, "macos_log collector starting");
@@ -177,6 +203,50 @@ fn field_after<'a>(s: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F10 anchor (2026-07-01): the availability probe must accept the real
+    /// Apple `log` usage output (which advertises `stream`) EVEN THOUGH `log`
+    /// exits 64 for `--help`. The old `log version` gate keyed on the exit code
+    /// and disabled the collector on every modern macOS.
+    #[test]
+    fn log_tool_usable_accepts_apple_log_usage_output() {
+        // Trimmed real `log --help` output — note it has no zero exit but does
+        // list the `stream` subcommand.
+        let usage = "usage:\n    log <command>\ncommands:\n    show\n    stream\n    stats\n";
+        assert!(log_tool_usable(true, usage));
+    }
+
+    #[test]
+    fn log_tool_usable_rejects_missing_binary_or_foreign_tool() {
+        // Binary did not spawn at all.
+        assert!(!log_tool_usable(false, ""));
+        // Some other `log` on PATH that has no `stream` subcommand.
+        assert!(!log_tool_usable(true, "usage: log [--rotate] <file>\n"));
+    }
+
+    #[test]
+    fn probe_says_usable_maps_output_and_spawn_error() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+        // Real Apple `log --help`: nonzero exit (64) but usage advertises stream.
+        let apple = Ok(Output {
+            status: ExitStatus::from_raw(64 << 8),
+            stdout: b"usage:\n    log <command>\n    stream\n".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert!(probe_says_usable(&apple));
+        // Foreign `log` with no stream subcommand.
+        let foreign = Ok(Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"usage: log [--rotate]\n".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert!(!probe_says_usable(&foreign));
+        // Binary absent → spawn error.
+        let missing: std::io::Result<Output> =
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!probe_says_usable(&missing));
+    }
 
     #[test]
     fn line_with_sshd_is_recognized() {

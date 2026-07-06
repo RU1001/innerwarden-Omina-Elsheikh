@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -207,9 +208,50 @@ pub fn find_asset<'a>(release: &'a GithubRelease, name: &str) -> Option<&'a Gith
     release.assets.iter().find(|a| a.name == name)
 }
 
-/// Download `url` to `dest`, return bytes written.
-/// Prints a simple dot-progress indicator to stdout.
+/// How many times to attempt a release-asset download before giving up, and the
+/// pause between attempts.
+const DOWNLOAD_ATTEMPTS: u32 = 4;
+const DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+/// Retry `op` up to `attempts` times, sleeping `delay` between failures.
+///
+/// Right after a release, GitHub's asset CDN intermittently fails individual
+/// asset / sidecar (`.sha256`, `.sig`) downloads while it propagates the new
+/// release — and the old abort-on-first-failure made `innerwarden upgrade`
+/// brittle in exactly that window (observed deploying 0.15.22: two consecutive
+/// runs each failed on a different sidecar). Retrying the per-asset fetch rides
+/// out the propagation/transient blip. Pure over its inputs (no network, no
+/// global state) so the policy is unit-tested with a counter closure + zero delay.
+fn with_retry<T, F>(attempts: u32, delay: Duration, mut op: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    let attempts = attempts.max(1);
+    let mut last_err: Option<anyhow::Error> = None;
+    for i in 0..attempts {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_err = Some(e);
+                if i + 1 < attempts {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("retry: no attempts made")))
+}
+
+/// Download `url` to `dest`, return bytes written. Retries transient failures
+/// (each attempt re-creates `dest`, so a partial download is never kept).
 pub fn download(url: &str, dest: &Path) -> Result<u64> {
+    with_retry(DOWNLOAD_ATTEMPTS, DOWNLOAD_RETRY_DELAY, || {
+        download_once(url, dest)
+    })
+}
+
+/// One download attempt: stream `url` into a freshly-created `dest`.
+fn download_once(url: &str, dest: &Path) -> Result<u64> {
     let resp = github_get(url).call().context("download request failed")?;
 
     let mut reader = resp.into_body().into_reader();
@@ -233,26 +275,29 @@ pub fn download(url: &str, dest: &Path) -> Result<u64> {
 }
 
 /// Download a `.sha256` sidecar file and return the expected hex hash (first token).
+/// Retries transient CDN failures (the common post-release flake).
 pub fn fetch_expected_hash(url: &str) -> Result<String> {
-    let resp = github_get(url)
-        .call()
-        .context("sha256 sidecar download failed")?;
-    let text = resp
-        .into_body()
-        .read_to_string()
-        .context("sha256 sidecar is not UTF-8")?;
-    let hash = text
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("sha256 sidecar file is empty"))?
-        .to_ascii_lowercase();
-    if hash.len() != 64 {
-        bail!(
-            "sha256 sidecar has unexpected format (got {} chars, want 64)",
-            hash.len()
-        );
-    }
-    Ok(hash)
+    with_retry(DOWNLOAD_ATTEMPTS, DOWNLOAD_RETRY_DELAY, || {
+        let resp = github_get(url)
+            .call()
+            .context("sha256 sidecar download failed")?;
+        let text = resp
+            .into_body()
+            .read_to_string()
+            .context("sha256 sidecar is not UTF-8")?;
+        let hash = text
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("sha256 sidecar file is empty"))?
+            .to_ascii_lowercase();
+        if hash.len() != 64 {
+            bail!(
+                "sha256 sidecar has unexpected format (got {} chars, want 64)",
+                hash.len()
+            );
+        }
+        Ok(hash)
+    })
 }
 
 /// Compute SHA-256 of a local file and return lowercase hex.
@@ -263,19 +308,22 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 }
 
 /// Download a `.sig` sidecar file and return the base64-encoded signature string.
+/// Retries transient CDN failures (the common post-release flake).
 pub fn fetch_signature(url: &str) -> Result<String> {
-    let resp = github_get(url)
-        .call()
-        .context("signature sidecar download failed")?;
-    let text = resp
-        .into_body()
-        .read_to_string()
-        .context("signature sidecar is not UTF-8")?;
-    let sig = text.trim().to_string();
-    if sig.is_empty() {
-        bail!("signature sidecar file is empty");
-    }
-    Ok(sig)
+    with_retry(DOWNLOAD_ATTEMPTS, DOWNLOAD_RETRY_DELAY, || {
+        let resp = github_get(url)
+            .call()
+            .context("signature sidecar download failed")?;
+        let text = resp
+            .into_body()
+            .read_to_string()
+            .context("signature sidecar is not UTF-8")?;
+        let sig = text.trim().to_string();
+        if sig.is_empty() {
+            bail!("signature sidecar file is empty");
+        }
+        Ok(sig)
+    })
 }
 
 /// Verify Ed25519 signature of binary bytes.
@@ -400,6 +448,103 @@ mod tests {
     fn is_newer_detects_patch() {
         assert!(is_newer("0.1.0", "0.1.1"));
         assert!(is_newer("0.1.0", "v0.1.1"));
+    }
+
+    /// Minimal one-shot HTTP/1.1 server: serves `body` to the first connection,
+    /// returns its base URL. Lets the download/sidecar paths run end-to-end
+    /// without the network (covers download_once + the fetch_* bodies).
+    fn serve_once(body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = [0u8; 1024];
+                let _ = stream.read(&mut req);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn download_streams_body_to_dest() {
+        let url = serve_once("the-binary-bytes");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.bin");
+        let n = download(&url, &dest).unwrap();
+        assert_eq!(n, "the-binary-bytes".len() as u64);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "the-binary-bytes");
+    }
+
+    #[test]
+    fn fetch_expected_hash_returns_first_token() {
+        let hash = "a".repeat(64);
+        let body: &'static str =
+            Box::leak(format!("{hash}  innerwarden-sensor-linux-x86_64\n").into_boxed_str());
+        let url = serve_once(body);
+        assert_eq!(fetch_expected_hash(&url).unwrap(), hash);
+    }
+
+    #[test]
+    fn fetch_signature_returns_trimmed_body() {
+        let url = serve_once("c2lnbmF0dXJlLWJhc2U2NA==\n");
+        assert_eq!(fetch_signature(&url).unwrap(), "c2lnbmF0dXJlLWJhc2U2NA==");
+    }
+
+    #[test]
+    fn with_retry_succeeds_on_first_try_without_sleeping() {
+        let mut calls = 0;
+        let r: Result<u32> = with_retry(4, Duration::ZERO, || {
+            calls += 1;
+            Ok(7)
+        });
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(calls, 1, "a success must not retry");
+    }
+
+    #[test]
+    fn with_retry_recovers_after_transient_failures() {
+        // Mirrors the post-release CDN flake: fail twice, succeed on the third.
+        let mut calls = 0;
+        let r: Result<&str> = with_retry(4, Duration::ZERO, || {
+            calls += 1;
+            if calls < 3 {
+                anyhow::bail!("sha256 sidecar download failed")
+            } else {
+                Ok("ok")
+            }
+        });
+        assert_eq!(r.unwrap(), "ok");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn with_retry_gives_up_after_attempts_and_returns_last_error() {
+        let mut calls = 0;
+        let r: Result<()> = with_retry(3, Duration::ZERO, || {
+            calls += 1;
+            anyhow::bail!("attempt {calls} failed")
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 3, "must try exactly `attempts` times then give up");
+        assert!(r.unwrap_err().to_string().contains("attempt 3 failed"));
+    }
+
+    #[test]
+    fn with_retry_floors_attempts_at_one() {
+        let mut calls = 0;
+        let _: Result<()> = with_retry(0, Duration::ZERO, || {
+            calls += 1;
+            anyhow::bail!("x")
+        });
+        assert_eq!(calls, 1, "attempts=0 still runs once");
     }
 
     #[test]

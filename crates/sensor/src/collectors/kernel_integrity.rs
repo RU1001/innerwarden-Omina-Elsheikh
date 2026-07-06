@@ -290,32 +290,41 @@ fn new_module_post_boot_event(
 
 /// Read key syscall addresses from /proc/kallsyms.
 fn read_kallsyms() -> HashMap<String, String> {
-    let content = match std::fs::read_to_string("/proc/kallsyms") {
-        Ok(c) => c,
+    let file = match std::fs::File::open("/proc/kallsyms") {
+        Ok(f) => f,
         Err(e) => {
             warn!("kernel_integrity: cannot read /proc/kallsyms: {e}");
             return HashMap::new();
         }
     };
-
-    parse_kallsyms(&content)
+    read_kallsyms_from(std::io::BufReader::new(file))
 }
 
-fn parse_kallsyms(content: &str) -> HashMap<String, String> {
+/// Stream a kallsyms source line by line, keeping only the monitored syscalls.
+/// /proc/kallsyms is 200k+ lines / several MB but only a handful of entries are
+/// wanted, so this never holds the whole file in memory. Generic over the
+/// reader so the streaming path is unit-testable without touching /proc.
+fn read_kallsyms_from<R: std::io::BufRead>(reader: R) -> HashMap<String, String> {
     let mut syscalls = HashMap::new();
-    for line in content.lines() {
-        // Format: address type name
-        let parts: Vec<&str> = line.splitn(3, ' ').collect();
-        if parts.len() >= 3 {
-            let addr = parts[0];
-            let name = parts[2].split('\t').next().unwrap_or(parts[2]);
-            if MONITORED_SYSCALLS.contains(&name) {
-                syscalls.insert(name.to_string(), addr.to_string());
-            }
-        }
+    for line in reader.lines().map_while(Result::ok) {
+        parse_kallsyms_line(&line, &mut syscalls);
     }
-
     syscalls
+}
+
+/// Parse one `/proc/kallsyms` line (`address type name[\t[module]]`) and insert
+/// it into `syscalls` when `name` is a monitored syscall. Shared by the
+/// streaming reader and the in-memory parser so both stay in lock-step.
+fn parse_kallsyms_line(line: &str, syscalls: &mut HashMap<String, String>) {
+    // Format: address type name
+    let mut parts = line.splitn(3, ' ');
+    let (Some(addr), Some(_typ), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+        return;
+    };
+    let name = rest.split('\t').next().unwrap_or(rest);
+    if MONITORED_SYSCALLS.contains(&name) {
+        syscalls.insert(name.to_string(), addr.to_string());
+    }
 }
 
 /// Read loaded eBPF program IDs by parsing /proc/*/fdinfo.
@@ -476,7 +485,9 @@ ffffffff81000000 t startup_64
 ffffffff81123456 t __x64_sys_execve
 ffffffff81123456 t __x64_sys_execve\t[module]
 ffffffff81abcdef T __x64_sys_openat";
-        let parsed = parse_kallsyms(content);
+        // The streaming reader is what `read_kallsyms` runs against
+        // /proc/kallsyms; drive it over the fixture via a Cursor.
+        let parsed = read_kallsyms_from(std::io::Cursor::new(content));
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed.get("__x64_sys_execve").unwrap(), "ffffffff81123456");
         assert_eq!(parsed.get("__x64_sys_openat").unwrap(), "ffffffff81abcdef");

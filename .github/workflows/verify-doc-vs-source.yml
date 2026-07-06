@@ -1,6 +1,6 @@
 name: Doc vs Source
 
-# Two doc-honesty gates:
+# Three doc-honesty gates:
 #  1. verify-doc-vs-source: collector/detector LISTS in `.claude/CLAUDE.md`
 #     match `crates/sensor/src/{collectors,detectors}/` (gitignored file, so
 #     this skips cleanly on CI checkouts that lack it).
@@ -9,6 +9,10 @@ name: Doc vs Source
 #     this one always runs. Added after a 2026-06 audit found 96 stale-count
 #     inconsistencies across the docs (README itself had two internal
 #     contradictions); counts can no longer silently drift.
+#  3. verify-agents-install-commands: the install-facing agent guide
+#     (agents-install.md, spec 082 — shipped to agents on-box + at
+#     innerwarden.com/agents.md) must pin the current version and may only
+#     name commands that exist in the real CLI (crates/ctl/src/main.rs).
 
 on:
   pull_request:
@@ -36,3 +40,11 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run verify-readme-counts.sh
         run: ./scripts/verify-readme-counts.sh
+
+  verify-agents-install-commands:
+    name: Verify install-facing agent guide matches CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run verify-agents-install-commands.sh
+        run: ./scripts/verify-agents-install-commands.sh

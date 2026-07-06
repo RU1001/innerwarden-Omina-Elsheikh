@@ -399,6 +399,67 @@ pub(super) fn check_kernel_modules(env: &impl HardenEnv) -> CheckResult {
         // Misc commonly loaded on Ubuntu cloud images
         "fscache",
         "watchdog",
+        // 2026-06-14: cloud / virt platform drivers that a stock public-cloud
+        // image loads at boot. Previously these raised a "12 unusual kernel
+        // module(s)" low finding on a clean Azure (AMD EPYC) host — pure noise
+        // that buries a real rogue module. Grouped by platform below.
+        //
+        // Microsoft Azure / Hyper-V (modern hv_* siblings + MANA NIC + DRM)
+        "hid_hyperv",
+        "hyperv_keyboard",
+        "hyperv_drm",
+        "hyperv_fb",
+        "hv_sock",
+        "mana",
+        "mana_ib",
+        // RDMA / InfiniBand core (Azure accelerated networking, HPC SKUs)
+        "ib_core",
+        "ib_uverbs",
+        "ib_cm",
+        "ib_umad",
+        "ib_ipoib",
+        "rdma_cm",
+        "rdma_ucm",
+        "iw_cm",
+        "mlx5_core",
+        "mlx5_ib",
+        "mlx4_core",
+        "mlx4_en",
+        "mlxfw",
+        // AMD platform (EPYC cloud hosts)
+        "ccp",       // AMD Secure Processor / crypto co-processor
+        "kvm_amd",   // (also above; harmless)
+        "irqbypass", // KVM IRQ bypass, loaded by kvm on virt hosts
+        // AWS / GCP NIC + storage drivers
+        "ena",          // AWS Elastic Network Adapter
+        "gve",          // Google Virtual NIC
+        "nvme_fabrics", // NVMe-oF (cloud block storage)
+        "nvme_tcp",
+        "nvme_rdma",
+        "failover",
+        "net_failover", // accelerated-networking failover pair
+        // Common physical NIC drivers (bare-metal / dedicated cloud)
+        "e1000",
+        "e1000e",
+        "igb",
+        "ixgbe",
+        "i40e",
+        "tg3",
+        "bnxt_en",
+        "r8169",
+        // Multipath storage + SCSI device handlers
+        "dm_multipath",
+        "scsi_dh_alua",
+        "scsi_dh_rdac",
+        "scsi_dh_emc",
+        // CRC / checksum helpers pulled in by the above
+        "crc_itu_t",
+        "crc_ccitt",
+        // Persistent store (EFI crash logs) — ubiquitous on UEFI hosts
+        "efi_pstore",
+        "pstore",
+        "pstore_blk",
+        "ramoops",
     ];
 
     match env.command_stdout("lsmod", &[]) {
@@ -587,6 +648,44 @@ mod tests {
             result.findings
         );
         assert!(result.findings.iter().any(|f| f.title.contains("rootkit")));
+    }
+
+    /// 2026-06-14 anchor — Azure (AMD EPYC) cloud-image FP fix.
+    ///
+    /// The exact 10 module names a clean Azure Spot host reported as
+    /// "12 unusual kernel module(s) loaded" (plus the platform
+    /// siblings that load with them). All are stock cloud/virt/NIC
+    /// drivers; none should land in the unusual bucket anymore.
+    #[test]
+    fn azure_cloud_baseline_modules_are_known_good() {
+        let azure_baseline = [
+            "crc_itu_t",
+            "mana_ib",
+            "ib_uverbs",
+            "ib_core",
+            "ccp",
+            "irqbypass",
+            "hid_hyperv",
+            "hyperv_keyboard",
+            "hyperv_drm",
+            "dm_multipath",
+            // siblings
+            "mana",
+            "rdma_cm",
+            "mlx5_core",
+            "ena",
+            "gve",
+            "efi_pstore",
+        ];
+        let env = MockEnv {
+            lsmod_output: lsmod(&azure_baseline),
+        };
+        let result = check_kernel_modules(&env);
+        assert!(
+            result.findings.is_empty(),
+            "Azure cloud baseline must not flag any module: {:?}",
+            result.findings
+        );
     }
 
     /// Anti-regression on `classify_loaded_modules` itself: unknown

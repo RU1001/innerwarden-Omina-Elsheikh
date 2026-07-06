@@ -3,7 +3,7 @@ use std::io::Write;
 use anyhow::Result;
 use innerwarden_core::audit::{append_admin_action, current_operator, AdminActionEntry};
 
-use crate::Cli;
+use crate::{require_sudo, Cli};
 
 fn is_mesh_enabled(content: &str) -> bool {
     content.contains("[mesh]") && content.contains("enabled = true")
@@ -170,7 +170,14 @@ pub(crate) fn cmd_mesh_status(cli: &Cli) -> Result<()> {
     }
 
     let content = std::fs::read_to_string(&state_path)?;
-    let state: serde_json::Value = serde_json::from_str(&content)?;
+    let state: serde_json::Value = if content.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&content).unwrap_or_else(|_| {
+            println!("  (state file unreadable; showing a fresh view — it will be rewritten on next save)");
+            serde_json::json!({})
+        })
+    };
 
     let identity_path = data_dir.join("mesh-identity.key");
     let has_identity = identity_path.exists();
@@ -212,6 +219,152 @@ pub(crate) fn cmd_mesh_status(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// Default mesh port (matches `mesh_enable_block`'s bind).
+const DEFAULT_MESH_PORT: u16 = 8790;
+
+/// Normalize a user-supplied peer into (canonical endpoint URL, host, port).
+///
+/// Accepts `host`, `host:port`, `http://host:port`, or `https://host:port`.
+/// The mesh server speaks plain HTTP, so the canonical endpoint is always
+/// `http://host:port` regardless of the scheme typed (a `https://` peer would
+/// never connect to the HTTP listener).
+fn normalize_endpoint(input: &str, default_port: u16) -> (String, String, u16) {
+    let trimmed = input.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let (host, port) = match without_scheme.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() && !h.is_empty() => {
+            (h.to_string(), p.parse().unwrap())
+        }
+        _ => (without_scheme.to_string(), default_port),
+    };
+    (format!("http://{host}:{port}"), host, port)
+}
+
+/// Build the firewall command that allows inbound `port` from `source` (the
+/// peer). `source` is only used to scope the rule when it is a literal IP;
+/// hostnames cannot be expressed as a firewall source, so the rule opens the
+/// port without a source restriction (the caller warns about that).
+fn firewall_open_command(tool: &str, source: &str, port: u16) -> Option<Vec<String>> {
+    let is_ip = source.parse::<std::net::IpAddr>().is_ok();
+    match tool {
+        "ufw" if is_ip => Some(vec![
+            "ufw".into(),
+            "allow".into(),
+            "from".into(),
+            source.into(),
+            "to".into(),
+            "any".into(),
+            "port".into(),
+            port.to_string(),
+            "proto".into(),
+            "tcp".into(),
+        ]),
+        "ufw" => Some(vec![
+            "ufw".into(),
+            "allow".into(),
+            format!("{port}/tcp"),
+        ]),
+        "firewalld" if is_ip => Some(vec![
+            "firewall-cmd".into(),
+            "--permanent".into(),
+            format!(
+                "--add-rich-rule=rule family=ipv4 source address={source} port port={port} protocol=tcp accept"
+            ),
+        ]),
+        "firewalld" => Some(vec![
+            "firewall-cmd".into(),
+            "--permanent".into(),
+            format!("--add-port={port}/tcp"),
+        ]),
+        _ => None,
+    }
+}
+
+/// Detect the active host firewall, if any (`ufw` / `firewalld`).
+fn detect_firewall() -> Option<&'static str> {
+    let ufw_active = std::process::Command::new("ufw")
+        .arg("status")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("Status: active"))
+        .unwrap_or(false);
+    if ufw_active {
+        return Some("ufw");
+    }
+    let firewalld_active = std::process::Command::new("firewall-cmd")
+        .arg("--state")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "running")
+        .unwrap_or(false);
+    if firewalld_active {
+        return Some("firewalld");
+    }
+    None
+}
+
+/// One-command connect: enable mesh, add the peer, and open the local firewall
+/// for the mesh port. Composes the existing enable/add-peer steps so the
+/// operator does not have to run three commands plus a manual firewall edit.
+pub(crate) fn cmd_mesh_connect(cli: &Cli, endpoint: &str, label: Option<&str>) -> Result<()> {
+    if !cli.dry_run {
+        require_sudo(cli);
+    }
+    let (url, host, port) = normalize_endpoint(endpoint, DEFAULT_MESH_PORT);
+    println!("Connecting to mesh peer {url}...");
+
+    // 1 + 2: ensure mesh is enabled, then register the peer.
+    cmd_mesh_enable(cli)?;
+    cmd_mesh_add_peer(cli, &url, label)?;
+
+    // 3: open the local firewall so the peer can reach our listener.
+    if cli.dry_run {
+        println!("  [dry-run] would open firewall for tcp/{port} from {host}");
+    } else {
+        match detect_firewall() {
+            Some(tool) => match firewall_open_command(tool, &host, port) {
+                Some(cmd) => {
+                    let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
+                    let reloaded = if tool == "firewalld" {
+                        std::process::Command::new("firewall-cmd")
+                            .arg("--reload")
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    };
+                    match status {
+                        Ok(s) if s.success() && reloaded => {
+                            println!("  [ok] {tool}: opened tcp/{port} from {host}");
+                        }
+                        _ => println!(
+                            "  [warn] could not open firewall automatically. Run: sudo ufw allow {port}/tcp"
+                        ),
+                    }
+                }
+                None => println!("  [warn] unsupported firewall; open tcp/{port} manually"),
+            },
+            None => println!(
+                "  [note] no active host firewall detected (ufw/firewalld). If one is added later, allow tcp/{port}."
+            ),
+        }
+        if host.parse::<std::net::IpAddr>().is_err() {
+            println!("  [note] peer is a hostname; firewall rule is not source-scoped to an IP");
+        }
+    }
+
+    println!();
+    println!("✅ Mesh peer connected: {url}");
+    println!("   Cloud firewall (AWS SG / Azure NSG / Oracle VCN) must also allow tcp/{port} inbound from the peer.");
+    println!("   Restart the agent to apply: sudo systemctl restart innerwarden-agent");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +380,44 @@ mod tests {
             dry_run: true,
             command: None,
         }
+    }
+
+    #[test]
+    fn normalize_endpoint_accepts_host_hostport_and_schemes() {
+        // Bare host -> default port, canonical http scheme.
+        assert_eq!(
+            normalize_endpoint("203.0.113.7", 8790),
+            ("http://203.0.113.7:8790".into(), "203.0.113.7".into(), 8790)
+        );
+        // host:port.
+        assert_eq!(
+            normalize_endpoint("10.0.1.5:9000", 8790),
+            ("http://10.0.1.5:9000".into(), "10.0.1.5".into(), 9000)
+        );
+        // https:// is normalized to http:// (the mesh server is plain HTTP).
+        assert_eq!(
+            normalize_endpoint("https://peer.example:8790/", 8790),
+            (
+                "http://peer.example:8790".into(),
+                "peer.example".into(),
+                8790
+            )
+        );
+    }
+
+    #[test]
+    fn firewall_open_command_scopes_to_ip_or_opens_port() {
+        // IP source -> source-scoped ufw rule.
+        let ip = firewall_open_command("ufw", "203.0.113.7", 8790).unwrap();
+        assert!(ip.contains(&"from".to_string()) && ip.contains(&"203.0.113.7".to_string()));
+        // Hostname -> port-only ufw rule (no source scoping possible).
+        let host = firewall_open_command("ufw", "peer.example", 8790).unwrap();
+        assert_eq!(host, vec!["ufw", "allow", "8790/tcp"]);
+        // firewalld IP rich-rule.
+        let fw = firewall_open_command("firewalld", "203.0.113.7", 8790).unwrap();
+        assert!(fw.iter().any(|a| a.contains("source address=203.0.113.7")));
+        // Unknown tool -> None.
+        assert!(firewall_open_command("pf", "203.0.113.7", 8790).is_none());
     }
 
     #[test]

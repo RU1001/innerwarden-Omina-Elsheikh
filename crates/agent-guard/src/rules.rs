@@ -24,6 +24,15 @@ pub enum AtrField {
     ToolArgs,
     /// Tool output or agent output (responses).
     ToolResponse,
+    /// The NAME of an invoked tool (e.g. `execute_shell`, `chmod`). Matched ONLY
+    /// against an actual tool name via [`RuleEngine::check_tool_name`], NEVER
+    /// against raw user input or a command string. Before this field existed,
+    /// `tool_name` conditions fell through to `UserInput` (the catch-all), so a
+    /// tool-NAME word list like `chmod|sudo|bash|rm -rf` matched any command
+    /// containing those substrings — `~/.bashrc` matched `bash`,
+    /// `sudo apt install` matched `sudo` — driving a 27.8% benchmark
+    /// false-positive rate. A tool name is not user input.
+    ToolName,
     /// Matches at all inspection points.
     Content,
 }
@@ -100,6 +109,7 @@ pub struct RuleEngine {
     user_input_idx: Vec<usize>,
     tool_args_idx: Vec<usize>,
     tool_response_idx: Vec<usize>,
+    tool_name_idx: Vec<usize>,
 }
 
 impl RuleEngine {
@@ -202,6 +212,7 @@ impl RuleEngine {
         let mut user_input_idx = Vec::new();
         let mut tool_args_idx = Vec::new();
         let mut tool_response_idx = Vec::new();
+        let mut tool_name_idx = Vec::new();
 
         for (i, rule) in rules.iter().enumerate() {
             let fields: std::collections::HashSet<AtrField> =
@@ -216,8 +227,12 @@ impl RuleEngine {
             if fields.contains(&AtrField::ToolResponse) || fields.contains(&AtrField::Content) {
                 tool_response_idx.push(i);
             }
-            // Rules with only UserInput/ToolArgs/ToolResponse are already handled.
-            // Rules with mixed fields go into all relevant groups.
+            if fields.contains(&AtrField::ToolName) || fields.contains(&AtrField::Content) {
+                tool_name_idx.push(i);
+            }
+            // Rules with mixed fields go into all relevant groups. A ToolName
+            // condition only enters tool_name_idx, so it is NEVER evaluated by
+            // check_user_input / check_tool_args (raw command / user text).
         }
 
         Self {
@@ -225,6 +240,7 @@ impl RuleEngine {
             user_input_idx,
             tool_args_idx,
             tool_response_idx,
+            tool_name_idx,
         }
     }
 
@@ -243,6 +259,18 @@ impl RuleEngine {
             &self.tool_args_idx,
             content,
             &[AtrField::ToolArgs, AtrField::Content],
+        )
+    }
+
+    /// Check an actual invoked tool NAME (e.g. `execute_shell`) against rules
+    /// targeting tool_name + content fields. This is the ONLY path that
+    /// evaluates `tool_name` conditions — they must never run against raw user
+    /// input or a command string (a tool name is not user text).
+    pub fn check_tool_name(&self, tool_name: &str) -> Vec<AtrMatch> {
+        self.check_indices(
+            &self.tool_name_idx,
+            tool_name,
+            &[AtrField::ToolName, AtrField::Content],
         )
     }
 
@@ -439,6 +467,10 @@ fn parse_field(raw: &str) -> AtrField {
     match raw {
         "tool_response" | "agent_output" => AtrField::ToolResponse,
         "tool_args" => AtrField::ToolArgs,
+        // A tool NAME is its own inspection point — it must NOT fall through to
+        // UserInput, or a tool-name word list (chmod|sudo|bash|rm -rf) matches
+        // any command containing those substrings. See `AtrField::ToolName`.
+        "tool_name" | "tool" => AtrField::ToolName,
         "content" => AtrField::Content,
         // user_input, tool_description, and anything else → UserInput
         _ => AtrField::UserInput,

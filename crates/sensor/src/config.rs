@@ -76,6 +76,11 @@ pub struct CollectorsConfig {
     pub nginx_error: NginxErrorConfig,
     #[serde(default)]
     pub macos_log: MacosLogConfig,
+    /// Windows ETW / Event Log collector (spec 085). OPT-IN like macos_log
+    /// (defaults to `enabled = false`) so it never spawns on Linux/macOS
+    /// prod; the spawn site additionally gates on `cfg!(target_os = "windows")`.
+    #[serde(default)]
+    pub windows_etw: WindowsEtwConfig,
     #[serde(default)]
     pub syslog_firewall: SyslogFirewallConfig,
     #[serde(default)]
@@ -126,6 +131,12 @@ pub struct CollectorsConfig {
     /// is absent.
     #[serde(default)]
     pub audit_state: AlwaysOnCollectorConfig,
+    /// tunnel_iface: watches `/sys/class/net` for a NEW tun/WireGuard
+    /// interface appearing at runtime — the rename-proof behavioural signal
+    /// of a mesh/overlay VPN being brought up (complements the c2_web_tunnel
+    /// exec-name detection). Interfaces present at startup are baselined.
+    #[serde(default)]
+    pub tunnel_iface: AlwaysOnCollectorConfig,
 }
 
 impl CollectorsConfig {
@@ -149,6 +160,8 @@ impl CollectorsConfig {
             nginx_access: NginxAccessConfig::default(),
             nginx_error: NginxErrorConfig::default(),
             macos_log: MacosLogConfig::default(),
+            // Default already produces enabled = false (opt-in).
+            windows_etw: WindowsEtwConfig::default(),
             syslog_firewall: SyslogFirewallConfig::default(),
             cloudtrail: CloudTrailConfig::default(),
             // auth_log defaults to enabled = true (sshd auth is the
@@ -175,6 +188,7 @@ impl CollectorsConfig {
             systemd_inventory: AlwaysOnCollectorConfig { enabled: false },
             tcp_stream: AlwaysOnCollectorConfig { enabled: false },
             audit_state: AlwaysOnCollectorConfig { enabled: false },
+            tunnel_iface: AlwaysOnCollectorConfig { enabled: false },
         }
     }
 }
@@ -199,6 +213,63 @@ impl Default for AlwaysOnCollectorConfig {
 pub struct MacosLogConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Windows ETW / Event Log collector config (spec 085).
+///
+/// OPT-IN: `enabled` defaults to `false` (mirrors [`MacosLogConfig`]) so an
+/// existing Linux/macOS prod TOML upgrades with no edits and never spawns
+/// this collector. Windows operators turn it on with:
+///
+/// ```toml
+/// [collectors.windows_etw]
+/// enabled = true
+/// # optional overrides (defaults shown):
+/// # channels = ["Security", "Microsoft-Windows-Sysmon/Operational"]
+/// # poll_seconds = 5
+/// # batch_cap = 200
+/// ```
+///
+/// The tuning fields each carry a `#[serde(default = "...")]` (like
+/// [`ExecAuditConfig`]) so a partial `[collectors.windows_etw]` section still
+/// parses. They are threaded into `WindowsEtwCollector` in
+/// `boot::spawn_collectors` via its `with_*` builders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowsEtwConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_etw_channels")]
+    pub channels: Vec<String>,
+    #[serde(default = "default_etw_poll_seconds")]
+    pub poll_seconds: u64,
+    #[serde(default = "default_etw_batch_cap")]
+    pub batch_cap: u32,
+}
+
+impl Default for WindowsEtwConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channels: default_etw_channels(),
+            poll_seconds: default_etw_poll_seconds(),
+            batch_cap: default_etw_batch_cap(),
+        }
+    }
+}
+
+fn default_etw_channels() -> Vec<String> {
+    vec![
+        "Security".to_string(),
+        "Microsoft-Windows-Sysmon/Operational".to_string(),
+    ]
+}
+
+fn default_etw_poll_seconds() -> u64 {
+    5
+}
+
+fn default_etw_batch_cap() -> u32 {
+    200
 }
 
 #[derive(Debug, Deserialize)]
@@ -2036,6 +2107,14 @@ surface = "dedicated kvm host"
         let harvest = CredentialHarvestConfig::default();
         assert!(harvest.enabled);
         assert_eq!(harvest.cooldown_seconds, 600);
+
+        // spec 085 Phase 1: Windows ETW collector config (opt-in, off by default).
+        let etw = WindowsEtwConfig::default();
+        assert!(!etw.enabled);
+        assert_eq!(etw.poll_seconds, 5);
+        assert_eq!(etw.batch_cap, 200);
+        assert_eq!(etw.channels.len(), 2);
+        assert!(etw.channels.iter().any(|c| c == "Security"));
 
         let flood = PacketFloodConfig::default();
         assert!(flood.enabled);

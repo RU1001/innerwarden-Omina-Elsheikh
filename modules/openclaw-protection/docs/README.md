@@ -1,15 +1,15 @@
 # AI Agent Protection
 
-Protects servers running autonomous AI agents (OpenClaw, n8n, Langchain, custom
-agents) by monitoring command execution, detecting dangerous patterns, and
-exposing a security API that agents can query before acting.
+Protects supported local AI agents and tool runners by monitoring command
+execution, detecting dangerous patterns, and exposing a security API that agents
+can query before acting.
 
 ## Overview
 
-AI agents execute shell commands, modify files, and connect to external services
-autonomously. This creates a new attack surface: a compromised or misbehaving
-agent can run destructive commands, exfiltrate data, or establish persistence
-before anyone notices.
+AI agents execute shell commands, modify files, call tools, and connect to
+external services autonomously. This creates a new attack surface: a compromised
+or misbehaving agent can run destructive commands, exfiltrate data, or establish
+persistence before anyone notices.
 
 Inner Warden's AI Agent Protection module:
 
@@ -83,7 +83,8 @@ paths = [
 ## Agent API - Let your AI ask before acting
 
 Inner Warden exposes HTTP endpoints on the dashboard that any AI agent can call.
-These are the recommended integration points for OpenClaw, n8n, or custom agents.
+These are the recommended integration points for supported local agents, MCP
+tool runners, and custom agents.
 
 ### `GET /api/agent/security-context`
 

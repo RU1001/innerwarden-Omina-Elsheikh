@@ -485,6 +485,22 @@ notifiers = ["slack"]
         assert_eq!(m.version.as_deref(), Some("0.1.0"));
     }
 
+    // Anchor (claude-code-protection module, 2026-06-28): the shipped
+    // modules/claude-code-protection/module.toml must parse and declare the
+    // builtin Claude Code integration. Mirrors its registry.toml entry.
+    #[test]
+    fn parses_claude_code_protection_builtin_module() {
+        let toml = include_str!("../../../modules/claude-code-protection/module.toml");
+        let m = parse(toml);
+        assert_eq!(m.id, "claude-code-protection");
+        assert_eq!(m.name, "Claude Code Protection");
+        assert!(m.builtin);
+        assert_eq!(m.version.as_deref(), Some("0.1.0"));
+        assert!(m.collectors.contains(&"exec-audit".to_string()));
+        assert!(m.detectors.contains(&"execution-guard".to_string()));
+        assert_eq!(m.preflights.len(), 1);
+    }
+
     #[test]
     fn parses_update_url_when_present() {
         let toml = r#"

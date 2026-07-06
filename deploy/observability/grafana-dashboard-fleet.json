@@ -1,0 +1,289 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping each InnerWarden agent's /metrics",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_LOKI",
+      "label": "Loki",
+      "description": "Loki datasource holding the InnerWarden incident / agent-guard / decision logs (shipped by Alloy). Optional — the incident-investigation panels use it; the metric panels do not.",
+      "type": "datasource",
+      "pluginId": "loki",
+      "pluginName": "Loki"
+    }
+  ],
+  "uid": "iw-fleet",
+  "title": "InnerWarden — AI Agent Fleet",
+  "description": "Fleet-wide visibility across every host running an InnerWarden agent: per-tenant AI-agent activity and host-level detection in one place. Each scrape target is one node; the `instance` label is the host and `tenant` is the attributed agent/employee/pod.",
+  "tags": ["innerwarden", "ai-agents", "fleet", "security"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "label": "Node",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(up{job=~\"innerwarden.*\"}, instance)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      },
+      {
+        "name": "tenant",
+        "label": "Tenant / agent",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(innerwarden_incidents_by_tenant, tenant)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Fleet overview",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "Nodes reporting",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "targets": [{ "expr": "count(up{job=~\"innerwarden.*\"} == 1)", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Incidents today",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 50 }] } } },
+      "targets": [{ "expr": "sum(innerwarden_incidents_total{instance=~\"$node\"})", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Decisions today",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "sum(innerwarden_decisions_total{instance=~\"$node\"})", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Live skill executions",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "sum(innerwarden_executions_total{mode=\"live\",instance=~\"$node\"})", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "AI latency (avg ms)",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "targets": [{ "expr": "avg(innerwarden_ai_latency_avg_ms{instance=~\"$node\"})", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "ATR rules loaded (min)",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "description": "0 on any node = agent-guard degraded (rules failed to load).",
+      "targets": [{ "expr": "min(innerwarden_agent_guard_atr_rules_loaded{instance=~\"$node\"})", "refId": "A" }]
+    },
+    {
+      "type": "row",
+      "title": "Per-tenant AI-agent activity (each Claude Code = a tenant)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Incidents by tenant",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Security incidents attributed to each agent/employee/pod (spec 084 kernel cgroup attribution — the agent can't spoof it).",
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "targets": [{ "expr": "sum by (tenant) (innerwarden_incidents_by_tenant{tenant=~\"$tenant\"})", "legendFormat": "{{tenant}}", "refId": "A" }]
+    },
+    {
+      "type": "table",
+      "title": "Top tenants by incidents",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "showHeader": true, "sortBy": [{ "displayName": "Value", "desc": true }] },
+      "targets": [{ "expr": "sort_desc(sum by (tenant) (innerwarden_incidents_by_tenant{tenant=~\"$tenant\"}))", "format": "table", "instant": true, "refId": "A" }],
+      "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "tenant": "Tenant / agent", "Value": "Incidents" } } }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Command checks by verdict (fleet)",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Every command each AI agent tried, judged allow / review / deny by the agent-guard. The 'what did the agents try, and what got blocked' view.",
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal" } } }, "overrides": [ { "matcher": { "id": "byName", "options": "deny" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }, { "matcher": { "id": "byName", "options": "review" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } } ] }, { "matcher": { "id": "byName", "options": "allow" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] } ] },
+      "targets": [{ "expr": "sum by (verdict) (innerwarden_agent_guard_checks_total{tenant=~\"$tenant\"})", "legendFormat": "{{verdict}}", "refId": "A" }]
+    },
+    {
+      "type": "table",
+      "title": "Denied commands by tenant",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Which agent/employee/pod hit the most denied commands — the ones to look at first.",
+      "options": { "showHeader": true, "sortBy": [{ "displayName": "Denied", "desc": true }] },
+      "targets": [{ "expr": "sort_desc(sum by (tenant) (innerwarden_agent_guard_checks_total{verdict=\"deny\",tenant=~\"$tenant\"}))", "format": "table", "instant": true, "refId": "A" }],
+      "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "tenant": "Tenant / agent", "Value": "Denied" } } }]
+    },
+    {
+      "type": "bargauge",
+      "title": "Rogue-agent signal — deny share by tenant",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "The fraction of each agent's commands that were denied — normalized for volume, so a rogue agent stands out even with few commands. Red = a high share of what this agent tried was dangerous. The 'which employee/pod went rogue' signal.",
+      "options": { "displayMode": "gradient", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.3 }, { "color": "red", "value": 0.6 } ] } } },
+      "targets": [{ "expr": "sum by (tenant) (innerwarden_agent_guard_checks_total{verdict=\"deny\",tenant=~\"$tenant\"}) / clamp_min(sum by (tenant) (innerwarden_agent_guard_checks_total{tenant=~\"$tenant\"}), 1)", "legendFormat": "{{tenant}}", "instant": true, "refId": "A" }]
+    },
+    {
+      "type": "row",
+      "title": "Decisions & response",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Decisions by action",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "What the agent decided to do (block / monitor / ignore / etc) across the fleet.",
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal" } } } },
+      "targets": [{ "expr": "sum by (action) (innerwarden_decisions_total{instance=~\"$node\"})", "legendFormat": "{{action}}", "refId": "A" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Skill executions (live vs dry-run)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 20 } } },
+      "targets": [{ "expr": "sum by (mode) (innerwarden_executions_total{instance=~\"$node\"})", "legendFormat": "{{mode}}", "refId": "A" }]
+    },
+    {
+      "type": "row",
+      "title": "Host-level detection (the EDR underneath)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Incidents by detector",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 15 } } },
+      "targets": [{ "expr": "topk(10, sum by (detector) (innerwarden_incidents_total{instance=~\"$node\"}))", "legendFormat": "{{detector}}", "refId": "A" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Events by collector",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [{ "expr": "topk(10, sum by (collector) (innerwarden_events_total{instance=~\"$node\"}))", "legendFormat": "{{collector}}", "refId": "A" }]
+    },
+    {
+      "type": "row",
+      "title": "Fleet health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Agent up per node",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 30 } } },
+      "targets": [{ "expr": "up{job=~\"innerwarden.*\",instance=~\"$node\"}", "legendFormat": "{{instance}}", "refId": "A" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors by component",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 60 } } },
+      "targets": [{ "expr": "sum by (component) (innerwarden_errors_total{instance=~\"$node\"})", "legendFormat": "{{component}}", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Active responses (fleet)",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "sum(innerwarden_responses_active{instance=~\"$node\"})", "refId": "A" }]
+    },
+    {
+      "type": "row",
+      "title": "Cost & tokens per agent (requires an LLM gateway, e.g. LiteLLM — see README)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tokens per tenant",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "LLM tokens consumed by each agent/employee. InnerWarden is a security layer and does not sit in the LLM path, so this comes from the LLM gateway (LiteLLM `litellm_total_tokens`). The `team`/`key` gateway label is aliased to `tenant` so it lines up with the security panels. No data until a gateway is scraped.",
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 50, "stacking": { "mode": "normal" } } } },
+      "targets": [{ "expr": "sum by (tenant) (label_replace(increase(litellm_total_tokens[5m]), \"tenant\", \"$1\", \"team\", \"(.*)\"))", "legendFormat": "{{tenant}}", "refId": "A" }]
+    },
+    {
+      "type": "table",
+      "title": "Spend by tenant (top)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "LLM spend per agent/employee from the gateway (LiteLLM `litellm_spend_metric`). Pair it with the security panels: who cost the most, and did any of it get blocked. No data until a gateway is scraped.",
+      "options": { "showHeader": true, "sortBy": [{ "displayName": "Spend (USD)", "desc": true }] },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+      "targets": [{ "expr": "sort_desc(sum by (tenant) (label_replace(litellm_spend_metric, \"tenant\", \"$1\", \"team\", \"(.*)\")))", "format": "table", "instant": true, "refId": "A" }],
+      "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "tenant": "Tenant / agent", "Value": "Spend (USD)" } } }]
+    },
+    {
+      "type": "row",
+      "title": "Incident investigation (what actually happened — needs Loki, see README)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 }
+    },
+    {
+      "type": "logs",
+      "title": "Command review journal — every command each agent tried",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 50 },
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "description": "The verbatim commands each AI agent ran through the guard, with the verdict and the ATR rules that fired. This is the 'what did they try, and what got blocked' investigation view. Filter to one tenant with the $tenant variable. Secrets are redacted in transit.",
+      "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true, "enableLogDetails": true, "dedupStrategy": "none" },
+      "targets": [{ "expr": "{kind=\"guard\", job=\"innerwarden\"} | json | tenant=~\"$tenant\" | line_format \"{{.tenant}}  [{{.recommendation}}] risk={{.risk_score}}  {{.command}}  «{{.atr_rule_ids}}»\"", "refId": "A" }]
+    },
+    {
+      "type": "logs",
+      "title": "Live incident feed",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 60 },
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "description": "Every incident InnerWarden raised across the fleet, newest first: severity, title, and the tags (including the tenant tag for agent-attributed incidents). Click a line to expand the full record for hand-off / evidence.",
+      "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true, "enableLogDetails": true, "dedupStrategy": "none" },
+      "targets": [{ "expr": "{kind=\"incident\", job=\"innerwarden\"} | json | line_format \"[{{.severity}}] {{.title}}  «{{.tags}}»\"", "refId": "A" }]
+    }
+  ]
+}

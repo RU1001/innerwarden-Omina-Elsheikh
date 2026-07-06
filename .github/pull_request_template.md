@@ -10,6 +10,7 @@
 
 ## Validation
 
+- [ ] All commits signed off (`git commit -s`) — see [DCO](../DCO)
 - [ ] `make check`
 - [ ] `make test`
 - [ ] `make scenario-qa` — if this PR touches anything that could change incident / telegram / block volumes

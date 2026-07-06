@@ -36,6 +36,11 @@ CANARY=0
 VERBOSE=0
 SIMULATE=0
 SIMULATE_MODE="basic"
+# Supervised mode is opt-in (see the supervisor-unit block below). It MUST be
+# declared here: it is referenced under `set -u` later, so a missing default
+# aborts the whole install with "SUPERVISED: unbound variable". Override via the
+# --supervised flag or the SUPERVISED env var.
+SUPERVISED="${SUPERVISED:-false}"
 for arg in "$@"; do
   case "$arg" in
     --with-integrations) WITH_INTEGRATIONS=1 ;;
@@ -44,8 +49,13 @@ for arg in "$@"; do
     --simulate) SIMULATE=1 ;;
     --simulate-mode=basic) SIMULATE_MODE="basic" ;;
     --simulate-mode=advanced) SIMULATE_MODE="advanced" ;;
+    --supervised) SUPERVISED=true ;;
+    --uninstall) UNINSTALL=1 ;;
+    --purge) PURGE=1 ;;
   esac
 done
+UNINSTALL="${UNINSTALL:-0}"
+PURGE="${PURGE:-0}"
 
 # BASH_SOURCE[0] is unset when the script is piped through `curl | bash` —
 # `set -u` then aborts before we even print the banner. Fall back to $0
@@ -130,6 +140,53 @@ fail() {
   exit 1
 }
 
+# ── Uninstall path ─────────────────────────────────────────────────────────
+# `curl -fsSL <installer> | sudo bash -s -- --uninstall [--purge]` mirrors the
+# install entrypoint for removal. Prefers the installed `innerwarden uninstall`
+# command (single source of truth for the teardown). If that binary is missing
+# or broken, falls back to an inline teardown so a half-installed box can still
+# be cleaned. Keeps config + data unless --purge.
+uninstall_inline() {
+  vlog "innerwarden binary not usable — running inline fallback teardown"
+  local units="innerwarden-watchdog innerwarden-supervisor innerwarden-agent innerwarden-sensor"
+  for u in $units; do
+    $SUDO systemctl stop "$u" 2>/dev/null || true
+    $SUDO systemctl disable "$u" 2>/dev/null || true
+    $SUDO rm -f "/etc/systemd/system/${u}.service" 2>/dev/null || true
+    $SUDO rm -rf "/etc/systemd/system/${u}.service.d" 2>/dev/null || true
+  done
+  $SUDO systemctl daemon-reload 2>/dev/null || true
+  $SUDO systemctl reset-failed 2>/dev/null || true
+  for b in innerwarden innerwarden-ctl innerwarden-agent innerwarden-sensor \
+           innerwarden-watchdog innerwarden-supervisor; do
+    $SUDO rm -f "${BIN_DIR}/${b}" 2>/dev/null || true
+  done
+  $SUDO rm -rf /usr/local/lib/innerwarden /sys/fs/bpf/innerwarden /run/innerwarden 2>/dev/null || true
+  $SUDO rm -f /etc/sudoers.d/innerwarden* 2>/dev/null || true
+  if [[ "${PURGE}" -eq 1 ]]; then
+    $SUDO rm -rf "${CONFIG_DIR}" "${DATA_DIR}" /var/log/innerwarden 2>/dev/null || true
+    $SUDO userdel innerwarden 2>/dev/null || true
+  fi
+}
+
+if [[ "${UNINSTALL}" -eq 1 ]]; then
+  echo ""
+  echo "  InnerWarden uninstall"
+  echo ""
+  args="--yes"
+  [[ "${PURGE}" -eq 1 ]] && args="${args} --purge"
+  if command -v innerwarden >/dev/null 2>&1 && innerwarden --version >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    $SUDO innerwarden uninstall ${args}
+  else
+    uninstall_inline
+    echo ""
+    echo "  ✅ InnerWarden removed."
+    [[ "${PURGE}" -eq 0 ]] && echo "  Config + data kept (re-run with --purge to remove)."
+  fi
+  exit 0
+fi
+
 normalize_bool() {
   local normalized
   normalized="$(printf '%s' "${1}" | tr '[:upper:]' '[:lower:]')"
@@ -141,23 +198,6 @@ normalize_bool() {
       echo "false"
       ;;
   esac
-}
-
-prompt_yes_no() {
-  local question="$1"
-  local default_answer="$2" # yes|no
-  local suffix answer normalized
-
-  if [[ "${default_answer}" == "yes" ]]; then
-    suffix="[Y/n]"
-  else
-    suffix="[y/N]"
-  fi
-
-  read -r -p "${question} ${suffix} " answer
-  answer="${answer:-${default_answer}}"
-  normalized="$(normalize_bool "${answer}")"
-  [[ "${normalized}" == "true" ]]
 }
 
 term_cols() {
@@ -703,6 +743,33 @@ run_root install -o "${INSTALL_USER:-root}" -g "${INSTALL_GROUP:-root}" -m 755 "
 run_root install -o "${INSTALL_USER:-root}" -g "${INSTALL_GROUP:-root}" -m 755 "${IW_CTL_BIN}"    "${BIN_DIR}/innerwarden-ctl"
 run_root install -o "${INSTALL_USER:-root}" -g "${INSTALL_GROUP:-root}" -m 755 "${IW_CTL_BIN}"    "${BIN_DIR}/innerwarden"
 
+# ── Drop the install-facing agent guide (spec 082) ───────────────────────
+# /etc/innerwarden/AGENTS.md is the playbook an AI coding agent reads to
+# configure and operate InnerWarden on this box (what the CLI is, the safe
+# observe->verify->allowlist workflow, the loopback check-command contract).
+# Best-effort and version-matched: fetched at the SAME ref we are installing
+# (raw repo content at the release tag), so the on-box guide matches the
+# binary's command surface. Never fails the install if it cannot be fetched.
+AGENTS_MD_DEST="${CONFIG_DIR}/AGENTS.md"
+agents_md_tmp="${TMP_DIR}/AGENTS.md"
+agents_md_path="agents-install.md"
+agents_md_ok=0
+for ref in "${IW_VERSION}" "main"; do
+  [[ -z "${ref}" || "${ref}" == "canary" ]] && ref="main"
+  if curl -fsSL --output "${agents_md_tmp}" \
+       "https://raw.githubusercontent.com/${GITHUB_REPO}/${ref}/${agents_md_path}" 2>/dev/null \
+       && [[ -s "${agents_md_tmp}" ]]; then
+    agents_md_ok=1
+    break
+  fi
+done
+if [[ "${agents_md_ok}" == "1" ]]; then
+  run_root install -o "${INSTALL_USER:-root}" -g "${IW_USER}" -m 644 "${agents_md_tmp}" "${AGENTS_MD_DEST}"
+  log "agent guide installed: ${AGENTS_MD_DEST} (point your coding agent at it)"
+else
+  log "note: could not fetch the agent guide; see https://innerwarden.com/agents.md"
+fi
+
 # ── Install bpftool for eBPF support (Linux only) ────────────────────────
 # bpftool is required for XDP firewall and LSM enforcement management.
 # The sensor works without it (graceful fallback) but advanced features need it.
@@ -942,7 +1009,7 @@ provider = "${AI_PROVIDER}"
 model = "${AI_MODEL}"
 context_events = 20
 # confidence_threshold: minimum AI confidence (0.0-1.0) for auto-execution.
-# Trial safety comes from `[responder] enabled = false` below, NOT from this
+# Trial safety comes from [responder] enabled = false below, NOT from this
 # value. The agent clamps any threshold > 1.0 back to the 0.85 default on load
 # (a >1.0 "never executes" sentinel once silently disabled ALL autonomous
 # response, because AI confidence is always in [0.0, 1.0]).
@@ -1071,6 +1138,20 @@ if [[ "$OS_TYPE" == "Darwin" ]]; then
 </plist>
 EOF
 
+  # 2026-06-29: emit EVERY provider API key the operator actually set, not just
+  # OpenAI. Pre-fix the plist hardcoded only OPENAI_API_KEY, so a Mac user who
+  # exported ANTHROPIC_API_KEY (and not OPENAI) got a plist with an empty OpenAI
+  # key and the agent's AI silently never initialised — a "works on Linux,
+  # broken on macOS" cross-platform bug. Mirror the documented providers the
+  # Linux env-file path handles.
+  MACOS_AI_ENV=""
+  for _k in OPENAI_API_KEY ANTHROPIC_API_KEY; do
+    _v="${!_k:-}"
+    if [[ -n "${_v}" ]]; then
+      MACOS_AI_ENV+="    <key>${_k}</key><string>${_v}</string>"$'\n'
+    fi
+  done
+
   log "writing launchd plist: ${AGENT_PLIST}"
   install_from_stdin "${AGENT_PLIST}" 644 "${INSTALL_USER:-root}" "${INSTALL_GROUP:-root}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1089,8 +1170,7 @@ EOF
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>OPENAI_API_KEY</key><string>${OPENAI_API_KEY}</string>
-  </dict>
+${MACOS_AI_ENV}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${LOG_DIR}/agent.log</string>
@@ -1196,7 +1276,7 @@ Documentation=https://github.com/InnerWarden/innerwarden
 Type=simple
 User=innerwarden
 Group=innerwarden
-EnvironmentFile=/etc/innerwarden/agent.env
+EnvironmentFile=-/etc/innerwarden/agent.env
 ExecStart=/usr/local/bin/innerwarden-agent --data-dir /var/lib/innerwarden --config /etc/innerwarden/agent.toml --dashboard
 Restart=on-failure
 RestartSec=5
@@ -1234,7 +1314,7 @@ Documentation=https://github.com/InnerWarden/innerwarden/wiki/Operations
 Type=simple
 User=innerwarden
 Group=innerwarden
-EnvironmentFile=/etc/innerwarden/agent.env
+EnvironmentFile=-/etc/innerwarden/agent.env
 ExecStart=/usr/local/bin/innerwarden-supervisor \\
   --agent-binary /usr/local/bin/innerwarden-agent \\
   --agent-arg --data-dir --agent-arg /var/lib/innerwarden \\
@@ -1324,13 +1404,16 @@ if [[ "${CANARY}" -eq 1 ]] && [[ "${IW_VERSION}" != "canary" ]]; then
   fi
 fi
 
-# SEC-019: Install telemetry is opt-in only.
-# Opt in with: export INNERWARDEN_TELEMETRY=1
+# Install telemetry is opt-OUT (default on, anonymous). Disable with:
+#   export INNERWARDEN_NO_TELEMETRY=1
+# The data is anonymous + minimal enough that an opt-out default with a
+# clear notice (printed above the ping) is the policy; see /privacy.
 #
-# What we collect when you opt in:
-#   - the release version you are installing (e.g. v0.13.4)
+# What we collect:
+#   - the release version you are installing (e.g. v0.15.12)
 #   - the OS family (uname -s — Linux or Darwin)
 #   - the CPU arch (uname -m — x86_64 / aarch64 / arm64)
+#   - whether this was a fresh install or an upgrade (event=install|upgrade)
 #
 # What we never collect:
 #   - your IP. The server hashes (ip + UTC day + a server-side secret)
@@ -1347,15 +1430,31 @@ fi
 # The curl is backgrounded with a 5 s timeout and `-fsS` so it never
 # blocks the install or writes to stdout. If the request fails (DNS,
 # network, server down), the install completes silently regardless.
-if [[ "${INNERWARDEN_TELEMETRY:-0}" == "1" ]]; then
+# Skip the ping in CI / automation. Installer smoke-tests run on ephemeral
+# runners (GitHub Actions et al.), each a fresh machine-id from a US x86_64 box,
+# so without this guard they flood the install telemetry and make adoption look
+# busier than it is. The install itself still runs and is still verified in CI;
+# only the ping is suppressed.
+_iw_in_ci() {
+  case "${CI:-}" in true | TRUE | 1) return 0 ;; esac
+  [[ -n "${GITHUB_ACTIONS:-}${GITLAB_CI:-}${JENKINS_URL:-}${BUILDKITE:-}${CIRCLECI:-}${TF_BUILD:-}${TEAMCITY_VERSION:-}${DRONE:-}" ]]
+}
+
+if _iw_in_ci; then
+  log "CI/automation detected, skipping the install telemetry ping."
+elif [[ "${INNERWARDEN_NO_TELEMETRY:-0}" != "1" ]]; then
+  # Anonymous install ping (opt-OUT). One-line notice + how to opt out, so the
+  # default-on collection is transparent (informed consent, not silent).
+  log "Sending an anonymous install ping (version + OS + CPU arch only — no IP, no host data)."
+  log "Opt out any time: re-run with INNERWARDEN_NO_TELEMETRY=1. Details: https://www.innerwarden.com/privacy"
   # Use the canonical www host and follow redirects (-L): the apex
   # innerwarden.com 308-redirects to www, and `curl -fsS` without -L drops
-  # the request — so every opted-in ping was silently lost. (Found 2026-06-11:
-  # the app_events install_ping stream went dry; the endpoint was healthy, the
+  # the request — so the ping was silently lost. (Found 2026-06-11: the
+  # app_events install_ping stream went dry; the endpoint was healthy, the
   # installer just never followed the redirect.)
   curl -fsSL \
     -m 5 \
-    "https://www.innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" \
+    "https://www.innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}&event=${IW_PING_EVENT:-install}" \
     >/dev/null 2>&1 &
 fi
 
@@ -1386,10 +1485,16 @@ fi
 # Headless installs (no /dev/tty: cloud-init, CI, Ansible) must NOT abort
 # here - warden + its config were already provisioned above, so just skip
 # the interactive wizard and tell the operator how to finish later.
-if [[ -e /dev/tty ]] && [[ -r /dev/tty ]]; then
-  $SUDO innerwarden setup < /dev/tty
+# `[[ -r /dev/tty ]]` only tests the device node's permission bits — it passes
+# even when there is NO controlling terminal (curl|sudo bash from a pipe, SSH
+# non-interactive, cloud-init, CI), and then `< /dev/tty` aborts the whole
+# install with "No such device or address". Probe by actually OPENING it, and
+# keep the wizard non-fatal so a clean install never exits non-zero on this step.
+if (: < /dev/tty) 2>/dev/null; then
+  $SUDO innerwarden setup < /dev/tty \
+    || vlog "interactive setup exited non-zero — run 'sudo innerwarden setup' to finish."
 else
-  vlog "No TTY detected (headless install) - skipping interactive setup."
+  vlog "No usable TTY (headless/piped install) - skipping interactive setup."
   vlog "Run 'sudo innerwarden setup' later to configure AI provider / notifications."
 fi
 

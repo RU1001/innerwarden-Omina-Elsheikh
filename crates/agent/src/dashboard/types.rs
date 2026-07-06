@@ -132,6 +132,55 @@ pub(crate) struct TriageCaseRequest {
     pub(super) reason: String,
 }
 
+/// Operator "Trust IP" (monitor-only allowlist). Adds an IP/CIDR to
+/// `dynamic_trusted_ips` so the agent stops AUTO-blocking it — the IP is still
+/// detected, logged, and notified (see `operator_trust.rs`). Body fields:
+/// - `ip`: the IP or CIDR to trust (internal/private ranges ARE allowed here,
+///   unlike the block path; `/0` is rejected).
+/// - `reason`: operator rationale (mandatory; audit trail).
+/// - `ttl_hours`: optional time-box. Omit for permanent trust; when set the
+///   entry expires on its own (≤ one slow-loop tick after lapsing).
+#[derive(Debug, Deserialize)]
+pub(crate) struct TrustIpRequest {
+    pub(super) ip: String,
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) ttl_hours: Option<u64>,
+}
+
+/// Remove an IP/CIDR from the operator trust list (re-enables auto-response).
+/// `reason` is optional (recorded for the audit trail when present).
+#[derive(Debug, Deserialize)]
+pub(crate) struct UntrustIpRequest {
+    pub(super) ip: String,
+    #[serde(default)]
+    pub(super) reason: String,
+}
+
+/// Authorise a binary PATH for the Execution Gate (operator "Trust Exec").
+/// - `path`: absolute binary path to allow (no globs — the kernel enforces an
+///   exact path).
+/// - `reason`: operator rationale (mandatory; audit trail).
+/// - `totp`: 6-digit 2FA code. Required when `[security].method = "totp"` (arming
+///   exec is a sensitive action); ignored when 2FA is disabled.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TrustExecRequest {
+    pub(super) path: String,
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) totp: String,
+}
+
+/// Remove a path from the Execution Gate operator allowlist.
+#[derive(Debug, Deserialize)]
+pub(crate) struct UntrustExecRequest {
+    pub(super) path: String,
+    #[serde(default)]
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) totp: String,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ActionResponse {
     pub(super) success: bool,

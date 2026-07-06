@@ -27,11 +27,34 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
     "/usr/bin/pkexec",
 ];
 
+/// Standard directories that hold setuid-root helpers. Top-level dirs are scanned
+/// flat; the `lib`/`libexec` trees are walked recursively (bounded) because
+/// distro SUID helpers live deep there (ssh-keysign, dbus-daemon-launch-helper,
+/// polkit-agent-helper-1, ...).
+const SUID_SCAN_DIRS_FLAT: &[&str] = &[
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+];
+const SUID_SCAN_DIRS_DEEP: &[&str] = &["/usr/lib", "/usr/libexec", "/usr/lib64"];
+const SUID_SCAN_MAX_DEPTH: usize = 4;
+const SUID_SCAN_MAX_FILES: usize = 1024;
+
 pub trait PageCacheReader: Send + Sync {
     fn path_exists(&self, path: &Path) -> bool;
     fn read_via_page_cache(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn drop_page_cache_for(&self, path: &Path) -> io::Result<()>;
     fn read_direct_from_disk(&self, path: &Path) -> io::Result<Vec<u8>>;
+
+    /// Enumerate the live setuid-root binaries on the host so the integrity scan
+    /// is not limited to a fixed allowlist. Default empty (mocks/tests stay
+    /// deterministic); the real reader walks the standard binary dirs.
+    fn enumerate_suid(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +76,80 @@ impl PageCacheReader for RealPageCacheReader {
     fn read_direct_from_disk(&self, path: &Path) -> io::Result<Vec<u8>> {
         read_direct(path)
     }
+
+    fn enumerate_suid(&self) -> Vec<PathBuf> {
+        enumerate_suid_binaries()
+    }
+}
+
+/// Walk the standard binary directories and return every regular file carrying
+/// the setuid bit (mode & 0o4000). Bounded in depth and count so a pathological
+/// filesystem cannot make the scan run away. Best-effort: unreadable dirs are
+/// skipped silently (the detector is fail-open). Non-unix builds return empty.
+#[cfg(unix)]
+fn enumerate_suid_binaries() -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let push_if_suid = |path: &Path, found: &mut Vec<PathBuf>| {
+        if let Ok(md) = std::fs::symlink_metadata(path) {
+            // Real file (not a symlink — we scan the actual binary), setuid set.
+            if md.is_file() && md.permissions().mode() & 0o4000 != 0 {
+                found.push(path.to_path_buf());
+            }
+        }
+    };
+
+    // Flat dirs: one level only.
+    for dir in SUID_SCAN_DIRS_FLAT {
+        if found.len() >= SUID_SCAN_MAX_FILES {
+            break;
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if found.len() >= SUID_SCAN_MAX_FILES {
+                    break;
+                }
+                push_if_suid(&entry.path(), &mut found);
+            }
+        }
+    }
+
+    // Deep dirs: bounded-depth recursion (BFS).
+    let mut stack: Vec<(PathBuf, usize)> = SUID_SCAN_DIRS_DEEP
+        .iter()
+        .map(|d| (PathBuf::from(d), 0))
+        .collect();
+    while let Some((dir, depth)) = stack.pop() {
+        if found.len() >= SUID_SCAN_MAX_FILES {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Use symlink_metadata so we never follow a symlink into a loop.
+            let Ok(md) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if md.is_dir() && depth < SUID_SCAN_MAX_DEPTH {
+                stack.push((path, depth + 1));
+            } else if md.is_file() && md.permissions().mode() & 0o4000 != 0 {
+                found.push(path);
+                if found.len() >= SUID_SCAN_MAX_FILES {
+                    break;
+                }
+            }
+        }
+    }
+
+    found
+}
+
+#[cfg(not(unix))]
+fn enumerate_suid_binaries() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 pub struct SuidPageCacheIntegrityDetector<R: PageCacheReader> {
@@ -87,7 +184,23 @@ impl<R: PageCacheReader> SuidPageCacheIntegrityDetector<R> {
     }
 
     pub fn scan_once_at(&self, now: DateTime<Utc>) -> Vec<Event> {
-        self.allowlist
+        // Scan the configured floor (always) UNION the live setuid binaries found
+        // on the host, deduped. The fixed allowlist alone left every off-list
+        // SUID-root helper (fusermount3, Xorg, ntfs-3g, ssh-keysign, distro
+        // helpers under /usr/lib*) un-checked for page-cache poisoning.
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut targets: Vec<PathBuf> = Vec::new();
+        for path in self
+            .allowlist
+            .iter()
+            .cloned()
+            .chain(self.reader.enumerate_suid())
+        {
+            if seen.insert(path.clone()) {
+                targets.push(path);
+            }
+        }
+        targets
             .iter()
             .filter_map(|path| self.scan_path(path, now))
             .collect()
@@ -294,6 +407,7 @@ mod tests {
         page_reads: Mutex<VecDeque<io::Result<Vec<u8>>>>,
         disk_reads: Mutex<VecDeque<io::Result<Vec<u8>>>>,
         fadvise_calls: Mutex<usize>,
+        enumerated: Vec<PathBuf>,
     }
 
     impl MockReader {
@@ -303,6 +417,7 @@ mod tests {
                 page_reads: Mutex::new(VecDeque::new()),
                 disk_reads: Mutex::new(VecDeque::new()),
                 fadvise_calls: Mutex::new(0),
+                enumerated: Vec::new(),
             }
         }
 
@@ -312,7 +427,16 @@ mod tests {
                 page_reads: Mutex::new(VecDeque::new()),
                 disk_reads: Mutex::new(VecDeque::new()),
                 fadvise_calls: Mutex::new(0),
+                enumerated: Vec::new(),
             }
+        }
+
+        /// Make this path both exist and be returned by enumerate_suid (i.e. a
+        /// live SUID binary discovered dynamically, NOT on the fixed allowlist).
+        fn with_enumerated(mut self, path: &str) -> Self {
+            self.existing_paths.insert(PathBuf::from(path));
+            self.enumerated.push(PathBuf::from(path));
+            self
         }
 
         fn push_page_read(&self, result: io::Result<Vec<u8>>) {
@@ -353,6 +477,10 @@ mod tests {
                 .pop_front()
                 .expect("mock disk read not queued")
         }
+
+        fn enumerate_suid(&self) -> Vec<PathBuf> {
+            self.enumerated.clone()
+        }
     }
 
     fn detector(reader: MockReader) -> SuidPageCacheIntegrityDetector<MockReader> {
@@ -388,6 +516,53 @@ mod tests {
             event.summary,
             "SUID binary corrupted in page cache: /usr/bin/su"
         );
+        assert_eq!(detector.reader.fadvise_call_count(), 1);
+    }
+
+    /// Regression anchor (evasion audit E6, 2026-06-20): the detector used to
+    /// scan ONLY the fixed 10-path allowlist, so page-cache poisoning of any
+    /// off-list SUID-root binary (fusermount3, Xorg, ntfs-3g, ssh-keysign, distro
+    /// helpers under /usr/lib*) was never checked. It now also scans every live
+    /// SUID binary returned by enumerate_suid(). Here a poisoned binary that is
+    /// NOT on the allowlist is discovered via enumeration and fires Critical.
+    #[test]
+    fn test_enumerated_offlist_suid_binary_is_scanned() {
+        let reader = MockReader::new("/usr/bin/su").with_enumerated("/usr/lib/openssh/ssh-keysign");
+        // allowlisted /usr/bin/su: clean (page == disk)
+        reader.push_page_read(Ok(b"su-clean".to_vec()));
+        reader.push_disk_read(Ok(b"su-clean".to_vec()));
+        // enumerated off-list ssh-keysign: poisoned (page != disk)
+        reader.push_page_read(Ok(b"keysign-poisoned".to_vec()));
+        reader.push_disk_read(Ok(b"keysign-clean".to_vec()));
+        let detector = detector(reader);
+
+        let events = detector.scan_once_at(Utc::now());
+
+        assert_eq!(
+            events.len(),
+            1,
+            "the off-allowlist SUID binary must be scanned"
+        );
+        assert_eq!(
+            events[0].details["path"], "/usr/lib/openssh/ssh-keysign",
+            "the dynamically-enumerated SUID binary fired, not the allowlisted one"
+        );
+        assert_eq!(events[0].severity, Severity::Critical);
+    }
+
+    /// A path on BOTH the allowlist and the enumerated set is scanned once, not
+    /// twice (dedup), so we don't double-read/double-alert.
+    #[test]
+    fn test_allowlist_and_enumerated_overlap_dedup() {
+        let reader = MockReader::new("/usr/bin/su").with_enumerated("/usr/bin/su");
+        reader.push_page_read(Ok(b"x".to_vec()));
+        reader.push_disk_read(Ok(b"x".to_vec()));
+        let detector = detector(reader);
+
+        let events = detector.scan_once_at(Utc::now());
+
+        assert!(events.is_empty());
+        // exactly one scan happened (one fadvise), proving dedup
         assert_eq!(detector.reader.fadvise_call_count(), 1);
     }
 

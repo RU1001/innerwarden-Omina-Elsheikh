@@ -161,7 +161,7 @@ mod tests {
             ParsedLine::Message(e) => e,
             _ => panic!("message"),
         };
-        let d = route_message(&env, Direction::ClientToServer, None, None);
+        let d = route_message(&env, Direction::ClientToServer, None, None, None);
         let line = format_alert("mylabel", &d);
         assert!(line.contains("label=mylabel"));
         assert!(line.contains("client->server"));
@@ -169,11 +169,37 @@ mod tests {
         assert!(!line.contains('\n'), "alert must be a single line");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    // multi_thread (2 workers): the proxy task awaits a real spawned child
+    // while this test drains the duplex. On a single-threaded runtime those two
+    // starve each other under CI load and the reader observed an empty buffer
+    // (the `out.contains("sk-ant-")` flake that failed #1010 even with `join!`).
+    // A second worker lets the reader progress independently.
+    //
+    // The echo subprocess is an `sh` line-echoer, NOT `cat`. `cat` with a piped
+    // stdout is BLOCK-buffered, so it holds the ~120-byte echo in libc's stdio
+    // buffer and only flushes it when stdin closes and it exits — the echo
+    // bytes and the stdout EOF then land on the pipe together, and the proxy's
+    // select loop can race draining the echo line against its break-on-EOF.
+    // That exit-time coupling is the residual flake (passed #1067's CI, failed
+    // the post-merge run on main, 2026-06-19). The shell `read`/`printf` loop
+    // issues a direct write(2) per line, so the echo is forwarded WHILE stdin is
+    // still open — well before EOF — making the forward-before-break ordering
+    // deterministic. A bounded timeout turns any pathological hang into a clear,
+    // fast failure instead of a CI-wide stall.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_drives_the_proxy_over_pipes() {
-        // `cat` echoes input; serve should run the proxy to completion and
-        // return the child's exit code, exercising the on_alert closure path.
-        let cfg = build_proxy_config("advisory", false, &["cat".to_string()]).unwrap();
+        // sh line-echoer: reads each line and printf's it back immediately
+        // (unbuffered write(2) per line), then exits 0 on stdin EOF.
+        let cfg = build_proxy_config(
+            "advisory",
+            false,
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_string(),
+            ],
+        )
+        .unwrap();
         let engine = load_engine();
         let (mut to_proxy, proxy_in) = duplex(16384);
         let (proxy_out, mut from_proxy) = duplex(16384);
@@ -187,12 +213,23 @@ mod tests {
             .unwrap();
         to_proxy.shutdown().await.unwrap();
 
-        let code = h.await.unwrap().unwrap();
-        assert_eq!(code, 0);
+        // Drain the output CONCURRENTLY with the proxy, not after it. Awaiting
+        // `h` first and only then reading `from_proxy` is a duplex race: if the
+        // reader isn't draining while the proxy writes/closes, the test can
+        // observe an empty/partial buffer (the `out.contains("sk-ant-")` flake,
+        // OS-thread/scheduling dependent). `join!` runs both to completion
+        // together; the timeout bounds a pathological hang.
         let mut out = String::new();
-        from_proxy.read_to_string(&mut out).await.unwrap();
-        // Advisory forwards the call (cat echoes it).
-        assert!(out.contains("sk-ant-"));
+        let (proxy_res, read_res) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(h, from_proxy.read_to_string(&mut out))
+            })
+            .await
+            .expect("proxy did not complete within 10s");
+        assert_eq!(proxy_res.unwrap().unwrap(), 0);
+        read_res.unwrap();
+        // Advisory forwards the call (the echoer reflects it back).
+        assert!(out.contains("sk-ant-"), "echo not forwarded; out={out:?}");
     }
 
     #[test]

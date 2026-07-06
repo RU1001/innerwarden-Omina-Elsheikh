@@ -174,11 +174,36 @@ pub(crate) fn apply_kg_decide_modifier(
         }
     };
     let now = chrono::Utc::now();
-    let features = match extract_features(&kg, incident, now) {
+    let mut features = match extract_features(&kg, incident, now) {
         Some(f) => f,
         None => return, // no IP entity or entity not yet in graph
     };
     drop(kg); // release the read lock before any logging or apply
+
+    // The KG IP node's `first_seen` (and risk) is rebuilt from a dated, daily
+    // graph snapshot, so it effectively resets across days/restarts — the
+    // age-based benign-suppression bands (`first_seen_age_days >= 7`) were
+    // therefore unreachable and the modifier sat at 0.0 in practice. Override
+    // with the PERSISTED attacker-intel profile (loaded from redb on boot, so
+    // it carries the true first sighting + composite risk across restarts).
+    // We take the OLDER age and HIGHER risk: a longer tenure makes the benign
+    // bands reachable for genuinely long-lived IPs, and the higher composite
+    // risk keeps the repeat-offender band honest — neither weakens detection.
+    if let Some(ip) = incident
+        .entities
+        .iter()
+        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+        .map(|e| e.value.as_str())
+    {
+        if let Some(profile) = state.attacker_profiles.get(ip) {
+            crate::kg_decide_features::merge_persisted_profile(
+                &mut features,
+                profile.first_seen,
+                profile.risk_score,
+                now,
+            );
+        }
+    }
 
     let (modifier_raw, reason) = compute_modifier(&features);
     let modifier_after_floor = apply_critical_floor(modifier_raw, &incident.severity);

@@ -1,0 +1,7 @@
+[Unit]
+Description=InnerWarden SQLite->Loki incident bridge (feeds the Loki dashboard panels)
+Documentation=file:/deploy/observability/README.md
+[Service]
+Type=oneshot
+# adjust IW_DB / LOKI_URL / CURSOR via a drop-in if your paths differ
+ExecStart=/usr/bin/python3 /opt/innerwarden/observability/sqlite-loki-bridge.py

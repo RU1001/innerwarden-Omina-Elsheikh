@@ -1525,13 +1525,20 @@ pub fn read_orphan_resolutions(
         // filename dynamically must not escape data_dir.
         return HashMap::new();
     }
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
+    // Stream the resolutions log line by line rather than holding the whole
+    // file in RAM only to build a last-wins map.
+    use std::io::BufRead as _;
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
         Err(_) => return HashMap::new(),
     };
     let mut latest: HashMap<String, OrphanResolution> = HashMap::new();
-    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
-        if let Ok(r) = serde_json::from_str::<OrphanResolution>(line) {
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+    {
+        if let Ok(r) = serde_json::from_str::<OrphanResolution>(&line) {
             // Last-wins: a later append overrides earlier resolutions
             // for the same orphan id (operator changed their mind).
             latest.insert(r.orphan_id.clone(), r);

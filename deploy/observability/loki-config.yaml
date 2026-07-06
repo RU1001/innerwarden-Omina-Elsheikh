@@ -1,0 +1,42 @@
+# Single-binary Loki for the fleet incident layer. Filesystem storage, no
+# clustering — sized for a demo / small fleet. For a large deployment use a
+# proper Loki (object store, retention policy per the customer's rules).
+auth_enabled: false
+
+server:
+  http_listen_address: 127.0.0.1   # loopback: Grafana (same host) proxies it
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /home/lab/iw-obs/loki-data
+  storage:
+    filesystem:
+      chunks_directory: /home/lab/iw-obs/loki-data/chunks
+      rules_directory: /home/lab/iw-obs/loki-data/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 336h   # 14 days — the customer controls this; short by default
+  reject_old_samples: false
+  allow_structured_metadata: true
+
+compactor:
+  working_directory: /home/lab/iw-obs/loki-data/compactor
+  retention_enabled: true
+  delete_request_store: filesystem

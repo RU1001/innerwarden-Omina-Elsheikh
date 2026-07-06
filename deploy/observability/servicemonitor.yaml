@@ -1,0 +1,46 @@
+# Prometheus Operator ServiceMonitor for an InnerWarden agent fleet on Kubernetes.
+#
+# Assumes each node runs the InnerWarden agent as a DaemonSet fronted by a
+# headless Service `innerwarden-agent` with a named `metrics` port. Apply this
+# and kube-prometheus-stack scrapes every node's agent automatically; the
+# per-tenant labels (tenant=<pod/employee>) give the per-Claude-Code breakdown.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: innerwarden-agent
+  labels:
+    app: innerwarden
+    release: kube-prometheus-stack   # match your Prometheus Operator's serviceMonitorSelector
+spec:
+  selector:
+    matchLabels:
+      app: innerwarden-agent
+  endpoints:
+    - port: metrics
+      scheme: https
+      interval: 15s
+      tlsConfig:
+        insecureSkipVerify: true      # agent serves a self-signed cert on :8787
+      relabelings:
+        # instance = the node the agent runs on (per-node aggregation)
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: instance
+---
+# Headless Service the ServiceMonitor selects. Point it at the agent DaemonSet
+# pods and expose the metrics port. (The DaemonSet itself is deployment-specific
+# and not shipped here — it runs the standard `innerwarden-agent` with the
+# dashboard/metrics port 8787.)
+apiVersion: v1
+kind: Service
+metadata:
+  name: innerwarden-agent
+  labels:
+    app: innerwarden-agent
+spec:
+  clusterIP: None
+  selector:
+    app: innerwarden-agent
+  ports:
+    - name: metrics
+      port: 8787
+      targetPort: 8787

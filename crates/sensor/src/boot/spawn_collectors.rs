@@ -42,6 +42,7 @@ use crate::collectors::{
     exec_audit::ExecAuditCollector, integrity::IntegrityCollector, journald::JournaldCollector,
     macos_log::MacosLogCollector, nginx_access::NginxAccessCollector,
     nginx_error::NginxErrorCollector, syslog_firewall::SyslogFirewallCollector,
+    windows_etw::WindowsEtwCollector,
 };
 use crate::config::Config;
 use crate::detectors;
@@ -55,6 +56,32 @@ use crate::sinks::state::State;
 /// after spawning so the consumer side does NOT keep a sender alive
 /// indefinitely (any leftover would block shutdown forever).
 ///
+/// InnerWarden's own config files, always integrity-monitored regardless of
+/// user config. The prefix is platform-specific: `/etc/innerwarden` on Linux,
+/// `/usr/local/etc/innerwarden` on macOS (where the installer writes them). The
+/// old hardcoded `/etc/innerwarden/*` list produced `cannot hash file: No such
+/// file` warnings on every macOS boot and monitored nothing real there (F8).
+pub(crate) fn self_monitor_config_paths() -> [&'static str; 3] {
+    self_monitor_config_paths_for(cfg!(target_os = "macos"))
+}
+
+/// Pure inner (tested for both platforms on the Linux CI host).
+pub(crate) fn self_monitor_config_paths_for(mac: bool) -> [&'static str; 3] {
+    if mac {
+        [
+            "/usr/local/etc/innerwarden/config.toml",
+            "/usr/local/etc/innerwarden/agent.toml",
+            "/usr/local/etc/innerwarden/agent.env",
+        ]
+    } else {
+        [
+            "/etc/innerwarden/config.toml",
+            "/etc/innerwarden/agent.toml",
+            "/etc/innerwarden/agent.env",
+        ]
+    }
+}
+
 /// 2026-05-25 (PR-F2): signature collapsed from 12 params to 5 by
 /// taking `&SharedCursors` instead of 8 individual cursor Arcs. The
 /// `shared_X` locals destructured below preserve the original body
@@ -112,12 +139,8 @@ pub(crate) fn spawn_collectors(
         *shared_integrity_hashes.lock().unwrap() = known_hashes.clone();
 
         // Always monitor Inner Warden's own config files for tampering,
-        // regardless of user configuration.
-        let self_monitor_paths = [
-            "/etc/innerwarden/config.toml",
-            "/etc/innerwarden/agent.toml",
-            "/etc/innerwarden/agent.env",
-        ];
+        // regardless of user configuration (platform-aware prefix — F8).
+        let self_monitor_paths = self_monitor_config_paths();
         let mut all_paths: Vec<std::path::PathBuf> =
             ic.paths.iter().map(|p| Path::new(p).to_owned()).collect();
         for sp in &self_monitor_paths {
@@ -253,6 +276,27 @@ pub(crate) fn spawn_collectors(
         tokio::spawn(async move {
             if let Err(e) = collector.run(tx_macos).await {
                 tracing::error!("macos_log collector error: {e:#}");
+            }
+        });
+    }
+
+    // Spawn windows_etw collector (spec 085). Belt-and-suspenders: gated on
+    // BOTH `cfg!(target_os = "windows")` (the collector only does useful work
+    // there; its `wevtutil` probe fails open elsewhere) AND the opt-in config
+    // flag. The `cfg!` macro is a runtime bool (same idiom as line ~64), so
+    // the block still COMPILES on every platform - keeping `WindowsEtwCollector`
+    // referenced (no dead-code) - while only ever SPAWNING on Windows.
+    if cfg!(target_os = "windows") && cfg.collectors.windows_etw.enabled {
+        let wc = &cfg.collectors.windows_etw;
+        let collector = WindowsEtwCollector::new(&cfg.agent.host_id)
+            .with_channels(wc.channels.clone())
+            .with_poll_seconds(wc.poll_seconds)
+            .with_batch_cap(wc.batch_cap);
+        info!(channels = ?wc.channels, "starting windows_etw collector");
+        let tx_etw = tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = collector.run(tx_etw).await {
+                tracing::error!("windows_etw collector error: {e:#}");
             }
         });
     }
@@ -435,6 +479,18 @@ pub(crate) fn spawn_collectors(
         });
     }
 
+    // tunnel_iface: behavioural mesh/overlay-VPN persistence detection — watches
+    // for a NEW tun/WireGuard interface appearing at runtime (rename-proof,
+    // complements the c2_web_tunnel exec-name detector). Baselines startup
+    // interfaces; 30s poll.
+    if cfg.collectors.tunnel_iface.enabled {
+        let tx_tunnel = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::tunnel_iface::run(tx_tunnel, host_id, 30).await;
+        });
+    }
+
     // SUID page-cache integrity: detects Copy Fail / Dirty Frag / Fragnesia-style
     // page-cache poisoning by comparing cached reads with direct-I/O disk reads.
     if cfg.detectors.suid_page_cache_integrity.enabled {
@@ -516,6 +572,33 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    /// F8 anchor (2026-07-01): the self-monitored config paths follow the
+    /// platform install prefix, so macOS watches the real `/usr/local/etc`
+    /// files instead of nonexistent `/etc/innerwarden/*`.
+    #[test]
+    fn self_monitor_config_paths_are_platform_prefixed() {
+        let paths = self_monitor_config_paths();
+        let want_prefix = if cfg!(target_os = "macos") {
+            "/usr/local/etc/innerwarden/"
+        } else {
+            "/etc/innerwarden/"
+        };
+        assert!(paths.iter().all(|p| p.starts_with(want_prefix)));
+        assert!(paths.iter().any(|p| p.ends_with("config.toml")));
+        assert!(paths.iter().any(|p| p.ends_with("agent.toml")));
+        assert!(paths.iter().any(|p| p.ends_with("agent.env")));
+    }
+
+    #[test]
+    fn self_monitor_config_paths_for_both_platforms() {
+        assert!(self_monitor_config_paths_for(true)
+            .iter()
+            .all(|p| p.starts_with("/usr/local/etc/innerwarden/")));
+        assert!(self_monitor_config_paths_for(false)
+            .iter()
+            .all(|p| p.starts_with("/etc/innerwarden/")));
+    }
+
     fn write_temp_file(dir: &std::path::Path, name: &str) -> String {
         let path = dir.join(name);
         std::fs::write(&path, "seed\n").expect("write temp file");
@@ -576,6 +659,7 @@ mod tests {
         cfg.collectors.sysctl_drift.enabled = true;
         cfg.collectors.systemd_inventory.enabled = true;
         cfg.collectors.tcp_stream.enabled = true;
+        cfg.collectors.tunnel_iface.enabled = true;
         cfg.detectors.suid_page_cache_integrity.enabled = true;
         cfg.detectors.kernel_devnode_exposed.enabled = true;
 

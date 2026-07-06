@@ -87,6 +87,147 @@ pub(crate) fn xdp_failure_to_warn(
     }
 }
 
+/// Extract the source-process identity `(pid, comm, read_path)` from an
+/// incident's `evidence`, tolerating both the array-of-one shape the eBPF
+/// detectors + killchain tracker emit (`evidence: [{...}]`) and a bare object.
+///
+/// For `data_exfil_ebpf` the evidence keys are `comm`, `pid`, `sensitive_file`
+/// (per `crates/sensor/src/detectors/data_exfil_ebpf.rs`); for the killchain
+/// tracker they are `comm`, `pid`, `pattern` (no read path). Returns `None`
+/// when there is no pid to attribute (then there is no source to verify and the
+/// block proceeds).
+fn incident_source_identity(
+    incident: &innerwarden_core::incident::Incident,
+) -> Option<(u32, String, Option<String>)> {
+    let ev = match &incident.evidence {
+        serde_json::Value::Array(arr) => arr.first()?,
+        obj @ serde_json::Value::Object(_) => obj,
+        _ => return None,
+    };
+    let pid = ev.get("pid").and_then(|p| p.as_u64())? as u32;
+    let comm = ev
+        .get("comm")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    let read_path = ev
+        .get("sensitive_file")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+    Some((pid, comm, read_path))
+}
+
+/// Spec 081 — consult the managed-agent verifier for the incident's source
+/// process. Returns `Some((agent_id, name))` ONLY when the source is a
+/// positively-verified, IW-managed agent acting on its own services (the caller
+/// then downgrades to monitor); `None` in every other case (no attributable
+/// source, registry miss, forged identity, recycled pid, …) so the block
+/// proceeds normally. Fail-closed by construction.
+///
+/// Clones the shared registry + signature-index `Arc`s up front so the registry
+/// lock does not conflict with the `&mut state` borrow of other fields.
+///
+/// This thin wrapper performs the AgentState-dependent steps (non-blocking
+/// `try_lock` of the shared registry, clone of the signature index, the
+/// destination-reputation lookup) and then delegates the verdict to the pure-of
+/// -AgentState [`evaluate_managed_agent_downgrade`] with the production
+/// [`crate::managed_agent_guard::SystemProc`] resolver. Behaviour is IDENTICAL
+/// to the pre-refactor inline body; the split only lets the wiring be tested
+/// without a live `/proc` or a full `AgentState`.
+fn managed_agent_downgrade(
+    incident: &innerwarden_core::incident::Incident,
+    state: &AgentState,
+) -> Option<(String, String)> {
+    let registry = state.agent_registry.clone();
+    let sigindex = state.signature_index.clone();
+    // Non-blocking try_lock: the registry mutex is only contended for the brief
+    // window of an `agent connect`. If it is momentarily held, fail closed
+    // (block proceeds) rather than await inside the block-decision hot path.
+    let reg = registry.try_lock().ok()?;
+    let resolver = crate::managed_agent_guard::SystemProc;
+    evaluate_managed_agent_downgrade(
+        incident,
+        &reg,
+        &sigindex,
+        &resolver,
+        // Destination-reputation refinement: when the destination IP is
+        // independently known-malicious, force the block regardless of source.
+        // This is a BLOCK override only — never a destination EXEMPTION.
+        destination_is_known_bad(incident, state),
+    )
+}
+
+/// Pure-of-`AgentState` core of the managed-agent downgrade decision (spec 081).
+/// Given the incident, an already-locked registry, the signature index, a
+/// `/proc` resolver, and the precomputed destination-known-bad flag, returns
+/// `Some((agent_id, name))` when the incident's source is a positively-verified
+/// IW-managed agent on its own services (downgrade to monitor) and `None`
+/// otherwise (block proceeds).
+///
+/// `incident_source_identity` is the first step: with no attributable pid there
+/// is no source to verify, so the block proceeds (`None`). Identical behaviour
+/// to the former inline body of [`managed_agent_downgrade`]; extracting it lets
+/// the wiring be exercised with a stub resolver + a hand-built registry without
+/// constructing a full `AgentState`.
+fn evaluate_managed_agent_downgrade(
+    incident: &innerwarden_core::incident::Incident,
+    registry: &innerwarden_agent_guard::registry::Registry,
+    sigindex: &innerwarden_agent_guard::signatures::SignatureIndex,
+    resolver: &dyn crate::managed_agent_guard::ProcResolver,
+    destination_known_bad: bool,
+) -> Option<(String, String)> {
+    let (pid, comm, read_path) = incident_source_identity(incident)?;
+    let verdict = crate::managed_agent_guard::verify_managed_agent_self_activity(
+        pid,
+        &comm,
+        read_path.as_deref(),
+        registry,
+        sigindex,
+        resolver,
+        destination_known_bad,
+    );
+    match verdict {
+        crate::managed_agent_guard::ManagedAgentVerdict::Managed { agent_id, name } => {
+            Some((agent_id, name))
+        }
+        crate::managed_agent_guard::ManagedAgentVerdict::NotManaged => None,
+    }
+}
+
+/// Destination-reputation hook (spec 081). Returns true when the incident's
+/// destination IP is independently known-malicious, which forces the block even
+/// for an otherwise-managed agent. Today this consults the in-memory local IP
+/// reputation (a destination the agent itself previously confirmed bad). It is
+/// deliberately conservative: a miss returns false (no block override), so the
+/// managed-agent downgrade still applies for unknown destinations. NEVER turns
+/// a known-bad destination into an exemption.
+fn destination_is_known_bad(
+    incident: &innerwarden_core::incident::Incident,
+    state: &AgentState,
+) -> bool {
+    dst_known_bad_from(&incident.entities, &state.ip_reputations)
+}
+
+/// Pure core of [`destination_is_known_bad`]: true when any IP entity of the
+/// incident has a local reputation with `total_blocks > 0` (a destination the
+/// agent itself previously confirmed bad). Split from the `AgentState`-bound
+/// wrapper so the lookup is unit-testable with a hand-built entity slice +
+/// reputation map. Identical behaviour to the former inline body.
+fn dst_known_bad_from(
+    entities: &[innerwarden_core::entities::EntityRef],
+    reputations: &std::collections::HashMap<String, crate::ip_reputation::LocalIpReputation>,
+) -> bool {
+    use innerwarden_core::entities::EntityType;
+    entities
+        .iter()
+        .filter(|e| e.r#type == EntityType::Ip)
+        .any(|e| {
+            reputations
+                .get(&e.value)
+                .is_some_and(|r| r.total_blocks > 0)
+        })
+}
+
 /// Execute the layered `BlockIp` decision path (XDP + firewall + Cloudflare + AbuseIPDB report).
 pub(crate) async fn execute_block_ip_decision(
     ip: &str,
@@ -109,6 +250,37 @@ pub(crate) async fn execute_block_ip_decision(
     state
         .store
         .prune_recent_blocks_before((now_utc - chrono::Duration::seconds(60)).timestamp_millis());
+
+    // Spec 081 — managed-agent coexistence. BEFORE we block the destination IP,
+    // check whether the incident's SOURCE process is a positively-verified,
+    // IW-managed AI agent acting on its OWN config / services (the OpenClaw
+    // class: reads its own .env, connects to its own Slack/Azure endpoint, which
+    // matches the generic sensitive-read → outbound-connect exfil/C2 signature).
+    // If so, DOWNGRADE to monitor/notify — do NOT block the destination IP (a
+    // shared service IP that other users depend on, and which the agent needs to
+    // keep working when it rotates). The relaxation is SOURCE-based (the agent
+    // identity), never destination-based, and AGENT-agnostic (any agent-guard
+    // signature). The verifier fails closed, and a known-bad destination still
+    // forces the block. Detection is untouched: the incident already fired and
+    // was notified; this only withholds the automatic IP-block.
+    if let Some((agent_id, name)) = managed_agent_downgrade(incident, state) {
+        warn!(
+            ip,
+            incident_id = %incident.incident_id,
+            agent_id = %agent_id,
+            agent = %name,
+            "withheld_ip_block: managed-agent-self-activity — destination {ip} block WITHHELD; \
+             source is verified managed agent {agent_id} ({name}) on its own services. \
+             Downgraded to monitor (incident + notification still fired). Detection unchanged."
+        );
+        return (
+            format!(
+                "downgraded to monitor: source is managed agent {agent_id} ({name}) on its \
+                 own services — destination IP {ip} not blocked (spec 081)"
+            ),
+            false,
+        );
+    }
 
     // Circuit breaker: hard ceiling on auto-blocks per UTC hour. Catches
     // the CL-008 *class* of regression — any future correlation rule that
@@ -1325,5 +1497,375 @@ mod tests {
         let (context, details) = result.expect("shield-only failure must warn");
         assert_eq!(context, "shield xdp_manager");
         assert_eq!(details, "shield: ENOENT");
+    }
+
+    // ── Spec 081 — managed-agent downgrade wiring (decision_block_ip side) ──
+    //
+    // These cover the extracted, AgentState-free helpers:
+    //   - `incident_source_identity` (evidence-shape parsing)
+    //   - `dst_known_bad_from` (destination-reputation lookup)
+    //   - `evaluate_managed_agent_downgrade` (the userspace IP-block downgrade
+    //     decision, against a stub `/proc` resolver + hand-built registry)
+    // plus the CROSS test that proves the SAME incident is spared on BOTH the
+    // userspace IP-block path AND the kernel-block path.
+
+    use innerwarden_agent_guard::registry::Registry;
+    use innerwarden_agent_guard::signatures::SignatureIndex;
+    use innerwarden_core::entities::EntityRef;
+    use innerwarden_core::event::Severity;
+    use innerwarden_core::incident::Incident;
+
+    /// Prod-realistic OpenClaw interpreter (`/proc/<pid>/exe`) + identity script
+    /// (argv[1]) + the `interpreter|script` fingerprint the hardened `connect()`
+    /// records. Mirrors the fixtures in `managed_agent_guard::tests`.
+    const OC_INTERP: &str = "/usr/bin/node";
+    const OC_SCRIPT: &str = "/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js";
+
+    fn oc_fingerprint() -> String {
+        format!("{OC_INTERP}|{OC_SCRIPT}")
+    }
+
+    fn oc_resolved(uid: u32) -> crate::managed_agent_guard::ResolvedProcess {
+        crate::managed_agent_guard::ResolvedProcess {
+            argv: vec![
+                OC_INTERP.to_string(),
+                OC_SCRIPT.to_string(),
+                "gateway".to_string(),
+            ],
+            exe_path: Some(OC_INTERP.to_string()),
+            uid: Some(uid),
+        }
+    }
+
+    /// Registry that vouches for OpenClaw at `pid` with the hardened facts
+    /// captured exactly as production `connect()` would.
+    fn registry_with_openclaw(pid: u32) -> Registry {
+        let mut reg = Registry::new();
+        reg.connect_with_facts(
+            "OpenClaw",
+            pid,
+            Some("ag-x"),
+            Some(OC_INTERP.to_string()),
+            Some(1000),
+            Some(oc_fingerprint()),
+        )
+        .expect("connect");
+        reg
+    }
+
+    /// Build a realistic exfil/C2 incident: evidence carries `pid`/`comm`/
+    /// `sensitive_file`/`pattern` (the `data_exfil_ebpf` shape) AND an Ip
+    /// entity for the outbound destination.
+    fn openclaw_exfil_incident(pid: u32, dst_ip: &str) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "azure-dogfood".to_string(),
+            incident_id: format!("data_exfil:detected:{pid}:2026-06-18T00:00Z"),
+            severity: Severity::Critical,
+            title: "Data exfiltration".to_string(),
+            summary: "sensitive read → outbound connect".to_string(),
+            evidence: serde_json::json!([{
+                "pid": pid,
+                "comm": "MainThread",
+                "sensitive_file": "/home/lab/.env",
+                "pattern": "data_exfil",
+            }]),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip(dst_ip)],
+        }
+    }
+
+    /// Build a realistic reverse_shell incident: the eBPF connect+dup2 shape
+    /// emitted by `crates/sensor/src/detectors/reverse_shell.rs` (the
+    /// `ebpf_sequence` branch). Evidence carries `pid`/`comm`/`source_comm`/
+    /// `target_ip`/`target_port` but **no `sensitive_file`** — a pure outbound
+    /// connect with no prior sensitive read, so `incident_source_identity`
+    /// resolves `read_path = None`. The outbound destination is an Ip entity.
+    /// This is the FirstHit shape that protects the AI-agent wedge: a managed
+    /// agent multiplexing a socket (connect → dup2 stdio) looks exactly like a
+    /// reverse shell, and must downgrade to monitor — NOT auto-block the
+    /// destination IP a shared service depends on.
+    fn openclaw_reverse_shell_incident(pid: u32, dst_ip: &str) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "azure-dogfood".to_string(),
+            incident_id: format!("reverse_shell:bash_dup2:{pid}:2026-06-29T00:00Z"),
+            severity: Severity::Critical,
+            title: "Reverse shell detected via eBPF".to_string(),
+            summary: "connect → fd redirect to socket".to_string(),
+            // Mirrors the real detector evidence keys (no `sensitive_file`).
+            evidence: serde_json::json!([{
+                "kind": "reverse_shell",
+                "pattern": "bash_dup2",
+                "detection": "ebpf_sequence",
+                "comm": "MainThread",
+                "source_comm": "MainThread",
+                "pid": pid,
+                "target_ip": dst_ip,
+                "target_port": 443,
+                "redirected_fd": 1,
+            }]),
+            recommended_checks: vec![],
+            tags: vec!["reverse_shell".to_string(), "ebpf".to_string()],
+            entities: vec![EntityRef::ip(dst_ip)],
+        }
+    }
+
+    #[test]
+    fn incident_source_identity_parses_array_evidence() {
+        let inc = openclaw_exfil_incident(4242, "1.2.3.4");
+        let (pid, comm, read_path) =
+            incident_source_identity(&inc).expect("array evidence must parse");
+        assert_eq!(pid, 4242);
+        assert_eq!(comm, "MainThread");
+        assert_eq!(read_path.as_deref(), Some("/home/lab/.env"));
+    }
+
+    #[test]
+    fn incident_source_identity_parses_object_evidence() {
+        let mut inc = openclaw_exfil_incident(7, "1.2.3.4");
+        // Collapse the array-of-one into a bare object — the killchain forward
+        // -compat shape.
+        inc.evidence = serde_json::json!({
+            "pid": 7,
+            "comm": "node",
+            "sensitive_file": "/home/lab/.env",
+        });
+        let (pid, comm, read_path) =
+            incident_source_identity(&inc).expect("object evidence must parse");
+        assert_eq!(pid, 7);
+        assert_eq!(comm, "node");
+        assert_eq!(read_path.as_deref(), Some("/home/lab/.env"));
+    }
+
+    #[test]
+    fn incident_source_identity_returns_none_without_pid() {
+        let mut inc = openclaw_exfil_incident(1, "1.2.3.4");
+        // Evidence present but no pid → no attributable source → None.
+        inc.evidence = serde_json::json!([{ "comm": "node" }]);
+        assert!(incident_source_identity(&inc).is_none());
+        // A non-array/object evidence shape → None too.
+        inc.evidence = serde_json::json!("not-an-object");
+        assert!(incident_source_identity(&inc).is_none());
+    }
+
+    #[test]
+    fn dst_known_bad_from_true_when_ip_entity_has_blocks() {
+        let mut reps = HashMap::new();
+        let mut rep = crate::ip_reputation::LocalIpReputation::new();
+        rep.total_blocks = 3;
+        reps.insert("1.2.3.4".to_string(), rep);
+        let entities = vec![EntityRef::ip("1.2.3.4")];
+        assert!(dst_known_bad_from(&entities, &reps));
+    }
+
+    #[test]
+    fn dst_known_bad_from_false_when_unknown_or_no_blocks() {
+        let mut reps = HashMap::new();
+        // Present but zero blocks → not known-bad.
+        reps.insert(
+            "1.2.3.4".to_string(),
+            crate::ip_reputation::LocalIpReputation::new(),
+        );
+        let entities = vec![EntityRef::ip("1.2.3.4")];
+        assert!(!dst_known_bad_from(&entities, &reps));
+        // Unknown IP → not known-bad.
+        let other = vec![EntityRef::ip("9.9.9.9")];
+        assert!(!dst_known_bad_from(&other, &reps));
+        // A non-IP entity (user) is ignored.
+        let user = vec![EntityRef::user("lab")];
+        assert!(!dst_known_bad_from(&user, &reps));
+    }
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_managed_for_real_openclaw() {
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        let out = evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false);
+        let (agent_id, name) = out.expect("real OpenClaw self-activity must downgrade");
+        assert_eq!(name, "OpenClaw");
+        assert!(agent_id.starts_with("ag-"));
+    }
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_none_when_unregistered() {
+        let pid = 4242;
+        let reg = Registry::new(); // nobody registered
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false).is_none(),
+            "an unregistered source must NOT downgrade — block proceeds"
+        );
+    }
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_none_when_no_pid_in_evidence() {
+        let reg = registry_with_openclaw(4242);
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default();
+        let mut inc = openclaw_exfil_incident(4242, "1.2.3.4");
+        inc.evidence = serde_json::json!([{ "comm": "MainThread" }]); // no pid
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false).is_none(),
+            "no attributable pid → None (block proceeds)"
+        );
+    }
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_none_when_destination_known_bad() {
+        // Even a perfect managed agent is blocked when the destination is
+        // independently known-malicious (reputation override).
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, true).is_none(),
+            "destination_known_bad=true forces the block even for a managed agent"
+        );
+    }
+
+    // ── REVERSE_SHELL (connect-only, read_path=None) DOWNGRADE — wedge guard ──
+    //
+    // Regression guard for the AI-agent wedge. A reverse_shell incident from a
+    // verified managed agent carries NO `sensitive_file` (`read_path = None`),
+    // unlike the exfil shape. The own-config gate in `decide()` is conditional
+    // (`if let Some(read_path)`), so read_path=None still reaches `Managed` once
+    // the identity gates pass. If a future refactor makes a read_path REQUIRED,
+    // every managed-agent socket-multiplex would auto-block its destination IP —
+    // the exact wedge-demo FP storm. This test pins the downgrade.
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_managed_for_reverse_shell_shape() {
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        // No `.with_owner(...)`: a connect-only incident never stats a read_path,
+        // so the verdict must not depend on file ownership.
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000));
+        let inc = openclaw_reverse_shell_incident(pid, "203.0.113.7");
+        // Sanity: this shape has no read_path.
+        let (_, _, read_path) =
+            incident_source_identity(&inc).expect("reverse_shell evidence carries a pid");
+        assert!(
+            read_path.is_none(),
+            "reverse_shell evidence has no sensitive_file → read_path must be None"
+        );
+        let out = evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false);
+        let (agent_id, name) =
+            out.expect("connect-only managed-agent activity (read_path=None) must downgrade");
+        assert_eq!(name, "OpenClaw");
+        assert!(agent_id.starts_with("ag-"));
+    }
+
+    #[test]
+    fn reverse_shell_to_known_bad_dest_still_blocks_for_managed_agent() {
+        // Anti-evasion: the connect-only downgrade NEVER becomes a destination
+        // exemption. A managed agent connecting to an independently known-bad IP
+        // is still blocked — the reputation override fires regardless of the
+        // missing read_path.
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000));
+        let inc = openclaw_reverse_shell_incident(pid, "203.0.113.7");
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, true).is_none(),
+            "known-bad destination forces the block even on the connect-only shape"
+        );
+    }
+
+    // ── CROSS / INTEGRATION TEST (incident → response, BOTH paths) ─────────
+    //
+    // The SAME realistic OpenClaw incident must be spared on BOTH response
+    // paths: the userspace IP-block (`evaluate_managed_agent_downgrade`) AND
+    // the kernel PID-block (`killchain_inline::evaluate_kernel_block_withhold`).
+    // The negative variant (unregistered pid) must block on BOTH. This proves
+    // the end-to-end incident→response wiring, not just the unit `decide()`.
+
+    #[test]
+    fn cross_managed_openclaw_spared_on_both_response_paths() {
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        // Prod-realistic OpenClaw: exe=/usr/bin/node, argv carries the script,
+        // uid 1000, owner of /home/lab/.env = 1000.
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+
+        // (1) Userspace IP-block path — downgrade (Some).
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        let userspace = evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false);
+        assert!(
+            userspace.is_some(),
+            "userspace IP-block must be downgraded for the managed OpenClaw"
+        );
+
+        // (2) Kernel-block path — withhold (Some). Build the killchain evidence
+        // object shape the kernel path reads (pid + pattern=data_exfil + comm +
+        // the `sensitive_file` the tracker now emits). The read is the agent's
+        // OWN /home/lab/.env (owner uid 1000), so the own-config gate passes on
+        // the kernel path exactly like the userspace path.
+        let kc_ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+            "sensitive_file": "/home/lab/.env",
+        });
+        let kernel =
+            crate::killchain_inline::evaluate_kernel_block_withhold(&kc_ev, &reg, &sigindex, &stub);
+        assert!(
+            kernel.is_some(),
+            "kernel PID-block must be WITHHELD for the managed OpenClaw"
+        );
+
+        // Same agent identity surfaced on both paths.
+        assert_eq!(userspace.unwrap().1, "OpenClaw");
+        assert_eq!(kernel.unwrap().1, "OpenClaw");
+    }
+
+    #[test]
+    fn cross_unregistered_pid_blocks_on_both_response_paths() {
+        let pid = 4242;
+        let reg = Registry::new(); // EMPTY registry — nobody vouched
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+
+        // (1) Userspace IP-block path — proceeds (None).
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false).is_none(),
+            "unregistered source → userspace block proceeds"
+        );
+
+        // (2) Kernel-block path — proceeds (None).
+        let kc_ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+        });
+        assert!(
+            crate::killchain_inline::evaluate_kernel_block_withhold(&kc_ev, &reg, &sigindex, &stub)
+                .is_none(),
+            "unregistered source → kernel block proceeds"
+        );
     }
 }

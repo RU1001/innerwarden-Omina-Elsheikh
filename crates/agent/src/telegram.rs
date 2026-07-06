@@ -63,12 +63,13 @@ pub struct PendingConfirmation {
     pub action_name: String,
 }
 
-pub use burst::{format_daily_digest_enriched, format_simple_status, PipelineDigestStats};
+pub use burst::{format_daily_briefing, format_simple_status, BlockedSource, DailyBriefingData};
 pub use client::TelegramClient;
 pub use commands::{
     append_to_allowlist, log_allowlist_change, log_false_positive, read_undoable_allowlist_entries,
     remove_from_allowlist,
 };
+pub(crate) use formatting::friendly_detector_name;
 pub use formatting::{escape_html_pub, extract_detector_pub, truncate_callback_pub};
 
 #[allow(dead_code)]

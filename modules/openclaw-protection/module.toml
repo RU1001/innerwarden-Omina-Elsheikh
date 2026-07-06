@@ -2,7 +2,7 @@
 id          = "openclaw-protection"
 name        = "AI Agent Protection"
 version     = "0.1.0"
-description = "Monitor and protect servers running OpenClaw, n8n, Langchain, or any autonomous AI agent - detects dangerous commands, suspicious execution patterns, and config tampering"
+description = "Supervise supported local AI agents and tool runners - screens dangerous commands, suspicious execution patterns, MCP/tool activity, and config tampering"
 authors     = ["InnerWarden Contributors"]
 license     = "Apache-2.0"
 tier        = "open"

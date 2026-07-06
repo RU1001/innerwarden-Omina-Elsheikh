@@ -705,7 +705,7 @@ pub(crate) fn cmd_module_install(
                 if cap_registry.get(cap_id).is_none() {
                     anyhow::bail!("capability '{}' not found - update InnerWarden", cap_id);
                 }
-                cmd_enable(cli, &cap_registry, cap_id, HashMap::new(), yes)?;
+                cmd_enable(cli, &cap_registry, cap_id, HashMap::new(), yes, false)?;
             }
             return Ok(());
         }

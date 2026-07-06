@@ -195,6 +195,15 @@ impl TcpFingerprinter {
         let mut groups: HashMap<(u16, u8), Vec<String>> = HashMap::new();
         for fp in self.fingerprints.values() {
             if let (Some(w), Some(t)) = (fp.dominant_window_size(), fp.dominant_ttl()) {
+                // Skip the "unknown L4 fingerprint" bucket (window 0 = no captured
+                // TCP window; timestamp-only tracking records 0). Without this,
+                // every IP whose window/ttl was never captured would share (0, 0)
+                // and >= botnet_ip_threshold of them would falsely cluster into a
+                // botnet. Botnet detection therefore requires a real L4 fingerprint;
+                // the per-IP timing-variance bot detection above needs none.
+                if w == 0 {
+                    continue;
+                }
                 groups.entry((w, t)).or_default().push(fp.ip.clone());
             }
         }

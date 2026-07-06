@@ -44,7 +44,20 @@ ProtectSystem=strict
 # /etc/ufw   - UFW writes updated rules
 ReadWritePaths=/var/lib/innerwarden /run /etc/ufw
 ReadOnlyPaths=/etc/innerwarden
-ProtectHome=yes
+# ProtectHome=read-only (NOT =yes): spec-081 managed-agent coexistence must verify
+# a co-located AI agent's OWN config in /home (e.g. OpenClaw's /home/lab/.env) by
+# stat-ing its owner uid. ProtectHome=yes hides /home entirely, so the verifier
+# fails closed and auto-blocks the agent's own activity (observed live on Azure
+# 2026-06-21: OpenClaw read its .env then called its own Azure-OpenAI endpoint and
+# InnerWarden blocked the endpoint). read-only lets the agent READ /home to verify,
+# never write. If you run NO co-located agents, you may set this back to =yes.
+ProtectHome=read-only
+# Optional, defense-in-depth: CAP_SYS_PTRACE lets the (non-root) agent readlink a
+# cross-uid /proc/<pid>/exe for strict interpreter-root verification of a managed
+# agent running as another user. Not required — the verifier falls back to argv[0]
+# (pinned by the registered cmdline fingerprint) when /proc/exe is unreadable.
+# Uncomment to enable strict exe verification:
+# AmbientCapabilities=CAP_SYS_PTRACE
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

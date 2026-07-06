@@ -112,6 +112,15 @@ function buildActionPreviewHtml(cfg, intent) {
       '<code>' + esc(cmd4) + '</code>' +
       '<div class="preview-meta">' + esc(meta4) + '</div>';
   }
+  if (intent.type === 'trust_ip') {
+    var cmd5 = 'trust ' + intent.ip + ' (monitor-only — suppress auto-response, keep detecting)';
+    var meta5 = live
+      ? 'LIVE — the agent stops auto-blocking this IP within ≤30s. Still detected, logged, notified.'
+      : 'DRY RUN — preview only. Logged as simulated.';
+    return '<span class="preview-label">Trust IP</span>' +
+      '<code>' + esc(cmd5) + '</code>' +
+      '<div class="preview-meta">' + esc(meta5) + '</div>';
+  }
   return '';
 }
 
@@ -167,6 +176,14 @@ function showActionModal(type, ip, user) {
       'Queues removal of the ' + esc(actionCfg.block_backend) + ' block. The agent reverts it on '
         + 'its next slow-loop tick (≤30s). Logged to the audit trail.',
       actionCfg.dry_run ? 'Simulate Unblock' : 'Unblock IP',
+      false);
+  } else if (type === 'trust_ip') {
+    _openActionModal(
+      'Trust IP: ' + _mono(ip),
+      'Monitor-only allowlist: the agent stops AUTO-blocking ' + esc(ip) + ', but it is still '
+        + 'detected, logged, and you are still notified. Manage / time-box via the CLI '
+        + '(innerwarden trust). Logged to the audit trail.',
+      actionCfg.dry_run ? 'Simulate Trust' : 'Trust IP',
       false);
   } else {
     _openActionModal(
@@ -267,6 +284,9 @@ async function submitAction() {
         reason,
         incident_ids: pendingAction.incidentIds || [],
       });
+    } else if (pendingAction.type === 'trust_ip') {
+      url = '/api/action/trust-ip';
+      body = JSON.stringify({ ip: pendingAction.ip, reason });
     } else if (pendingAction.type === 'triage') {
       url = '/api/action/triage-case';
       body = JSON.stringify({

@@ -114,6 +114,26 @@ coverage:
           # format_alert, and `serve` (driven over in-memory pipes) in
           # agent_proxy.rs, plus the agent-guard proxy itself.
           - "!crates/ctl/src/commands/agent_proxy.rs"
+          # `innerwarden setup` is an interactive wizard: a MultiSelect over
+          # notification channels plus per-channel `cmd_configure_*` prompts
+          # that block on the test's stdin (same class as ctl/src/main.rs and
+          # agent_proxy.rs). The pure logic it composes IS unit-tested in
+          # setup.rs's own `#[cfg(test)]` module — notification_plan_defaults /
+          # from_selections, compute_setup_existing_channels,
+          # channels_to_configure_in_apply, already_configured_*,
+          # sensor_restart_decision, resolve_responder_plan_from_selection — and
+          # those still count toward the `ctl` project gate. Only the
+          # interactive apply loop (which prompts on stdin) is unreachable.
+          - "!crates/ctl/src/commands/setup.rs"
+          # Service-manager I/O wrappers: systemd.rs shells out to systemctl /
+          # launchctl / schtasks / tasklist. The Windows branch (schtasks/tasklist)
+          # only runs on Windows (spec 085 Phase 4), so those spawns are
+          # uncoverable on the Linux runner. All the ROUTING + parsing logic it
+          # composes (restart_route, scheduled_task_name, classify_tasklist,
+          # classify_pgrep, classify_systemctl_is_active, restart_*_with via
+          # injected closures) IS unit-tested (26 tests) - only the thin
+          # spawn-the-real-tool wrappers are excluded.
+          - "!crates/ctl/src/systemd.rs"
           - "!crates/sensor/src/main.rs"
           # Sensor dispatch/wiring: process_event dispatches to 79
           # detectors + writes incidents via SQLite. Unit-testing
@@ -123,6 +143,13 @@ coverage:
           - "!crates/sensor/src/event_dispatch.rs"
           - "!crates/sensor/src/detector_set.rs"
           - "!crates/sensor/src/boot/build_detectors.rs"
+          # Collector-spawn wiring: a sequence of `if cfg.collectors.X.enabled {
+          # tokio::spawn(collector.run(...)) }` blocks. Each collector's run() is
+          # unit-tested in its own module; the spawn glue here only orchestrates.
+          # Same class as build_detectors.rs. Also holds the windows_etw spawn,
+          # whose `cfg!(target_os = "windows")` block cannot execute on the Linux
+          # CI runner (spec 085).
+          - "!crates/sensor/src/boot/spawn_collectors.rs"
           # FFI boundary to the kernel BPF map at
           # /sys/fs/bpf/innerwarden/blocked_pids. Every line in
           # aya_impl.rs calls into aya which calls into the kernel —
@@ -133,6 +160,35 @@ coverage:
           # validation happens against the prod kernel — see
           # project_lsm_aya_kernel_64.md for the GC validation log.
           - "!crates/agent/src/lsm_policy/aya_impl.rs"
+          # Same kernel-FFI exclusion for the Execution Gate live-map readers
+          # (spec 080 G4): reading EXEC_ALLOWLIST / LSM_POLICY needs CAP_BPF +
+          # real pins. The verdict logic (innerwarden_core::execution_gate) and
+          # the monitor's pure helpers ARE unit-tested.
+          - "!crates/agent/src/execution_gate_aya.rs"
+          # Same kernel-FFI exclusion for the Execution Gate WRITER (spec 083
+          # arming): apply_arm_plan / disarm / resolve_cgroup_id write the pinned
+          # maps and need CAP_BPF + real pins. The SAFETY decision they apply
+          # (innerwarden_core::execution_gate::plan_arm + reconcile) IS
+          # unit-tested; the writes are validated on a real kernel by the
+          # `#[ignore]`d on-box roundtrip test in the file.
+          - "!crates/agent/src/execution_gate_arm.rs"
+          # Windows Event Log collector (spec 085 Phantom-on-Windows Phase 1):
+          # run() spawns `wevtutil` and drains its stdout in a poll loop -
+          # Windows-only, so it compiles on the Linux CI runner but can never
+          # execute there (probe fails, fail-open returns Ok), leaving those
+          # runtime lines uncoverable - same class as the eBPF/kernel-FFI files
+          # above and main.rs/boot.rs. The PURE parser + watermark math it
+          # delegates to (parse_win_event, is_local_dest, drain_should_continue,
+          # ...) IS unit-tested by the 33 in-file #[cfg(test)] tests that run
+          # under `cargo test` and gate via `make test`. Future Windows-runtime
+          # collectors/skills under spec 085 get the same exclusion.
+          - "!crates/sensor/src/collectors/windows_etw.rs"
+          # Windows Firewall block skill (spec 085 Phase 2): the netsh
+          # delete-then-add block path only runs on Windows (netsh does not
+          # exist on the Linux CI runner), so those spawn lines are uncoverable
+          # here - the same Windows-runtime class as windows_etw above. The IP
+          # validation + dry-run logic IS unit-tested (runs under `cargo test`).
+          - "!crates/agent/src/skills/builtin/block_ip_windows.rs"
       # Orchestration / boot wiring gets its own *informational* gauge so
       # it is measured (not hidden) but never blocks merges. Real ceiling
       # is set by integration tests, not unit tests.

@@ -465,6 +465,7 @@ async fn promote_escalated_to_decision(
         ip_reputation: None,
         ip_geo: None,
         ip_dshield: None,
+        ip_dshield_attacker: false,
         host_posture: None,
         prior_decisions: None,
         graph_context: None,

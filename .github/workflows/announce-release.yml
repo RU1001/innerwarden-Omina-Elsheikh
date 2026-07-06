@@ -1,0 +1,89 @@
+name: Announce Release
+
+# Auto-divulgação: when a (non-pre-release) GitHub Release is published, post a
+# short announcement with the link to whichever channels have a secret set. This
+# is the "release IS the announcement" path — GitHub already notifies watchers;
+# this fans the same event out to your own channels with zero manual posting.
+#
+# Channels are opt-in by secret presence — a channel with no secret is silently
+# skipped, and a failed post never fails the workflow (announce is best-effort,
+# it must never gate a release). Add any of these repo secrets to enable:
+#   RELEASE_TELEGRAM_BOT_TOKEN + RELEASE_TELEGRAM_CHAT_ID
+#   RELEASE_DISCORD_WEBHOOK
+#   RELEASE_SLACK_WEBHOOK
+# (X/Twitter is intentionally omitted — its OAuth dance is not worth a CI secret;
+# post there by hand from the same copy if you want it.)
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    name: Announce to channels
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fan out the release link
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.RELEASE_TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.RELEASE_TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK: ${{ secrets.RELEASE_DISCORD_WEBHOOK }}
+          SLACK_WEBHOOK: ${{ secrets.RELEASE_SLACK_WEBHOOK }}
+          TAG: ${{ github.event.release.tag_name }}
+          URL: ${{ github.event.release.html_url }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -uo pipefail
+
+          # Never announce a pre-release (vX.Y.Z-rc.N).
+          if [ "${PRERELEASE}" = "true" ]; then
+            echo "pre-release ${TAG} — skipping announce"
+            exit 0
+          fi
+
+          MSG="InnerWarden ${TAG} is out — open-source eBPF Linux security + AI-agent guardrail. ${URL}"
+          any=0
+
+          if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+            any=1
+            if curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                 --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                 --data-urlencode "text=${MSG}" >/dev/null; then
+              echo "telegram: sent"
+            else
+              echo "telegram: post failed (non-fatal)"
+            fi
+          else
+            echo "telegram: no secret, skipped"
+          fi
+
+          if [ -n "${DISCORD_WEBHOOK}" ]; then
+            any=1
+            payload=$(jq -nc --arg c "$MSG" '{content: $c}')
+            if curl -fsS -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" >/dev/null; then
+              echo "discord: sent"
+            else
+              echo "discord: post failed (non-fatal)"
+            fi
+          else
+            echo "discord: no secret, skipped"
+          fi
+
+          if [ -n "${SLACK_WEBHOOK}" ]; then
+            any=1
+            payload=$(jq -nc --arg t "$MSG" '{text: $t}')
+            if curl -fsS -H "Content-Type: application/json" -d "$payload" "$SLACK_WEBHOOK" >/dev/null; then
+              echo "slack: sent"
+            else
+              echo "slack: post failed (non-fatal)"
+            fi
+          else
+            echo "slack: no secret, skipped"
+          fi
+
+          if [ "$any" = "0" ]; then
+            echo "::notice::No announce channel configured. Add RELEASE_TELEGRAM_BOT_TOKEN+RELEASE_TELEGRAM_CHAT_ID, RELEASE_DISCORD_WEBHOOK, or RELEASE_SLACK_WEBHOOK to enable auto-announce."
+          fi

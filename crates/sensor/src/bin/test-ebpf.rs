@@ -67,6 +67,7 @@ fn summarize_event(data: &[u8]) -> Option<EbpfEventSummary> {
     }
 }
 
+#[cfg(not(feature = "ebpf"))]
 fn missing_ebpf_feature_message() -> &'static str {
     "This binary requires the 'ebpf' feature. Compile with:\n  cargo build --release --features ebpf -p innerwarden-sensor --bin test-ebpf"
 }

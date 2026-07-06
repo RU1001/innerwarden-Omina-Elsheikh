@@ -1477,6 +1477,9 @@ ignored = 0, 9, 67
                 "ppid": 999,
                 "comm": comm,
                 "parent_comm": parent_comm,
+                // Interactive-operator baseline: a real ssh shell owns a tty.
+                // The OpInteractive free-pass now requires this (evasion audit E3).
+                "has_tty": true,
                 "command": comm,
                 "argv": [comm],
                 "argc": 1,

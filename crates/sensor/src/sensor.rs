@@ -200,6 +200,7 @@ pub(crate) async fn boot_init(cfg: Config) -> Result<SensorContext> {
             collector_health::build_ebpf_status(
                 cfg.collectors.ebpf_syscall.enabled,
                 crate::collectors::ebpf_syscall::ebpf_unavailability_reason(),
+                crate::collectors::ebpf_syscall::ebpf_progs_attached(),
                 now,
             ),
             collector_health::build_status(

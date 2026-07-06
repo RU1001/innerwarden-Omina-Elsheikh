@@ -226,6 +226,9 @@ pub const COLLECTOR_MANIFEST: &[(&str, CollectorCategory)] = &[
     ("cloudtrail", CollectorCategory::Telemetry),
     ("dns_capture", CollectorCategory::Telemetry),
     ("ebpf", CollectorCategory::Telemetry),
+    // Windows ETW / Event Log collector (spec 085). Emits `source: "etw"`;
+    // always-on log stream, so a low count means the feed is broken.
+    ("etw", CollectorCategory::Telemetry),
     ("file_extract", CollectorCategory::Telemetry),
     ("http_capture", CollectorCategory::Telemetry),
     ("journald", CollectorCategory::Telemetry),
@@ -390,19 +393,35 @@ pub fn build_status(
 /// reserved "for ebpf without recent kernel" since PR25 but was never
 /// emitted, so the Sensors HUD now shows the kernel feed as
 /// `unsupported` with a reason instead of silently appearing healthy
-/// while ~44 eBPF programs are dark. Boot-time/static check only; a
-/// runtime CAP_BPF load failure is a separate follow-up.
+/// while ~44 eBPF programs are dark.
+///
+/// Two failure modes, both surfaced here instead of a false "active":
+/// - **static** (`unavailability_reason`): kernel too old / no BTF / no
+///   bytecode — eBPF cannot load at all.
+/// - **runtime** (`runtime_attached`): eBPF loaded but 0 programs actually
+///   attached (e.g. under a restrictive systemd sandbox), leaving the sensor
+///   host-blind. `None` = attach count not known yet (treated as active, not
+///   yet blind); `Some(0)` = confirmed blind; `Some(n>0)` = healthy.
 pub fn build_ebpf_status(
     enabled_in_config: bool,
     unavailability_reason: Option<String>,
+    runtime_attached: Option<usize>,
     _now: chrono::DateTime<chrono::Utc>,
 ) -> CollectorStatus {
     let health = if !enabled_in_config {
         CollectorHealth::DisabledByConfig
     } else {
         match unavailability_reason {
-            None => CollectorHealth::Active,
             Some(reason) => CollectorHealth::Unsupported { reason },
+            None => match runtime_attached {
+                Some(0) => CollectorHealth::Unsupported {
+                    reason: "eBPF loaded but 0 programs attached at runtime - \
+                             host syscall detection is off (check systemd \
+                             sandboxing and capabilities)"
+                        .to_string(),
+                },
+                _ => CollectorHealth::Active,
+            },
         }
     };
     CollectorStatus {
@@ -693,20 +712,29 @@ mod tests {
         let now = chrono::Utc::now();
 
         // Disabled in config -> not a fault.
-        let disabled = build_ebpf_status(false, Some("kernel too old".into()), now);
+        let disabled = build_ebpf_status(false, Some("kernel too old".into()), None, now);
         assert_eq!(disabled.name, "ebpf");
         assert_eq!(disabled.category, CollectorCategory::Telemetry);
         assert!(disabled.source.is_none());
         assert!(matches!(disabled.health, CollectorHealth::DisabledByConfig));
 
-        // Enabled and available -> Active.
-        let active = build_ebpf_status(true, None, now);
+        // Enabled, available, programs attached -> Active.
+        let active = build_ebpf_status(true, None, Some(44), now);
         assert!(matches!(active.health, CollectorHealth::Active));
+
+        // Enabled, available, attach count not yet known -> still Active
+        // (do not flag blind until we actually observe 0 attached).
+        let unknown = build_ebpf_status(true, None, None, now);
+        assert!(matches!(unknown.health, CollectorHealth::Active));
 
         // Enabled but unavailable -> Unsupported carrying the reason, so
         // the HUD shows WHY the kernel feed is dark instead of nothing.
-        let unsupported =
-            build_ebpf_status(true, Some("/sys/kernel/btf/vmlinux missing".into()), now);
+        let unsupported = build_ebpf_status(
+            true,
+            Some("/sys/kernel/btf/vmlinux missing".into()),
+            None,
+            now,
+        );
         match unsupported.health {
             // The reason is preserved verbatim so the HUD can show it.
             CollectorHealth::Unsupported { reason } => {
@@ -717,10 +745,30 @@ mod tests {
     }
 
     #[test]
+    fn build_ebpf_status_flags_runtime_host_blind() {
+        // The gap that let iw-k7 look healthy: eBPF loads (no static reason)
+        // but 0 programs attach at runtime -> the sensor is host-blind and must
+        // NOT report Active.
+        let now = chrono::Utc::now();
+        let blind = build_ebpf_status(true, None, Some(0), now);
+        match blind.health {
+            CollectorHealth::Unsupported { reason } => {
+                assert!(reason.contains("0 programs attached"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported (host-blind), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_ebpf_status_serializes_with_state_and_reason() {
         // The dashboard keys on the serde-tagged `state` field + reason.
         let now = chrono::Utc::now();
-        let status = build_ebpf_status(true, Some("kernel 4.18 is older than 5.8".into()), now);
+        let status = build_ebpf_status(
+            true,
+            Some("kernel 4.18 is older than 5.8".into()),
+            None,
+            now,
+        );
         let json = serde_json::to_value(&status).expect("serialize");
         assert_eq!(json["name"], "ebpf");
         assert_eq!(json["health"]["state"], "unsupported");

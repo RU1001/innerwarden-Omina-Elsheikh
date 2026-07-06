@@ -4,6 +4,7 @@ use std::pin::Pin;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
+use innerwarden_core::sudo_guard::{deny_file_path, is_valid_username};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -13,7 +14,6 @@ use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 const DEFAULT_TTL_SECS: u64 = 1800;
 const MIN_TTL_SECS: u64 = 60;
 const MAX_TTL_SECS: u64 = 86_400;
-const DENY_FILE_PREFIX: &str = "/etc/sudoers.d/zz-innerwarden-deny-";
 
 pub struct SuspendUserSudo;
 
@@ -73,24 +73,14 @@ impl ResponseSkill for SuspendUserSudo {
                 .clamp(MIN_TTL_SECS, MAX_TTL_SECS);
             let created_at = Utc::now();
             let expires_at = created_at + Duration::seconds(ttl_secs as i64);
-            // Wave 2 (AUDIT-WAVE2-SUDOERS-DOT): sudo's `includedir` for
-            // `/etc/sudoers.d/` SILENTLY ignores any file whose name
-            // contains `.` (period) or ends in `~` (tilde) - per
-            // sudoers(5) "files that contain a `.` (period) or end with
-            // `~` (tilde) are silently ignored". Real Linux usernames
-            // CAN contain `.` (e.g. `john.doe`), and `is_valid_username`
-            // intentionally allows it. The deny file's filename is built
-            // from the username verbatim, so `john.doe` produces
-            // `/etc/sudoers.d/zz-innerwarden-deny-john.doe` which sudo
-            // reads, sees the `.`, and skips - the rule never loads, the
-            // suspension is silently a no-op, and the operator believes
-            // the user was suspended. Sanitize the FILENAME portion only
-            // (the rule body still uses the real username so sudo
-            // matches the right account).
-            let deny_file = format!(
-                "{DENY_FILE_PREFIX}{}",
-                sanitize_sudoers_filename_segment(&user)
-            );
+            // The on-disk deny-file path is derived once, canonically, in
+            // `innerwarden_core::sudo_guard::deny_file_path` — the same helper
+            // the privileged `__sudo-suspend` subcommand uses — so what the
+            // agent records in metadata can never diverge from what the root
+            // helper actually writes. (It also sanitizes the `.`/`~` characters
+            // sudo's includedir silently skips, so `john.doe` does not become a
+            // no-op suspension.)
+            let deny_file = deny_file_path(&user);
 
             if dry_run {
                 info!(
@@ -105,115 +95,105 @@ impl ResponseSkill for SuspendUserSudo {
                 };
             }
 
-            let rule = render_sudo_deny_rule(&user, expires_at);
-            let tmp_path = std::env::temp_dir().join(format!(
-                "innerwarden-sudo-deny-{}-{}.tmp",
-                user,
-                Utc::now().timestamp_nanos_opt().unwrap_or_default()
-            ));
-
-            if let Err(e) = std::fs::write(&tmp_path, rule) {
-                return SkillResult {
-                    success: false,
-                    message: format!("failed to write temp sudoers rule: {e}"),
-                };
-            }
-
-            let tmp_path_str = tmp_path.to_string_lossy().to_string();
-            let install_output = Command::new("sudo")
+            // Delegate the privileged write to the hard-coded helper subcommand.
+            // The narrow sudoers grant permits only
+            // `innerwarden __sudo-suspend --user *` (and `__sudo-restore`), so a
+            // compromised agent cannot install arbitrary sudoers content — the
+            // binary generates a deny-all rule itself, validates it with visudo,
+            // and refuses `root`. See `innerwarden_core::sudo_guard` and
+            // `crates/ctl/src/commands/sudo_guard.rs`.
+            let expires_rfc3339 = expires_at.to_rfc3339();
+            let output = Command::new("sudo")
                 .args([
-                    "install",
-                    "-o",
-                    "root",
-                    "-g",
-                    "root",
-                    "-m",
-                    "440",
-                    &tmp_path_str,
-                    &deny_file,
+                    "innerwarden",
+                    "__sudo-suspend",
+                    "--user",
+                    &user,
+                    "--expires",
+                    &expires_rfc3339,
                 ])
                 .output()
                 .await;
-
-            let _ = std::fs::remove_file(&tmp_path);
-
-            match install_output {
-                Ok(out) if out.status.success() => {}
+            let outcome = match output {
+                Ok(out) if out.status.success() => SuspendOutcome::Ok,
                 Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(user, stderr = %stderr, "failed to install sudo suspend rule");
-                    return SkillResult {
-                        success: false,
-                        message: format!("failed to install sudo suspend rule: {stderr}"),
-                    };
+                    SuspendOutcome::HelperFailed(String::from_utf8_lossy(&out.stderr).into_owned())
                 }
-                Err(e) => {
-                    warn!(user, error = %e, "failed to spawn install command");
-                    return SkillResult {
-                        success: false,
-                        message: format!("failed to install sudo suspend rule: {e}"),
-                    };
-                }
-            }
-
-            let visudo_output = Command::new("sudo")
-                .args(["visudo", "-cf", &deny_file])
-                .output()
-                .await;
-
-            match visudo_output {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let _ = Command::new("sudo")
-                        .args(["rm", "-f", &deny_file])
-                        .output()
-                        .await;
-                    warn!(user, stderr = %stderr, "invalid generated sudoers rule");
-                    return SkillResult {
-                        success: false,
-                        message: format!("generated invalid sudoers rule for {user}: {stderr}"),
-                    };
-                }
-                Err(e) => {
-                    let _ = Command::new("sudo")
-                        .args(["rm", "-f", &deny_file])
-                        .output()
-                        .await;
-                    return SkillResult {
-                        success: false,
-                        message: format!("failed to validate sudoers rule: {e}"),
-                    };
-                }
-            }
-
-            let meta = SuspensionMetadata {
-                user: user.clone(),
-                deny_file: deny_file.clone(),
-                created_at,
-                expires_at,
-                reason: ctx.incident.summary.clone(),
+                Err(e) => SuspendOutcome::SpawnError(e.to_string()),
             };
 
-            if let Err(e) = write_metadata(&ctx.data_dir, &meta) {
-                warn!(user, error = %e, "failed to write suspension metadata");
-            }
-
-            info!(
-                user,
+            finish_suspend(
+                &ctx.data_dir,
+                &user,
                 ttl_secs,
-                deny_file,
-                expires_at = %expires_at,
-                "suspended sudo access for user"
-            );
-
-            SkillResult {
-                success: true,
-                message: format!(
-                    "Suspended sudo for user {user} for {ttl_secs}s (until {expires_at})"
-                ),
-            }
+                created_at,
+                expires_at,
+                &deny_file,
+                &ctx.incident.summary,
+                outcome,
+            )
         })
+    }
+}
+
+/// Outcome of invoking the `__sudo-suspend` helper — the seam that keeps
+/// `finish_suspend`'s branch logic testable without spawning a real `sudo`.
+enum SuspendOutcome {
+    Ok,
+    /// Helper ran but returned non-zero; carries its stderr.
+    HelperFailed(String),
+    /// The `sudo` process could not be spawned; carries the error text.
+    SpawnError(String),
+}
+
+/// Given the helper outcome, write metadata on success and produce the
+/// `SkillResult`. Split out of `execute` so the success / helper-error /
+/// spawn-error branches + the metadata write are unit-testable without
+/// spawning `sudo`.
+#[allow(clippy::too_many_arguments)]
+fn finish_suspend(
+    data_dir: &Path,
+    user: &str,
+    ttl_secs: u64,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    deny_file: &str,
+    reason: &str,
+    outcome: SuspendOutcome,
+) -> SkillResult {
+    match outcome {
+        SuspendOutcome::Ok => {}
+        SuspendOutcome::HelperFailed(stderr) => {
+            warn!(user, stderr = %stderr, "failed to suspend sudo via helper");
+            return SkillResult {
+                success: false,
+                message: format!("failed to suspend sudo for {user}: {}", stderr.trim()),
+            };
+        }
+        SuspendOutcome::SpawnError(e) => {
+            warn!(user, error = %e, "failed to spawn __sudo-suspend helper");
+            return SkillResult {
+                success: false,
+                message: format!("failed to suspend sudo for {user}: {e}"),
+            };
+        }
+    }
+
+    let meta = SuspensionMetadata {
+        user: user.to_string(),
+        deny_file: deny_file.to_string(),
+        created_at,
+        expires_at,
+        reason: reason.to_string(),
+    };
+    if let Err(e) = write_metadata(data_dir, &meta) {
+        warn!(user, error = %e, "failed to write suspension metadata");
+    }
+
+    info!(user, ttl_secs, deny_file, expires_at = %expires_at, "suspended sudo access for user");
+    SkillResult {
+        success: true,
+        message: format!("Suspended sudo for user {user} for {ttl_secs}s (until {expires_at})"),
     }
 }
 
@@ -250,7 +230,7 @@ pub async fn cleanup_expired_sudo_suspensions(data_dir: &Path, dry_run: bool) ->
         }
 
         let output = Command::new("sudo")
-            .args(["rm", "-f", &meta.deny_file])
+            .args(["innerwarden", "__sudo-restore", "--user", &meta.user])
             .output()
             .await;
 
@@ -363,97 +343,19 @@ fn metadata_dir(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("sudo-suspensions")
 }
 
-fn render_sudo_deny_rule(user: &str, expires_at: DateTime<Utc>) -> String {
-    format!(
-        "# Managed by Inner Warden\n# user={user}\n# expires_at={expires_at}\n{user} ALL=(ALL:ALL) !ALL\n"
-    )
-}
-
-/// Wave 2 (AUDIT-WAVE2-SUDOERS-DOT) helper: replace characters that
-/// sudo's `includedir` silently skips (`.` and `~`) with `_` so the
-/// resulting `/etc/sudoers.d/` filename is actually loaded. The rule
-/// body inside the file still uses the real username so sudo matches
-/// the right account; only the on-disk filename is mangled.
-///
-/// Pinned by `sanitize_sudoers_filename_segment_*` anchor tests.
-fn sanitize_sudoers_filename_segment(s: &str) -> String {
-    s.chars()
-        .map(|c| if c == '.' || c == '~' { '_' } else { c })
-        .collect()
-}
-
-fn is_valid_username(user: &str) -> bool {
-    if user.is_empty() || user.len() > 64 {
-        return false;
-    }
-
-    let mut chars = user.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-
-    if !(first.is_ascii_alphanumeric() || first == '_' || first == '-') {
-        return false;
-    }
-
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '$')
-}
+// The username validation, filename sanitisation, and deny-rule rendering that
+// used to live here are now the single source of truth in
+// `innerwarden_core::sudo_guard` (shared with the privileged `__sudo-suspend`
+// helper). Their unit tests live alongside them there.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── Wave 2 anchors (AUDIT-WAVE2-SUDOERS-DOT) ──────────────────────
-    //
-    // sudo's `includedir /etc/sudoers.d` silently skips files containing
-    // `.` or ending in `~` (sudoers(5)). Real Linux usernames may
-    // legitimately contain `.` (e.g. `john.doe`), and `is_valid_username`
-    // accepts them; without filename sanitisation the deny rule never
-    // loads and the suspension is a silent no-op. These tests pin the
-    // fix so the bug cannot recur quietly.
-
-    #[test]
-    fn sanitize_sudoers_filename_segment_replaces_dots() {
-        // The exact prod failure shape: `john.doe` → filename
-        // `zz-innerwarden-deny-john_doe`, NOT `..-deny-john.doe`
-        // (which sudo would silently ignore).
-        assert_eq!(sanitize_sudoers_filename_segment("john.doe"), "john_doe");
-        assert_eq!(
-            sanitize_sudoers_filename_segment("a.b.c.d"),
-            "a_b_c_d",
-            "every dot must be replaced, not just the first"
-        );
-    }
-
-    #[test]
-    fn sanitize_sudoers_filename_segment_replaces_tildes() {
-        // sudo also skips files ending in `~`. Replace anywhere.
-        assert_eq!(sanitize_sudoers_filename_segment("user~"), "user_");
-        assert_eq!(sanitize_sudoers_filename_segment("u~ser"), "u_ser");
-    }
-
-    #[test]
-    fn sanitize_sudoers_filename_segment_passes_safe_chars_through() {
-        // ASCII alphanumeric + `_` + `-` + `$` (SAMBA machine accounts)
-        // are all safe in sudoers.d filenames - must not be touched.
-        for safe in &["alice", "bob_42", "ci-runner-3", "machine$", "x"] {
-            assert_eq!(
-                sanitize_sudoers_filename_segment(safe),
-                *safe,
-                "safe input {safe:?} must pass through unchanged"
-            );
-        }
-    }
-
-    #[test]
-    fn sanitize_sudoers_filename_segment_handles_combined_skip_chars() {
-        // Defense-in-depth: `john.doe~backup` would be doubly skipped
-        // by sudo. Both classes of skip-char get replaced.
-        assert_eq!(
-            sanitize_sudoers_filename_segment("john.doe~backup"),
-            "john_doe_backup"
-        );
-    }
+    // Filename-sanitisation and deny-rule rendering are now tested in
+    // `innerwarden_core::sudo_guard`. The tests below cover this skill's own
+    // behaviour: validation gating, TTL clamping, the sanitized filename
+    // reaching the dry-run message, metadata persistence, and cleanup.
 
     fn skill_context(user: Option<&str>, duration_secs: Option<u64>) -> SkillContext {
         SkillContext {
@@ -533,13 +435,63 @@ mod tests {
     }
 
     #[test]
-    fn render_sudo_deny_rule_contains_operator_metadata_and_deny_rule() {
-        let expires_at = Utc::now() + Duration::minutes(30);
-        let rule = render_sudo_deny_rule("deploy", expires_at);
-        assert!(rule.contains("# Managed by Inner Warden"));
-        assert!(rule.contains("# user=deploy"));
-        assert!(rule.contains(&format!("# expires_at={expires_at}")));
-        assert!(rule.contains("deploy ALL=(ALL:ALL) !ALL"));
+    fn finish_suspend_ok_writes_metadata_and_succeeds() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let created = Utc::now();
+        let expires = created + Duration::minutes(30);
+        let res = finish_suspend(
+            td.path(),
+            "deploy",
+            1800,
+            created,
+            expires,
+            "/etc/sudoers.d/zz-innerwarden-deny-deploy",
+            "suspicious sudo",
+            SuspendOutcome::Ok,
+        );
+        assert!(res.success);
+        assert!(res.message.contains("Suspended sudo for user deploy"));
+        // Metadata persisted on the Ok path.
+        let persisted = metadata_dir(td.path()).join("deploy.json");
+        assert!(persisted.exists());
+    }
+
+    #[test]
+    fn finish_suspend_helper_failure_reports_stderr_and_writes_no_metadata() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let now = Utc::now();
+        let res = finish_suspend(
+            td.path(),
+            "deploy",
+            1800,
+            now,
+            now,
+            "/etc/sudoers.d/zz-innerwarden-deny-deploy",
+            "r",
+            SuspendOutcome::HelperFailed("  visudo rejected\n".to_string()),
+        );
+        assert!(!res.success);
+        assert!(res.message.contains("visudo rejected"));
+        assert!(!metadata_dir(td.path()).join("deploy.json").exists());
+    }
+
+    #[test]
+    fn finish_suspend_spawn_error_reports_error() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let now = Utc::now();
+        let res = finish_suspend(
+            td.path(),
+            "deploy",
+            1800,
+            now,
+            now,
+            "/etc/sudoers.d/zz-innerwarden-deny-deploy",
+            "r",
+            SuspendOutcome::SpawnError("No such file or directory".to_string()),
+        );
+        assert!(!res.success);
+        assert!(res.message.contains("No such file or directory"));
+        assert!(!metadata_dir(td.path()).join("deploy.json").exists());
     }
 
     #[test]

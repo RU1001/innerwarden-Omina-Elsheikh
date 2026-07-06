@@ -27,6 +27,19 @@ pub fn scan_processes(index: &SignatureIndex) -> Vec<DetectedAgent> {
     scan_processes_in_dir(index, Path::new("/proc"))
 }
 
+/// Read `/proc/<pid>/cmdline` as a NUL-separated argv vector. Returns an empty
+/// vec when the file is absent or unreadable (kernel threads, races, EPERM).
+fn read_cmdline(proc_pid_dir: &Path) -> Vec<String> {
+    match std::fs::read(proc_pid_dir.join("cmdline")) {
+        Ok(bytes) => bytes
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn scan_processes_in_dir(index: &SignatureIndex, proc: &Path) -> Vec<DetectedAgent> {
     let mut found: HashMap<String, DetectedAgent> = HashMap::new();
 
@@ -63,7 +76,17 @@ fn scan_processes_in_dir(index: &SignatureIndex, proc: &Path) -> Vec<DetectedAge
             Err(_) => continue,
         };
 
-        if let Some(sig) = index.identify(&comm) {
+        // `comm` is enough for native binaries, but interpreter-launched
+        // agents (OpenClaw is `node .../openclaw/dist/index.js`, comm =
+        // "MainThread") only reveal their identity in the cmdline. Fall back
+        // to scanning argv when comm does not match.
+        let sig = index.identify(&comm).or_else(|| {
+            let argv = read_cmdline(&entry.path());
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            index.identify_cmdline(&argv_refs)
+        });
+
+        if let Some(sig) = sig {
             let key = sig.name.to_string();
             found.entry(key).or_insert_with(|| DetectedAgent {
                 name: sig.name.to_string(),
@@ -231,6 +254,30 @@ mod tests {
         assert_eq!(agents[0].name, "Claude Code");
         assert_eq!(agents[0].vendor, "Anthropic");
         assert_eq!(agents[0].integration, "official");
+    }
+
+    #[test]
+    fn scan_processes_in_dir_detects_interpreter_launched_openclaw_via_cmdline() {
+        // Regression: OpenClaw installed via npm runs as node, and node renames
+        // its main thread, so /proc/<pid>/comm is "MainThread" — comm matching
+        // alone reported "No known agents detected" on a host running OpenClaw.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let proc_dir = temp.path().join("12718");
+        std::fs::create_dir(&proc_dir).expect("pid dir");
+        std::fs::write(proc_dir.join("comm"), "MainThread\n").expect("comm");
+        let argv = [
+            "/usr/bin/node",
+            "/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js",
+            "gateway",
+        ];
+        std::fs::write(proc_dir.join("cmdline"), argv.join("\0")).expect("cmdline");
+
+        let index = SignatureIndex::new();
+        let agents = scan_processes_in_dir(&index, temp.path());
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "OpenClaw");
+        assert_eq!(agents[0].comm, "MainThread");
     }
 
     #[test]

@@ -121,8 +121,6 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, _poll_seconds: u64) {
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 async fn run_linux(tx: mpsc::Sender<Event>, host: String) -> anyhow::Result<()> {
-    use std::os::fd::FromRawFd;
-
     // Open AF_PACKET socket (ETH_P_IP = 0x0800)
     let fd = unsafe {
         libc::socket(
@@ -137,7 +135,6 @@ async fn run_linux(tx: mpsc::Sender<Event>, host: String) -> anyhow::Result<()> 
 
     info!("TLS fingerprint collector started (AF_PACKET raw socket)");
 
-    let mut buf = vec![0u8; 65536];
     let mut cooldowns: HashMap<String, DateTime<Utc>> = HashMap::new();
     let cooldown = Duration::seconds(60);
 

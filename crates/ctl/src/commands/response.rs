@@ -734,21 +734,108 @@ pub(crate) fn cmd_allowlist_remove(cli: &Cli, ip: Option<&str>, user: Option<&st
     Ok(())
 }
 
+/// Default event_pipeline rules dir (shared with the sensor + agent + the
+/// dashboard "Trust IP" feature, which writes suppress_response/scope:ip rules
+/// here).
+const EVENT_PIPELINE_RULES_DIR: &str = "/etc/innerwarden/rules/event_pipeline";
+
+/// A dynamic trusted IP sourced from a `suppress_response`/`scope: ip` rule in
+/// the event_pipeline dir (hot-reloaded by the agent, also writable by hand or
+/// by the dashboard "Trust IP" action).
+pub(crate) struct DynTrust {
+    pub value: String,
+    pub expires_at: Option<String>,
+    pub id: String,
+}
+
+/// Scan a rules dir for `suppress_response`/`scope: ip` rules and return their
+/// trusted IPs. Lenient: unparseable files are skipped. Pure helper for testing.
+pub(crate) fn dynamic_trusted_ips_from_rules(rules_dir: &std::path::Path) -> Vec<DynTrust> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(rules_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".yml") && !name.ends_with(".yaml") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+            continue;
+        };
+        let Some(rules) = doc.get("rules").and_then(|v| v.as_sequence()) else {
+            continue;
+        };
+        for rule in rules {
+            if rule.get("action").and_then(|v| v.as_str()) != Some("suppress_response") {
+                continue;
+            }
+            if rule
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(suppress) = rule.get("suppress") else {
+                continue;
+            };
+            if suppress.get("scope").and_then(|v| v.as_str()) != Some("ip") {
+                continue;
+            }
+            let expires_at = rule
+                .get("expires_at")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = rule
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(values) = suppress.get("values").and_then(|v| v.as_sequence()) {
+                for v in values.iter().filter_map(|v| v.as_str()) {
+                    out.push(DynTrust {
+                        value: v.to_string(),
+                        expires_at: expires_at.clone(),
+                        id: id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn cmd_allowlist_list(cli: &Cli) -> Result<()> {
     use crate::config_editor::read_str_array;
     let ips = read_str_array(&cli.agent_config, "allowlist", "trusted_ips");
     let users = read_str_array(&cli.agent_config, "allowlist", "trusted_users");
+    let dynamic = dynamic_trusted_ips_from_rules(std::path::Path::new(EVENT_PIPELINE_RULES_DIR));
 
-    if ips.is_empty() && users.is_empty() {
+    if ips.is_empty() && users.is_empty() && dynamic.is_empty() {
         println!("Allowlist is empty - no trusted IPs or users configured.");
         println!("Add entries with: innerwarden allowlist add --ip <cidr> --reason \"<why>\"");
         return Ok(());
     }
 
     if !ips.is_empty() {
-        println!("Trusted IPs / CIDRs:");
+        println!("Trusted IPs / CIDRs (static, agent.toml):");
         for ip in &ips {
             println!("  {ip}");
+        }
+    }
+    if !dynamic.is_empty() {
+        println!(
+            "Trusted IPs / CIDRs (dynamic rules, hot-reloaded — incl. dashboard \"Trust IP\"):"
+        );
+        for d in &dynamic {
+            match &d.expires_at {
+                Some(exp) => println!("  {} (expires {exp}) [{}]", d.value, d.id),
+                None => println!("  {} [{}]", d.value, d.id),
+            }
         }
     }
     if !users.is_empty() {
@@ -1138,13 +1225,13 @@ mod tests {
     // emergency CIDRs (Ubuntu mirrors / Telegram / GitHub Pages / Oracle
     // Cloud) without an audit trail and there was no flag to record WHY.
     /// Wave 8e helper: locate today's admin-actions file. The audit
-    /// writer uses `chrono::Local` for the date and canonicalises the
+    /// writer uses `chrono::Utc` for the date and canonicalises the
     /// data_dir (so `/var/folders/...` becomes `/private/var/folders/...`
     /// on macOS). Mirroring both here keeps the anchor tests robust on
     /// any host the test suite runs on. Reads the actual `data_dir`
     /// from the test CLI so it matches `test_cli`'s `temp/data` choice.
     fn admin_audit_today_in(cli: &Cli) -> std::path::PathBuf {
-        let day = chrono::Local::now()
+        let day = chrono::Utc::now()
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
@@ -1211,6 +1298,47 @@ mod tests {
         // Fresh agent.toml has empty arrays — exercise the early-return
         // hint that suggests `--reason` from the start.
         cmd_allowlist_list(&cli).expect("list should print without error");
+    }
+
+    #[test]
+    fn dynamic_trusted_ips_reads_suppress_response_rules() {
+        let temp = TempDir::new().expect("tempdir");
+        // A dashboard "Trust IP" managed file + a disabled rule that must be skipped.
+        let yaml = r#"
+version: 1
+rules:
+  - id: operator-trust-203-0-113-10
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["203.0.113.10"]
+    expires_at: "2026-06-20T10:00:00Z"
+    tags: [operator-trust]
+  - id: operator-trust-10-0-0-0-8
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["10.0.0.0/8"]
+  - id: disabled-one
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["1.2.3.4"]
+    disabled: true
+"#;
+        std::fs::write(temp.path().join("70-operator-trust.yml"), yaml).unwrap();
+        let found = dynamic_trusted_ips_from_rules(temp.path());
+        let vals: Vec<&str> = found.iter().map(|d| d.value.as_str()).collect();
+        assert!(vals.contains(&"203.0.113.10"));
+        assert!(vals.contains(&"10.0.0.0/8"));
+        assert!(!vals.contains(&"1.2.3.4")); // disabled skipped
+        let with_exp = found.iter().find(|d| d.value == "203.0.113.10").unwrap();
+        assert_eq!(with_exp.expires_at.as_deref(), Some("2026-06-20T10:00:00Z"));
+    }
+
+    #[test]
+    fn dynamic_trusted_ips_missing_dir_is_empty() {
+        assert!(dynamic_trusted_ips_from_rules(std::path::Path::new("/nope/xyz")).is_empty());
     }
 
     // Wave 8e anchor: --reason is OPTIONAL for backwards compat, but

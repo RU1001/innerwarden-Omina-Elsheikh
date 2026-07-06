@@ -22,7 +22,7 @@
 //! `data_retention` alongside `decisions-*.jsonl`.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -190,10 +190,16 @@ pub fn append_label(data_dir: &Path, sample: &LabelSample, now: DateTime<Utc>) {
 /// Restart-robust. Missing file → 0. Used by the nightly stats reader.
 pub fn count_labels_for_date(data_dir: &Path, date: &str) -> usize {
     let path = data_dir.join(format!("labels-{date}.jsonl"));
-    match std::fs::read_to_string(&path) {
-        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
-        Err(_) => 0,
-    }
+    // Stream the daily label log line by line rather than slurping the whole
+    // file into a String just to count non-empty lines.
+    let Ok(file) = std::fs::File::open(&path) else {
+        return 0;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .count()
 }
 
 #[cfg(test)]

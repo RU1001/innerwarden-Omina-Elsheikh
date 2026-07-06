@@ -12,7 +12,8 @@ use crate::commands::agent::{cmd_agent, parse_selection_indices, resolve_dashboa
 use crate::commands::ai::{fetch_models, WIZARD_PROVIDERS};
 use crate::commands::capability::cmd_enable_with_deferred_restart;
 use crate::commands::notify::{
-    cmd_configure_dashboard, cmd_configure_slack, cmd_configure_telegram, cmd_configure_webhook,
+    cmd_configure_dashboard, cmd_configure_discord, cmd_configure_slack, cmd_configure_telegram,
+    cmd_configure_webhook,
 };
 use crate::{
     am_root, config_editor, load_env_file, mask_secret, prompt, reexec_with_sudo, restart_agent,
@@ -52,6 +53,7 @@ struct SetupAiPlan {
 struct SetupNotificationPlan {
     telegram: bool,
     slack: bool,
+    discord: bool,
     webhook: bool,
     dashboard: bool,
 }
@@ -64,6 +66,9 @@ impl SetupNotificationPlan {
         }
         if self.slack {
             parts.push("Slack");
+        }
+        if self.discord {
+            parts.push("Discord");
         }
         if self.webhook {
             parts.push("Webhook");
@@ -79,7 +84,7 @@ impl SetupNotificationPlan {
     }
 
     fn any_selected(&self) -> bool {
-        self.telegram || self.slack || self.webhook || self.dashboard
+        self.telegram || self.slack || self.discord || self.webhook || self.dashboard
     }
 }
 
@@ -1336,6 +1341,7 @@ fn collect_setup_checks(
 fn already_configured_channel_lines(
     telegram_ok: bool,
     slack_ok: bool,
+    discord_ok: bool,
     webhook_ok: bool,
     dashboard_ok: bool,
     env_vars: &HashMap<String, String>,
@@ -1354,6 +1360,13 @@ fn already_configured_channel_lines(
             .map(|s| mask_secret(s))
             .unwrap_or_default();
         lines.push(("Slack", format!("webhook: {url}")));
+    }
+    if discord_ok {
+        let url = env_vars
+            .get("DISCORD_WEBHOOK_URL")
+            .map(|s| mask_secret(s))
+            .unwrap_or_default();
+        lines.push(("Discord", format!("webhook: {url}")));
     }
     if webhook_ok {
         let url = env_vars
@@ -1381,6 +1394,7 @@ fn already_configured_channel_lines(
 fn prompt_notification_channels(
     telegram_ok: bool,
     slack_ok: bool,
+    discord_ok: bool,
     webhook_ok: bool,
     dashboard_ok: bool,
     _env_vars: &HashMap<String, String>,
@@ -1388,6 +1402,7 @@ fn prompt_notification_channels(
     Ok(SetupNotificationPlan {
         telegram: telegram_ok,
         slack: slack_ok,
+        discord: discord_ok,
         webhook: webhook_ok,
         dashboard: dashboard_ok,
     })
@@ -1397,6 +1412,7 @@ fn prompt_notification_channels(
 fn prompt_notification_channels(
     telegram_ok: bool,
     slack_ok: bool,
+    discord_ok: bool,
     webhook_ok: bool,
     dashboard_ok: bool,
     env_vars: &HashMap<String, String>,
@@ -1406,8 +1422,14 @@ fn prompt_notification_channels(
 
     println!("  {}\n", bold.apply_to("[3/4] Notification channels"));
 
-    let configured =
-        already_configured_channel_lines(telegram_ok, slack_ok, webhook_ok, dashboard_ok, env_vars);
+    let configured = already_configured_channel_lines(
+        telegram_ok,
+        slack_ok,
+        discord_ok,
+        webhook_ok,
+        dashboard_ok,
+        env_vars,
+    );
     if !configured.is_empty() {
         println!("  {}", dim.apply_to("Already configured:"));
         for (channel, detail) in &configured {
@@ -1421,9 +1443,11 @@ fn prompt_notification_channels(
         "Slack       — team channel",
         "Webhook     — PagerDuty/Opsgenie/custom",
         "Dashboard   — browser UI",
+        "Discord     — server channel",
     ];
 
-    let defaults = notification_plan_defaults(telegram_ok, slack_ok, webhook_ok, dashboard_ok);
+    let defaults =
+        notification_plan_defaults(telegram_ok, slack_ok, discord_ok, webhook_ok, dashboard_ok);
 
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("  Use arrows + space to toggle, Enter to confirm")
@@ -1443,23 +1467,29 @@ fn prompt_notification_channels(
 fn notification_plan_defaults(
     telegram_ok: bool,
     slack_ok: bool,
+    discord_ok: bool,
     webhook_ok: bool,
     dashboard_ok: bool,
 ) -> Vec<bool> {
-    if telegram_ok || slack_ok || webhook_ok || dashboard_ok {
-        vec![telegram_ok, slack_ok, webhook_ok, dashboard_ok]
+    if telegram_ok || slack_ok || discord_ok || webhook_ok || dashboard_ok {
+        vec![telegram_ok, slack_ok, webhook_ok, dashboard_ok, discord_ok]
     } else {
-        vec![true, false, false, true]
+        vec![true, false, false, true, false]
     }
 }
 
 /// Convert the multi-select indices into a structured notification plan.
+///
+/// Index order matches the `items` list in `prompt_notification_channels`:
+/// 0=Telegram, 1=Slack, 2=Webhook, 3=Dashboard, 4=Discord (appended last so the
+/// pre-existing indices stay stable).
 fn notification_plan_from_selections(selections: &[usize]) -> SetupNotificationPlan {
     SetupNotificationPlan {
         telegram: selections.contains(&0),
         slack: selections.contains(&1),
         webhook: selections.contains(&2),
         dashboard: selections.contains(&3),
+        discord: selections.contains(&4),
     }
 }
 
@@ -1475,6 +1505,7 @@ fn resolve_env_file_path(agent_config: &Path) -> PathBuf {
 fn already_configured_summary(
     telegram_ok: bool,
     slack_ok: bool,
+    discord_ok: bool,
     webhook_ok: bool,
     dashboard_ok: bool,
 ) -> String {
@@ -1484,6 +1515,9 @@ fn already_configured_summary(
     }
     if slack_ok {
         parts.push("Slack");
+    }
+    if discord_ok {
+        parts.push("Discord");
     }
     if webhook_ok {
         parts.push("Webhook");
@@ -1500,6 +1534,7 @@ fn pending_channels_for_apply(
     plan: &SetupNotificationPlan,
     telegram_ok: bool,
     slack_ok: bool,
+    discord_ok: bool,
     webhook_ok: bool,
     dashboard_ok: bool,
 ) -> Vec<&'static str> {
@@ -1509,6 +1544,9 @@ fn pending_channels_for_apply(
     }
     if plan.slack && !slack_ok {
         pending.push("Slack");
+    }
+    if plan.discord && !discord_ok {
+        pending.push("Discord");
     }
     if plan.webhook && !webhook_ok {
         pending.push("Webhook");
@@ -1617,13 +1655,14 @@ fn apply_setup_mesh(
 struct SetupExistingChannels {
     pub telegram: bool,
     pub slack: bool,
+    pub discord: bool,
     pub webhook: bool,
     pub dashboard: bool,
 }
 
 impl SetupExistingChannels {
     fn any(&self) -> bool {
-        self.telegram || self.slack || self.webhook || self.dashboard
+        self.telegram || self.slack || self.discord || self.webhook || self.dashboard
     }
 }
 
@@ -1638,6 +1677,8 @@ fn compute_setup_existing_channels(
     SetupExistingChannels {
         telegram: env_has(env_vars, "TELEGRAM_BOT_TOKEN") && env_has(env_vars, "TELEGRAM_CHAT_ID"),
         slack: env_has(env_vars, "SLACK_WEBHOOK_URL") && agent_bool(agent_doc, "slack", "enabled"),
+        discord: env_has(env_vars, "DISCORD_WEBHOOK_URL")
+            && agent_bool(agent_doc, "discord", "enabled"),
         webhook: env_has(env_vars, "WEBHOOK_URL") && agent_bool(agent_doc, "webhook", "enabled"),
         dashboard: env_has(env_vars, "INNERWARDEN_DASHBOARD_USER")
             && env_has(env_vars, "INNERWARDEN_DASHBOARD_PASSWORD_HASH"),
@@ -1650,6 +1691,7 @@ fn compute_setup_existing_channels(
 enum SetupChannel {
     Telegram,
     Slack,
+    Discord,
     Webhook,
     Dashboard,
 }
@@ -1662,6 +1704,7 @@ fn channels_to_configure_in_apply(
     plan: &SetupNotificationPlan,
     telegram_ok: bool,
     slack_ok: bool,
+    discord_ok: bool,
     webhook_ok: bool,
     dashboard_ok: bool,
 ) -> Vec<SetupChannel> {
@@ -1671,6 +1714,9 @@ fn channels_to_configure_in_apply(
     }
     if plan.slack && !slack_ok {
         out.push(SetupChannel::Slack);
+    }
+    if plan.discord && !discord_ok {
+        out.push(SetupChannel::Discord);
     }
     if plan.webhook && !webhook_ok {
         out.push(SetupChannel::Webhook);
@@ -1850,6 +1896,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     let existing = compute_setup_existing_channels(&env_vars, agent_doc.as_ref());
     let telegram_ok = existing.telegram;
     let slack_ok = existing.slack;
+    let discord_ok = existing.discord;
     let webhook_ok = existing.webhook;
     let dashboard_ok_existing = existing.dashboard;
 
@@ -1857,8 +1904,13 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
 
     println!();
     let notification_plan = if any_channel_configured && !setup_mode.is_advanced() {
-        let summary =
-            already_configured_summary(telegram_ok, slack_ok, webhook_ok, dashboard_ok_existing);
+        let summary = already_configured_summary(
+            telegram_ok,
+            slack_ok,
+            discord_ok,
+            webhook_ok,
+            dashboard_ok_existing,
+        );
         println!(
             "  [ok] {}  {}",
             bold.apply_to("[3/4] Alerts"),
@@ -1870,6 +1922,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
             prompt_notification_channels(
                 telegram_ok,
                 slack_ok,
+                discord_ok,
                 webhook_ok,
                 dashboard_ok_existing,
                 &env_vars,
@@ -1878,6 +1931,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
             SetupNotificationPlan {
                 telegram: telegram_ok,
                 slack: slack_ok,
+                discord: discord_ok,
                 webhook: webhook_ok,
                 dashboard: dashboard_ok_existing,
             }
@@ -1886,6 +1940,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
         prompt_notification_channels(
             telegram_ok,
             slack_ok,
+            discord_ok,
             webhook_ok,
             dashboard_ok_existing,
             &env_vars,
@@ -1982,6 +2037,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
         &notification_plan,
         telegram_ok,
         slack_ok,
+        discord_ok,
         webhook_ok,
         dashboard_ok_existing,
     );
@@ -2021,6 +2077,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
             capability.params.clone(),
             true,
             true,
+            false,
         ) {
             println!("  [warn] Could not enable {}: {err:#}", capability.id);
         } else {
@@ -2029,6 +2086,15 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
         }
     }
     apply_setup_preconfig_defaults(&cli.agent_config, &preconfig_plan);
+
+    // Cloud-aware: if this host runs on a cloud whose platform uses a fixed
+    // infrastructure IP outside its published ranges (e.g. Azure's wireserver),
+    // add it to the HOST allowlist so the responder never blocks the platform's
+    // own DNS/health traffic. Server-side rule, not a hardcoded never-block in
+    // the product. Idempotent + best-effort (a failure must not abort setup).
+    if let Err(err) = crate::commands::cloud_detect::apply_cloud_platform_allowlist(cli) {
+        println!("  [warn] cloud platform allowlist step skipped: {err:#}");
+    }
 
     if let Some(plan) = &ai_plan {
         apply_setup_ai_plan(cli, &env_file, plan)?;
@@ -2046,6 +2112,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
         &notification_plan,
         telegram_ok,
         slack_ok,
+        discord_ok,
         webhook_ok,
         dashboard_ok_existing,
     );
@@ -2074,6 +2141,13 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
             SetupChannel::Slack => {
                 if let Err(err) = cmd_configure_slack(cli, None, "high", false) {
                     println!("  [warn] Slack setup did not finish: {err:#}");
+                } else {
+                    channel_restarted_agent = true;
+                }
+            }
+            SetupChannel::Discord => {
+                if let Err(err) = cmd_configure_discord(cli, None, "high", false) {
+                    println!("  [warn] Discord setup did not finish: {err:#}");
                 } else {
                     channel_restarted_agent = true;
                 }
@@ -2318,6 +2392,7 @@ mod tests {
         let plan = SetupNotificationPlan {
             telegram: true,
             slack: true,
+            discord: false,
             webhook: false,
             dashboard: true,
         };
@@ -2661,6 +2736,7 @@ mod tests {
             &env_file,
             &SetupNotificationPlan {
                 slack: true,
+                discord: false,
                 ..Default::default()
             },
             SetupResponderPlan { dry_run: true },
@@ -2982,19 +3058,23 @@ mod tests {
 
     #[test]
     fn notification_plan_defaults_fresh_install_picks_telegram_and_dashboard() {
-        let defaults = notification_plan_defaults(false, false, false, false);
-        assert_eq!(defaults, vec![true, false, false, true]);
+        // Args: (telegram, slack, discord, webhook, dashboard).
+        // Vec order matches the multi-select items: [tg, slack, webhook, dash, discord].
+        let defaults = notification_plan_defaults(false, false, false, false, false);
+        assert_eq!(defaults, vec![true, false, false, true, false]);
     }
 
     #[test]
     fn notification_plan_defaults_keeps_existing_state_when_anything_configured() {
         // If telegram is already configured, defaults should mirror current
-        let d1 = notification_plan_defaults(true, false, false, false);
-        assert_eq!(d1, vec![true, false, false, false]);
-        let d2 = notification_plan_defaults(false, true, true, false);
-        assert_eq!(d2, vec![false, true, true, false]);
-        let d3 = notification_plan_defaults(true, true, true, true);
-        assert_eq!(d3, vec![true, true, true, true]);
+        let d1 = notification_plan_defaults(true, false, false, false, false);
+        assert_eq!(d1, vec![true, false, false, false, false]);
+        // slack + webhook configured
+        let d2 = notification_plan_defaults(false, true, false, true, false);
+        assert_eq!(d2, vec![false, true, true, false, false]);
+        // everything (incl. discord) configured
+        let d3 = notification_plan_defaults(true, true, true, true, true);
+        assert_eq!(d3, vec![true, true, true, true, true]);
     }
 
     #[test]
@@ -3004,12 +3084,17 @@ mod tests {
         assert!(!plan.slack);
         assert!(!plan.webhook);
         assert!(plan.dashboard);
+        assert!(!plan.discord);
 
         let plan = notification_plan_from_selections(&[]);
-        assert!(!plan.telegram && !plan.slack && !plan.webhook && !plan.dashboard);
+        assert!(!plan.telegram && !plan.slack && !plan.webhook && !plan.dashboard && !plan.discord);
 
         let plan = notification_plan_from_selections(&[1, 2]);
-        assert!(!plan.telegram && plan.slack && plan.webhook && !plan.dashboard);
+        assert!(!plan.telegram && plan.slack && plan.webhook && !plan.dashboard && !plan.discord);
+
+        // index 4 = Discord (appended last so existing indices stay stable)
+        let plan = notification_plan_from_selections(&[4]);
+        assert!(plan.discord && !plan.telegram && !plan.slack);
     }
 
     // ---- resolve_env_file_path ----
@@ -3038,17 +3123,25 @@ mod tests {
 
     #[test]
     fn already_configured_summary_lists_only_enabled_channels() {
-        assert_eq!(already_configured_summary(false, false, false, false), "");
+        // Args: (telegram, slack, discord, webhook, dashboard).
         assert_eq!(
-            already_configured_summary(true, false, false, false),
+            already_configured_summary(false, false, false, false, false),
+            ""
+        );
+        assert_eq!(
+            already_configured_summary(true, false, false, false, false),
             "Telegram"
         );
         assert_eq!(
-            already_configured_summary(true, true, false, true),
+            already_configured_summary(true, true, false, false, true),
             "Telegram + Slack + Dashboard"
         );
         assert_eq!(
-            already_configured_summary(true, true, true, true),
+            already_configured_summary(true, true, true, false, false),
+            "Telegram + Slack + Discord"
+        );
+        assert_eq!(
+            already_configured_summary(true, true, false, true, true),
             "Telegram + Slack + Webhook + Dashboard"
         );
     }
@@ -3060,26 +3153,32 @@ mod tests {
         let plan = SetupNotificationPlan {
             telegram: true,
             slack: true,
+            discord: false,
             webhook: false,
             dashboard: true,
         };
-        // telegram already configured, slack & dashboard not
-        let pending = pending_channels_for_apply(&plan, true, false, false, false);
+        // telegram already configured, slack & dashboard not.
+        // Args: (plan, telegram_ok, slack_ok, discord_ok, webhook_ok, dashboard_ok).
+        let pending = pending_channels_for_apply(&plan, true, false, false, false, false);
         assert_eq!(pending, vec!["Slack", "Dashboard"]);
 
         // nothing selected -> nothing pending
         let empty = SetupNotificationPlan::default();
-        assert!(pending_channels_for_apply(&empty, false, false, false, false).is_empty());
+        assert!(pending_channels_for_apply(&empty, false, false, false, false, false).is_empty());
 
-        // everything selected and nothing configured -> all pending
+        // everything selected (incl. discord) and nothing configured -> all pending
         let all_selected = SetupNotificationPlan {
             telegram: true,
             slack: true,
+            discord: true,
             webhook: true,
             dashboard: true,
         };
-        let pending = pending_channels_for_apply(&all_selected, false, false, false, false);
-        assert_eq!(pending, vec!["Telegram", "Slack", "Webhook", "Dashboard"]);
+        let pending = pending_channels_for_apply(&all_selected, false, false, false, false, false);
+        assert_eq!(
+            pending,
+            vec!["Telegram", "Slack", "Discord", "Webhook", "Dashboard"]
+        );
     }
 
     // ---- resolve_responder_plan_from_selection ----
@@ -3691,7 +3790,7 @@ mod tests {
             "admin".to_string(),
         );
 
-        let lines = already_configured_channel_lines(true, true, true, true, &env);
+        let lines = already_configured_channel_lines(true, true, false, true, true, &env);
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0].0, "Telegram");
         assert!(lines[0].1.starts_with("token: "));
@@ -3707,7 +3806,7 @@ mod tests {
     #[test]
     fn already_configured_channel_lines_handles_missing_env_values_gracefully() {
         let env: HashMap<String, String> = HashMap::new();
-        let lines = already_configured_channel_lines(true, false, true, true, &env);
+        let lines = already_configured_channel_lines(true, false, false, true, true, &env);
         assert_eq!(lines.len(), 3);
         // No panic; secrets/values fall back to "" and the prefix is intact.
         assert_eq!(lines[0].0, "Telegram");
@@ -3721,7 +3820,7 @@ mod tests {
     #[test]
     fn already_configured_channel_lines_returns_empty_when_nothing_configured() {
         let env: HashMap<String, String> = HashMap::new();
-        let lines = already_configured_channel_lines(false, false, false, false, &env);
+        let lines = already_configured_channel_lines(false, false, false, false, false, &env);
         assert!(lines.is_empty());
     }
 
@@ -3732,6 +3831,7 @@ mod tests {
         let plan = SetupNotificationPlan {
             telegram: false,
             slack: false,
+            discord: false,
             webhook: true,
             dashboard: false,
         };
@@ -3739,6 +3839,7 @@ mod tests {
         let plan = SetupNotificationPlan {
             telegram: true,
             slack: true,
+            discord: false,
             webhook: true,
             dashboard: true,
         };
@@ -4041,6 +4142,46 @@ mod tests {
     }
 
     #[test]
+    fn compute_setup_existing_channels_discord_needs_env_and_enabled() {
+        let env = make_env_map(&[(
+            "DISCORD_WEBHOOK_URL",
+            "https://discord.com/api/webhooks/1/x",
+        )]);
+        // env present but not enabled in agent.toml → not OK
+        assert!(!compute_setup_existing_channels(&env, None).discord);
+
+        let doc: toml_edit::DocumentMut = "[discord]\nenabled = true\n".parse().unwrap();
+        let snap = compute_setup_existing_channels(&env, Some(&doc));
+        assert!(snap.discord);
+        assert!(snap.any());
+    }
+
+    #[test]
+    fn discord_wizard_lines_and_apply_channel() {
+        // Already-configured banner lists Discord with a masked webhook.
+        let env = make_env_map(&[(
+            "DISCORD_WEBHOOK_URL",
+            "https://discord.com/api/webhooks/1/sekret",
+        )]);
+        let lines = already_configured_channel_lines(false, false, true, false, false, &env);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "Discord");
+        assert!(lines[0].1.starts_with("webhook: "));
+
+        // Selected-but-unconfigured Discord shows up in the apply walk-through.
+        let plan = SetupNotificationPlan {
+            telegram: false,
+            slack: false,
+            discord: true,
+            webhook: false,
+            dashboard: false,
+        };
+        let pending = channels_to_configure_in_apply(&plan, false, false, false, false, false);
+        assert_eq!(pending, vec![SetupChannel::Discord]);
+        assert_eq!(plan.label(), "Discord");
+    }
+
+    #[test]
     fn compute_setup_existing_channels_dashboard_needs_user_and_password_hash() {
         let env = make_env_map(&[("INNERWARDEN_DASHBOARD_USER", "admin")]);
         let snap = compute_setup_existing_channels(&env, None);
@@ -4069,7 +4210,9 @@ mod tests {
     #[test]
     fn channels_to_configure_in_apply_empty_when_nothing_selected() {
         let plan = SetupNotificationPlan::default();
-        assert!(channels_to_configure_in_apply(&plan, false, false, false, false).is_empty());
+        assert!(
+            channels_to_configure_in_apply(&plan, false, false, false, false, false).is_empty()
+        );
     }
 
     #[test]
@@ -4077,10 +4220,11 @@ mod tests {
         let plan = SetupNotificationPlan {
             telegram: true,
             slack: true,
+            discord: false,
             webhook: true,
             dashboard: true,
         };
-        let pending = channels_to_configure_in_apply(&plan, true, false, true, false);
+        let pending = channels_to_configure_in_apply(&plan, true, false, false, true, false);
         assert_eq!(pending, vec![SetupChannel::Slack, SetupChannel::Dashboard]);
     }
 
@@ -4140,10 +4284,11 @@ mod tests {
         let plan = SetupNotificationPlan {
             telegram: true,
             slack: true,
+            discord: false,
             webhook: true,
             dashboard: true,
         };
-        let pending = channels_to_configure_in_apply(&plan, false, false, false, false);
+        let pending = channels_to_configure_in_apply(&plan, false, false, false, false, false);
         assert_eq!(
             pending,
             vec![

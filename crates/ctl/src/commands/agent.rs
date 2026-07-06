@@ -875,6 +875,24 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
         }) => {
             crate::commands::agent_proxy::run(mode, label.as_deref(), *error_response, server_cmd)
         }
+
+        Some(AgentCommand::McpServe { label }) => {
+            crate::commands::agent_mcp_serve::run(cli, label.as_deref())
+        }
+
+        Some(AgentCommand::InstallHook {
+            agent,
+            settings,
+            url,
+            block_review,
+            tenant,
+        }) => crate::commands::agent_install_hook::run(
+            agent,
+            settings.as_deref(),
+            url.as_deref(),
+            *block_review,
+            tenant.as_deref(),
+        ),
     }
 }
 
@@ -900,6 +918,36 @@ mod tests {
         cli.dry_run = true;
         std::fs::create_dir_all(&cli.data_dir).expect("test should create data dir");
         cli
+    }
+
+    #[test]
+    fn cmd_agent_install_hook_writes_guard_into_home() {
+        // Covers the InstallHook dispatch arm + agent_install_hook::run + home().
+        // Nothing else in ctl reads the process HOME, so pointing it at a temp
+        // dir for this test is race-free.
+        let temp = TempDir::new().unwrap();
+        let cli = test_cli(&temp);
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let cmd = AgentCommand::InstallHook {
+            agent: "claude-code".to_string(),
+            settings: None,
+            url: None,
+            block_review: false,
+            tenant: Some("acme-corp".to_string()),
+        };
+        let res = cmd_agent(&cli, Some(&cmd));
+        match prev {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        res.expect("install-hook dispatch should succeed");
+        assert!(home
+            .path()
+            .join(".config/innerwarden/claude_code_guard.sh")
+            .exists());
+        assert!(home.path().join(".claude/settings.json").exists());
     }
 
     #[cfg(unix)]

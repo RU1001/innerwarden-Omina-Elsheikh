@@ -6,15 +6,172 @@ pub(crate) fn incident_detector(incident_id: &str) -> &str {
     incident_id.split(':').next().unwrap_or("unknown")
 }
 
-/// Returns the current guardian mode based on responder configuration.
+/// Returns the guardian mode implied by the current responder configuration.
+/// Because `/mode` mutates the owned `cfg` in place, this always reflects the
+/// live mode (there is no separate override to consult).
 pub(crate) fn guardian_mode(cfg: &config::AgentConfig) -> telegram::GuardianMode {
-    if !cfg.responder.enabled {
+    mode_from_responder(cfg.responder.enabled, cfg.responder.dry_run)
+}
+
+/// The single source of truth mapping `(enabled, dry_run)` to a guardian mode.
+/// Watch = responder off; DryRun = on but simulated; Guard = on and live.
+pub(crate) fn mode_from_responder(enabled: bool, dry_run: bool) -> telegram::GuardianMode {
+    if !enabled {
         telegram::GuardianMode::Watch
-    } else if cfg.responder.dry_run {
+    } else if dry_run {
         telegram::GuardianMode::DryRun
     } else {
         telegram::GuardianMode::Guard
     }
+}
+
+/// Apply a guardian mode to the responder config in place. The Telegram `/mode`
+/// command mutates the agent's owned `cfg` through this so EVERY downstream
+/// `cfg.responder.{enabled,dry_run}` read (the ~60 enforcement + record sites)
+/// sees the new mode immediately and consistently. There is no config
+/// hot-reload, so this in-place mutation IS the runtime actuation; `/mode` also
+/// persists the same two keys to agent.toml for restart durability.
+///   Watch  = responder off (passive monitor)
+///   DryRun = on but simulated
+///   Guard  = on and live (auto-defend)
+pub(crate) fn apply_guardian_mode(cfg: &mut config::AgentConfig, mode: telegram::GuardianMode) {
+    match mode {
+        telegram::GuardianMode::Watch => {
+            cfg.responder.enabled = false;
+        }
+        telegram::GuardianMode::DryRun => {
+            cfg.responder.enabled = true;
+            cfg.responder.dry_run = true;
+        }
+        telegram::GuardianMode::Guard => {
+            cfg.responder.enabled = true;
+            cfg.responder.dry_run = false;
+        }
+    }
+}
+
+/// Persist the responder mode (the two keys `/mode` changes) to agent.toml,
+/// format-preserving + atomic, so a phone mode flip survives a restart. The
+/// in-memory `cfg` mutation already took effect; this is best-effort durability
+/// (callers log on error, never fail the loop). Creates the `[responder]` table
+/// and the file if missing.
+pub(crate) fn persist_responder_mode(
+    path: &std::path::Path,
+    enabled: bool,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    doc["responder"]["enabled"] = toml_edit::value(enabled);
+    doc["responder"]["dry_run"] = toml_edit::value(dry_run);
+    // Atomic replace: write a sibling temp file then rename (same dir = same fs).
+    let tmp = path.with_extension("toml.iwtmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Map a Telegram sensitivity word to the bot channel's notification filter.
+/// Returns None for an unknown word (caller leaves the level unchanged).
+pub(crate) fn sensitivity_to_filter(level: &str) -> Option<crate::config::ChannelFilterLevel> {
+    use crate::config::ChannelFilterLevel as L;
+    match level.trim().to_ascii_lowercase().as_str() {
+        "quiet" => Some(L::Critical),
+        "normal" => Some(L::Actionable),
+        "verbose" => Some(L::All),
+        _ => None,
+    }
+}
+
+/// The lowercase TOML token for a filter level (matches its serde repr).
+fn filter_level_token(l: crate::config::ChannelFilterLevel) -> &'static str {
+    use crate::config::ChannelFilterLevel::*;
+    match l {
+        All => "all",
+        Actionable => "actionable",
+        Critical => "critical",
+        None => "none",
+    }
+}
+
+/// Apply a queued Settings change to `cfg` in place + persist it to
+/// `config_path`. Returns the human label of what changed for logging/reply, or
+/// None if the change was invalid (e.g. an unknown sensitivity word). The
+/// `[telegram]` reads (alert language via `user_profile`, alert noise via
+/// `channel_notifications.notification_level`) all see the new value because we
+/// mutate the owned `cfg`, same single-source-of-truth approach as `/mode`.
+pub(crate) fn apply_setting_change(
+    cfg: &mut config::AgentConfig,
+    change: &crate::SettingChange,
+    config_path: Option<&std::path::Path>,
+) -> Option<String> {
+    match change {
+        crate::SettingChange::Profile(simple) => {
+            cfg.telegram.user_profile = if *simple { "simple" } else { "technical" }.to_string();
+            if let Some(path) = config_path {
+                let _ =
+                    persist_telegram_string(path, &["user_profile"], &cfg.telegram.user_profile);
+            }
+            Some(format!("profile={}", cfg.telegram.user_profile))
+        }
+        crate::SettingChange::Sensitivity(level) => {
+            let filter = sensitivity_to_filter(level)?;
+            cfg.telegram.channel_notifications.notification_level = filter;
+            if let Some(path) = config_path {
+                let _ = persist_telegram_string(
+                    path,
+                    &["channel_notifications", "notification_level"],
+                    filter_level_token(filter),
+                );
+            }
+            Some(format!("sensitivity={level}"))
+        }
+    }
+}
+
+/// Write a string key under `[telegram]` (or a nested sub-table) to agent.toml,
+/// format-preserving + atomic. `key_path` is the dotted path under `telegram`.
+fn persist_telegram_string(
+    path: &std::path::Path,
+    key_path: &[&str],
+    value: &str,
+) -> std::io::Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut item = &mut doc["telegram"];
+    for seg in &key_path[..key_path.len() - 1] {
+        item = &mut item[*seg];
+    }
+    item[key_path[key_path.len() - 1]] = toml_edit::value(value);
+    let tmp = path.with_extension("toml.iwtmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Take a queued `/mode` change (if any), apply it to `cfg` in place, and
+/// persist it to `config_path` (best-effort). Returns the applied mode so the
+/// caller can log it. Pure of the run loop so the glue is unit-testable.
+pub(crate) fn take_and_apply_pending_mode(
+    cfg: &mut config::AgentConfig,
+    pending: &mut Option<telegram::GuardianMode>,
+    config_path: Option<&std::path::Path>,
+) -> Option<telegram::GuardianMode> {
+    let mode = pending.take()?;
+    apply_guardian_mode(cfg, mode);
+    if let Some(path) = config_path {
+        if let Err(e) = persist_responder_mode(path, cfg.responder.enabled, cfg.responder.dry_run) {
+            tracing::warn!(
+                error = %e,
+                "failed to persist /mode change to agent.toml (in-memory flip still active)"
+            );
+        }
+    }
+    Some(mode)
 }
 
 /// Builds a rich system-state context string injected into every AI chat call.
@@ -265,6 +422,169 @@ mod tests {
 
         cfg.responder.dry_run = false;
         assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Guard));
+    }
+
+    #[test]
+    fn apply_guardian_mode_sets_responder_flags() {
+        let mut cfg = config::AgentConfig::default();
+
+        apply_guardian_mode(&mut cfg, telegram::GuardianMode::Guard);
+        assert!(
+            cfg.responder.enabled && !cfg.responder.dry_run,
+            "Guard = on + live"
+        );
+        // round-trip through guardian_mode confirms consistency
+        assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Guard));
+
+        apply_guardian_mode(&mut cfg, telegram::GuardianMode::DryRun);
+        assert!(
+            cfg.responder.enabled && cfg.responder.dry_run,
+            "DryRun = on + simulated"
+        );
+        assert!(matches!(
+            guardian_mode(&cfg),
+            telegram::GuardianMode::DryRun
+        ));
+
+        apply_guardian_mode(&mut cfg, telegram::GuardianMode::Watch);
+        assert!(!cfg.responder.enabled, "Watch = responder off");
+        assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Watch));
+    }
+
+    #[test]
+    fn persist_responder_mode_is_format_preserving_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        // A config with a comment + an unrelated section that must survive.
+        std::fs::write(
+            &path,
+            "# my agent\n[responder]\nenabled = false\ndry_run = true\nblock_backend = \"ufw\"\n\n[ai]\nenabled = true\n",
+        )
+        .unwrap();
+
+        persist_responder_mode(&path, true, false).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# my agent"),
+            "comment preserved: {written}"
+        );
+        assert!(
+            written.contains("block_backend = \"ufw\""),
+            "sibling key preserved"
+        );
+        assert!(written.contains("[ai]"), "unrelated section preserved");
+
+        // Re-parse and confirm the two keys flipped.
+        let reparsed: config::AgentConfig = toml::from_str(&written).unwrap();
+        assert!(reparsed.responder.enabled);
+        assert!(!reparsed.responder.dry_run);
+    }
+
+    #[test]
+    fn apply_setting_change_actuates_profile_and_sensitivity() {
+        use crate::config::ChannelFilterLevel;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, "# cfg\n[telegram]\nuser_profile = \"technical\"\n").unwrap();
+        let mut cfg = config::AgentConfig::default();
+
+        // Profile flips the key + persists.
+        let label =
+            apply_setting_change(&mut cfg, &crate::SettingChange::Profile(true), Some(&path));
+        assert_eq!(label.as_deref(), Some("profile=simple"));
+        assert_eq!(cfg.telegram.user_profile, "simple");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# cfg"), "comment preserved");
+        assert!(
+            written.contains("user_profile = \"simple\""),
+            "persisted: {written}"
+        );
+
+        // Sensitivity maps quiet->Critical + persists the lowercase token.
+        let l2 = apply_setting_change(
+            &mut cfg,
+            &crate::SettingChange::Sensitivity("quiet".to_string()),
+            Some(&path),
+        );
+        assert_eq!(l2.as_deref(), Some("sensitivity=quiet"));
+        assert_eq!(
+            cfg.telegram.channel_notifications.notification_level,
+            ChannelFilterLevel::Critical
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("notification_level = \"critical\""));
+
+        // Unknown sensitivity word changes nothing (returns None).
+        let before = cfg.telegram.channel_notifications.notification_level;
+        let l3 = apply_setting_change(
+            &mut cfg,
+            &crate::SettingChange::Sensitivity("loud".to_string()),
+            Some(&path),
+        );
+        assert!(l3.is_none(), "unknown sensitivity is rejected");
+        assert_eq!(
+            cfg.telegram.channel_notifications.notification_level,
+            before
+        );
+    }
+
+    #[test]
+    fn sensitivity_to_filter_maps_the_three_words() {
+        use crate::config::ChannelFilterLevel as L;
+        assert_eq!(sensitivity_to_filter("quiet"), Some(L::Critical));
+        assert_eq!(sensitivity_to_filter("NORMAL"), Some(L::Actionable));
+        assert_eq!(sensitivity_to_filter("verbose"), Some(L::All));
+        assert_eq!(sensitivity_to_filter("nonsense"), Option::None);
+    }
+
+    #[test]
+    fn take_and_apply_pending_mode_applies_persists_and_noops_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, "[responder]\nenabled = false\ndry_run = true\n").unwrap();
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = false;
+        cfg.responder.dry_run = true;
+
+        // Empty queue → no-op, returns None, file untouched logic.
+        let mut pending: Option<telegram::GuardianMode> = None;
+        assert!(take_and_apply_pending_mode(&mut cfg, &mut pending, Some(&path)).is_none());
+
+        // Queued Guard → applied to cfg, persisted, queue drained.
+        pending = Some(telegram::GuardianMode::Guard);
+        let applied = take_and_apply_pending_mode(&mut cfg, &mut pending, Some(&path));
+        assert!(matches!(applied, Some(telegram::GuardianMode::Guard)));
+        assert!(pending.is_none(), "queue drained");
+        assert!(
+            cfg.responder.enabled && !cfg.responder.dry_run,
+            "cfg flipped to Guard"
+        );
+        let reparsed: config::AgentConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            reparsed.responder.enabled && !reparsed.responder.dry_run,
+            "persisted"
+        );
+
+        // No config path → applies in memory, skips persist (no panic).
+        pending = Some(telegram::GuardianMode::Watch);
+        assert!(take_and_apply_pending_mode(&mut cfg, &mut pending, None).is_some());
+        assert!(
+            !cfg.responder.enabled,
+            "Watch applied without a config path"
+        );
+    }
+
+    #[test]
+    fn persist_responder_mode_creates_section_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, "[ai]\nenabled = true\n").unwrap();
+        persist_responder_mode(&path, true, true).unwrap();
+        let reparsed: config::AgentConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(reparsed.responder.enabled && reparsed.responder.dry_run);
     }
 
     #[test]

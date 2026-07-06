@@ -182,18 +182,52 @@ const SENSITIVE_ARCHIVE_TARGETS: &[&str] = &[
     "/etc/",
 ];
 
-/// T1222.002 — Dangerous chmod/chattr patterns (checked against full argv joined)
+/// T1222.002 — SYMBOLIC dangerous chmod/chattr patterns. Octal modes are handled
+/// by `octal_chmod_danger` instead (position-sensitive), and symbolic
+/// world-writable by `symbolic_world_write`.
+///
+/// Note: the octal entries `chmod 4`/`chmod 2`/`chmod 6` used to live here but
+/// were a substring trap — `chmod 600 ~/.ssh/id_rsa` (the CORRECT secure perm)
+/// contains `chmod 6` and was wrongly flagged as setuid. Octal is now parsed by
+/// digit position so only true setuid/setgid (4-digit, special digit) fires.
 const SUID_PATTERNS: &[&str] = &[
     "chmod +s",
     "chmod u+s",
     "chmod g+s",
-    "chmod 4",
-    "chmod 2",
-    "chmod 6",
     "chattr +i",
     "chattr -i",
     "chattr +a",
 ];
+
+/// Symbolic `chmod` forms that grant write to "other"/"all" (world-writable).
+fn symbolic_world_write(argv_joined: &str) -> bool {
+    const SYMBOLIC: &[&str] = &["o+w", "a+w", "o=rwx", "a=rwx", "o=rw", "a=rw", "o=w", "a=w"];
+    let lower = argv_joined.to_ascii_lowercase();
+    SYMBOLIC.iter().any(|p| lower.contains(p))
+}
+
+/// Inspect any 3-4 digit octal mode token in a `chmod` command, parsed BY
+/// POSITION (substring matching can't tell `chmod 777` from `chmod 700`):
+///   Some(true)  -> 4-digit mode whose special digit sets setuid(4) or setgid(2)
+///   Some(false) -> the final ("other") digit carries the write bit (2) => world-writable
+///   None        -> not dangerous (owner/group-only modes like 600/700/755)
+fn octal_chmod_danger(argv_joined: &str) -> Option<bool> {
+    for tok in argv_joined.split_whitespace() {
+        if !(3..=4).contains(&tok.len()) || !tok.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            continue;
+        }
+        let digits = tok.as_bytes();
+        // 4-digit mode: leading digit carries setuid(4)/setgid(2)/sticky(1).
+        if tok.len() == 4 && (digits[0] - b'0') & 0b110 != 0 {
+            return Some(true);
+        }
+        // Any length: final ("other") digit has the write bit => world-writable.
+        if (digits[digits.len() - 1] - b'0') & 0b010 != 0 {
+            return Some(false);
+        }
+    }
+    None
+}
 
 // ─── Detector ──────────────────────────────────────────────────────────────
 
@@ -551,11 +585,26 @@ impl MitreHuntDetector {
             return None;
         }
 
-        // chmod: only flag SUID/SGID or world-writable patterns
+        // High for setuid/setgid/immutable/ownership-to-root; Medium for a plain
+        // world-writable grant (lower signal, more common in sloppy deploy scripts).
+        let mut severity = Severity::High;
+
+        // chmod / chattr: flag SUID/SGID/immutable, or a world-writable grant.
         if argv0_base == "chmod" || argv0_base == "chattr" {
-            let is_dangerous = SUID_PATTERNS.iter().any(|pat| argv_joined.contains(pat));
-            if !is_dangerous {
+            let octal = if argv0_base == "chmod" {
+                octal_chmod_danger(argv_joined)
+            } else {
+                None
+            };
+            let suid =
+                SUID_PATTERNS.iter().any(|pat| argv_joined.contains(pat)) || octal == Some(true);
+            let world = (argv0_base == "chmod" && symbolic_world_write(argv_joined))
+                || octal == Some(false);
+            if !suid && !world {
                 return None;
+            }
+            if world && !suid {
+                severity = Severity::Medium;
             }
         }
 
@@ -569,7 +618,7 @@ impl MitreHuntDetector {
 
         self.emit(
             "file_permission_mod",
-            Severity::High,
+            severity,
             format!("Suspicious file permission change: {argv_joined} (pid={pid}, user={user})"),
             format!(
                 "Process (pid={pid}, uid={uid}) modified file permissions with a dangerous \
@@ -1659,6 +1708,105 @@ mod tests {
         let mut d = det();
         let ev = make_event("chmod", &["chmod", "755", "/opt/app/run.sh"]);
         assert!(d.process(&ev).is_none(), "normal chmod should not trigger");
+    }
+
+    /// Regression anchor (atomic-bench T1222.002, 2026-06-20): `chmod 777` is
+    /// world-writable but was missed — SUID_PATTERNS had no world-writable entry
+    /// though the code comment claimed it did, so only setuid (`chmod u+s`) fired.
+    /// Now it must fire, at Medium (lower signal than a setuid grant).
+    #[test]
+    fn detects_chmod_777_world_writable() {
+        let mut d = det();
+        let ev = make_event("chmod", &["chmod", "777", "/tmp/atomic-perm"]);
+        let inc = d.process(&ev);
+        assert!(inc.is_some(), "chmod 777 (world-writable) MUST trigger");
+        let inc = inc.unwrap();
+        assert!(inc.incident_id.starts_with("file_permission_mod:"));
+        assert_eq!(
+            inc.severity,
+            Severity::Medium,
+            "world-writable alone is Medium, not High"
+        );
+    }
+
+    #[test]
+    fn detects_chmod_symbolic_world_writable() {
+        let mut d = det();
+        let ev = make_event("chmod", &["chmod", "o+w", "/etc/passwd"]);
+        assert!(d.process(&ev).is_some(), "chmod o+w MUST trigger");
+    }
+
+    /// Position-correctness: owner/group-only octal modes must NOT fire at all
+    /// (we parse the mode by position instead of substring-matching, which is why
+    /// `chmod 700`/`750`/`744` are silent).
+    #[test]
+    fn ignores_owner_only_octal_chmod() {
+        let mut d = det();
+        for mode in ["700", "750", "744", "711"] {
+            let ev = make_event("chmod", &["chmod", mode, "/home/u/file"]);
+            assert!(
+                d.process(&ev).is_none(),
+                "chmod {mode} is not world-writable and MUST NOT trigger"
+            );
+        }
+    }
+
+    /// Regression anchor (pre-existing substring FP found 2026-06-20): `chmod 600`
+    /// on a private key is the CORRECT secure perm, but the old `"chmod 6"`
+    /// substring in SUID_PATTERNS flagged it as a setuid privesc. Octal is now
+    /// parsed by position, so 3-digit 4xx/2xx/6xx (owner perms, no special bit)
+    /// must NOT fire; only true 4-digit setuid/setgid does.
+    #[test]
+    fn ignores_three_digit_modes_with_special_looking_leading_digit() {
+        let mut d = det();
+        for mode in ["600", "640", "400", "200", "660"] {
+            let ev = make_event("chmod", &["chmod", mode, "/home/u/.ssh/id_rsa"]);
+            assert!(
+                d.process(&ev).is_none(),
+                "chmod {mode} is owner/group-only and MUST NOT be flagged as setuid"
+            );
+        }
+        // ...but a real 4-digit setuid/setgid still fires.
+        assert!(d
+            .process(&make_event("chmod", &["chmod", "6755", "/tmp/x"]))
+            .is_some());
+    }
+
+    #[test]
+    fn octal_chmod_danger_unit() {
+        // setuid/setgid (4-digit, special digit)
+        for m in ["4755", "2755", "6755", "4777"] {
+            assert_eq!(
+                octal_chmod_danger(&format!("chmod {m} /x")),
+                Some(true),
+                "{m}"
+            );
+        }
+        // world-writable (other has write bit), incl. sticky+world
+        for m in ["777", "666", "1777", "757", "776"] {
+            assert_eq!(
+                octal_chmod_danger(&format!("chmod {m} /x")),
+                Some(false),
+                "{m}"
+            );
+        }
+        // safe owner/group-only
+        for m in ["700", "755", "644", "750", "600", "640", "744", "0755"] {
+            assert_eq!(octal_chmod_danger(&format!("chmod {m} /x")), None, "{m}");
+        }
+    }
+
+    #[test]
+    fn symbolic_world_write_unit() {
+        for m in ["o+w", "a+w", "go+w", "o=rwx"] {
+            assert!(symbolic_world_write(&format!("chmod {m} /x")), "{m} world");
+        }
+        for m in ["u+w", "g+w", "u+s"] {
+            assert!(
+                !symbolic_world_write(&format!("chmod {m} /x")),
+                "{m} not world"
+            );
+        }
     }
 
     // ── T1219: Remote Access Software ──────────────────────────────────

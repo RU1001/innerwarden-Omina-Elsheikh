@@ -87,9 +87,9 @@ pub(super) fn format_incident_message(
     };
 
     let mode_line = match mode {
-        GuardianMode::Guard => "\u{26a1} Handling — stand by for action report.",
-        GuardianMode::DryRun => "\u{1f9ea} Dry-run — would act. Enable live mode.",
-        GuardianMode::Watch => "\u{1f440} Watching — operator action required.",
+        GuardianMode::Guard => "\u{26a1} Handling. Stand by for action report.",
+        GuardianMode::DryRun => "\u{1f9ea} Dry-run. Would act. Enable live mode.",
+        GuardianMode::Watch => "\u{1f440} Watching. Operator action required.",
     };
 
     let link_line = dashboard_url
@@ -105,13 +105,14 @@ pub(super) fn format_incident_message(
         .unwrap_or_default();
 
     format!(
-        "{sev} <code>{detector}</code>\n\
+        "{sev} <code>{detector}</code>{host_line}\n\
          \n\
          <b>{title}</b>\n\
          {entity_line}\n\
          <i>{summary}</i>\n\
          \n\
          {mode_line}{link_line}",
+        host_line = host_line(incident),
         title = escape_html(&incident.title),
         summary = escape_html(&summary_trunc),
     )
@@ -235,6 +236,24 @@ pub(super) fn source_icon(tags: &[String]) -> &'static str {
     }
 }
 
+/// A leading-newline server tag (`\n🖥 <b>host</b>`) so every operator
+/// notification names WHICH server it came from (the burst summary + daily
+/// briefing already do). Returns empty when the host is blank or the
+/// placeholder `"unknown"`, so we never render a useless `🖥 unknown` label.
+pub(super) fn host_tag(host: &str) -> String {
+    let host = host.trim();
+    if host.is_empty() || host.eq_ignore_ascii_case("unknown") {
+        return String::new();
+    }
+    format!("\n\u{1f5a5}\u{fe0f} <b>{}</b>", escape_html(host))
+}
+
+/// Server tag for a single-incident alert. `incident.host` is the precise
+/// origin (the sensor stamps it), which is what matters in a multi-host mesh.
+pub(super) fn host_line(incident: &Incident) -> String {
+    host_tag(&incident.host)
+}
+
 pub(super) fn entity_summary(incident: &Incident) -> String {
     use innerwarden_core::entities::EntityType::*;
     let parts: Vec<String> = incident
@@ -328,7 +347,10 @@ pub(super) fn parse_callback(data: &str, operator: &str) -> Option<ApprovalResul
             chosen_action: String::new(),
         });
     }
-    // Capabilities inline keyboard: "enable:<id>" → routed to __enable__:<id> handler
+    // Capabilities inline keyboard: "enable:<id>" is forwarded verbatim as
+    // `enable:<id>` and consumed by the dedicated `enable:` handler in
+    // bot_commands (runs `innerwarden enable <id>` via CLI). This is distinct
+    // from the `__enable__:<cap>` path used by the typed `/enable <cap>` command.
     if let Some(cap_id) = data.strip_prefix("enable:") {
         return Some(ApprovalResult {
             incident_id: format!("enable:{cap_id}"),
@@ -375,6 +397,12 @@ pub fn escape_html_pub(s: &str) -> String {
 /// Public wrapper for truncate_utf8_bytes (callback data must be <= 64 bytes).
 pub fn truncate_callback_pub(s: &str) -> String {
     truncate_utf8_bytes(s, TELEGRAM_MAX_CALLBACK_BYTES)
+}
+
+/// Crate wrapper for `country_flag_emoji` — used by the daily briefing body to
+/// render a flag next to a blocked source IP. Empty string on bad input.
+pub(crate) fn country_flag_emoji_pub(code: &str) -> String {
+    country_flag_emoji(code)
 }
 
 /// Visual score bar for AbuseIPDB confidence (e.g. "████░░░░ 80/100").
@@ -599,9 +627,9 @@ pub(super) fn format_simple_message(
 
     // Action line depends on mode.
     let action_line = match mode {
-        GuardianMode::Guard => "\u{26a1} <b>Handled automatically</b> — no action needed.",
+        GuardianMode::Guard => "\u{26a1} <b>Handled automatically.</b> No action needed.",
         GuardianMode::DryRun => {
-            "\u{1f9ea} <b>Dry-run</b> — would act on this. Enable live mode to let me."
+            "\u{1f9ea} <b>Dry-run.</b> Would act on this. Enable live mode to let me."
         }
         GuardianMode::Watch => "\u{26a0}\u{fe0f} <b>Needs your attention.</b>",
     };
@@ -619,11 +647,12 @@ pub(super) fn format_simple_message(
         .unwrap_or_default();
 
     format!(
-        "{sev_emoji} {det_emoji} <b>{sev_word} — {det_label}</b>\n\
+        "{sev_emoji} {det_emoji} <b>{sev_word} — {det_label}</b>{host_line}\n\
          \n\
          {detail}{why_line}\n\
          \n\
          {action_line}{link_line}",
+        host_line = host_line(incident),
     )
 }
 
@@ -677,9 +706,13 @@ fn simple_detail_line(incident: &Incident, ip_entity: &Option<String>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The retired enriched-digest anchors import directly from `burst` (the
+    // `telegram::` re-export was dropped when `format_daily_briefing` became the
+    // production renderer).
+    use crate::telegram::burst::{format_daily_digest_enriched, PipelineDigestStats};
     use crate::telegram::{
-        append_to_allowlist, explain_detector, format_daily_digest, format_daily_digest_enriched,
-        format_simple_status, log_false_positive, PipelineDigestStats,
+        append_to_allowlist, explain_detector, format_daily_digest, format_simple_status,
+        log_false_positive,
     };
     use chrono::Utc;
     use innerwarden_core::{entities::EntityRef, event::Severity, incident::Incident};
@@ -727,6 +760,41 @@ mod tests {
         assert!(msg.contains("guess passwords"), "missing why text: {msg}");
         assert!(msg.contains("MITRE T1110"), "missing MITRE line: {msg}");
         assert!(msg.contains("Handled automatically"), "missing reassurance");
+    }
+
+    #[test]
+    fn incident_alerts_name_the_server() {
+        // Operator principle: every notification names the server. Both the
+        // detailed and the simple (lay-user) single-incident alerts must carry
+        // the host the incident came from.
+        let inc = make_incident(
+            Severity::Critical,
+            vec!["ssh".to_string()],
+            vec![EntityRef::ip("1.2.3.4".to_string())],
+        );
+        let detailed = format_incident_message(&inc, None, GuardianMode::Watch);
+        assert!(
+            detailed.contains("web-server-01"),
+            "detailed alert must name the server: {detailed}"
+        );
+        let simple = format_simple_message(&inc, None, GuardianMode::Guard);
+        assert!(
+            simple.contains("web-server-01"),
+            "simple alert must name the server: {simple}"
+        );
+    }
+
+    #[test]
+    fn host_line_omitted_for_blank_or_unknown_host() {
+        // Never render a useless `🖥 unknown` label.
+        for h in ["", "unknown", "UNKNOWN", "  "] {
+            let mut inc = make_incident(Severity::High, vec![], vec![]);
+            inc.host = h.to_string();
+            assert!(
+                host_line(&inc).is_empty(),
+                "host_line must be empty for host {h:?}"
+            );
+        }
     }
 
     #[test]

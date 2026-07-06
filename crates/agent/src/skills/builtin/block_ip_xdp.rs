@@ -191,6 +191,47 @@ pub fn is_xdp_available() -> bool {
     std::path::Path::new(BLOCKLIST_PIN).exists()
 }
 
+/// Classify a `sudo bpftool map delete` failure as a NON-transient privilege
+/// problem (the agent cannot run bpftool — e.g. no sudoers entry, no tty, not
+/// root) rather than a transient kernel/map drift.
+///
+/// Why this matters: the boot-loop XDP TTL sweep keeps a local entry and
+/// retries "next tick" on failure, which is correct for a transient kernel
+/// drift but WRONG for a privilege failure — that never recovers on its own,
+/// so every 30s slow-loop tick re-spawns `sudo` and re-logs. Observed on a
+/// non-root deploy (agent `User=innerwarden`, block backend `ufw`, no sudoers
+/// rule for bpftool): 44,415 failed sudo-auths + 44,260 WARN lines in 7 days
+/// for a single stuck entry. A privilege failure must back off, not hammer.
+///
+/// The match is on the lowercased stderr; covers the common sudo/kernel
+/// permission signatures.
+pub fn is_xdp_privilege_failure(stderr_lower: &str) -> bool {
+    stderr_lower.contains("conversation failed")
+        || stderr_lower.contains("password is required")
+        || stderr_lower.contains("askpass")
+        || stderr_lower.contains("no tty present")
+        || stderr_lower.contains("not allowed to execute")
+        || stderr_lower.contains("not in the sudoers")
+        || stderr_lower.contains("permission denied")
+        || stderr_lower.contains("operation not permitted")
+        || stderr_lower.contains("must be run as root")
+}
+
+/// Exponential backoff (in seconds) for repeated non-transient XDP cleanup
+/// failures, keyed on the count of consecutive failures for that IP.
+///
+/// Starts at 60s and doubles, capped at 1 hour. The cap (rather than "give up
+/// forever") means a privilege that gets granted later — operator adds the
+/// sudoers rule, or restarts the agent as root — is still picked up within an
+/// hour without the every-tick sudo storm in between. A fresh boot clears the
+/// backoff map entirely, so a restart retries immediately.
+pub fn xdp_cleanup_backoff_secs(consecutive_failures: u32) -> i64 {
+    const BASE: i64 = 60;
+    const CAP: i64 = 3600;
+    let shift = consecutive_failures.saturating_sub(1).min(6);
+    BASE.saturating_mul(1_i64 << shift).min(CAP)
+}
+
 /// Wave 4 (AUDIT-WAVE4-XDP-IPV6) helper: dispatch an IP string to the
 /// matching XDP blocklist pin path + bpftool key bytes. Returns `None`
 /// for non-IP input so callers can drop the local poison entry without
@@ -345,6 +386,62 @@ mod tests {
     // the kernel map forever even after the operator (or the response
     // lifecycle TTL sweep) requested removal. The fix mirrors the
     // version-detection that `execute()` already does.
+
+    // ── XDP cleanup backoff anchors (non-root deploy flood fix) ────────
+    //
+    // A non-root agent (User=innerwarden) with block backend `ufw` has no
+    // sudoers rule for bpftool, so the boot-loop XDP TTL sweep's
+    // `sudo bpftool map delete` fails every tick. Pre-fix that retried +
+    // logged every 30s slow-loop tick: 44,415 failed sudo-auths + 44,260
+    // WARN lines in 7 days for one stuck entry. The classifier routes such
+    // permanent failures into exponential backoff instead.
+
+    #[test]
+    fn privilege_failures_are_classified_non_transient() {
+        for s in [
+            "sudo: a password is required",         // NOPASSWD rule missing
+            "sudo: a terminal is required to read the password; either use the -s option to read from standard input or configure an askpass helper",
+            "sudo: no tty present and no askpass program specified",
+            "sudo: pam_unix(sudo:auth): conversation failed",
+            "user innerwarden is not allowed to execute",
+            "innerwarden is not in the sudoers file",
+            "bpftool: permission denied",
+            "operation not permitted",
+            "must be run as root",
+        ] {
+            assert!(
+                is_xdp_privilege_failure(&s.to_lowercase()),
+                "should be a privilege failure: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_drift_is_not_a_privilege_failure() {
+        // Genuine kernel/map drift must stay on the retry-next-tick path,
+        // NOT get backed off (it can recover on its own).
+        for s in [
+            "error: bpftool: map element not found",
+            "no such file or directory",
+            "cannot read map: invalid argument",
+            "",
+        ] {
+            assert!(
+                !is_xdp_privilege_failure(&s.to_lowercase()),
+                "should NOT be a privilege failure: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_backoff_grows_then_caps_at_one_hour() {
+        assert_eq!(xdp_cleanup_backoff_secs(0), 60); // saturating_sub floor
+        assert_eq!(xdp_cleanup_backoff_secs(1), 60);
+        assert_eq!(xdp_cleanup_backoff_secs(2), 120);
+        assert_eq!(xdp_cleanup_backoff_secs(3), 240);
+        assert_eq!(xdp_cleanup_backoff_secs(7), 3600); // 60 * 2^6 = 3840 -> capped
+        assert_eq!(xdp_cleanup_backoff_secs(100), 3600); // stays capped, no overflow
+    }
 
     #[test]
     fn xdp_unblock_ip_handles_ipv4_addresses() {

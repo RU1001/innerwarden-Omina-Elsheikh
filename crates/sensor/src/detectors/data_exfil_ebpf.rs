@@ -24,6 +24,11 @@ use innerwarden_core::{entities::EntityRef, event::Event, event::Severity, incid
 /// `is_browser_self_access` and `BACKUP_TOOLS` allowlists keep this
 /// FP-safe — Chrome reading its own Login Data and rclone uploading a
 /// home-dir backup both pass through without alert.
+// SPECIFIC credential paths — distinctive enough that a match is a real
+// credential read REGARDLESS of file extension or location (e.g. even a key
+// named `id_rsa` planted under node_modules still counts). These are NEVER
+// relaxed by the source-file guard below, so an attacker cannot evade by
+// staging a real credential at a .js path.
 const SENSITIVE_PATHS: &[&str] = &[
     "/etc/shadow",
     "/etc/passwd",
@@ -35,10 +40,8 @@ const SENSITIVE_PATHS: &[&str] = &[
     "/id_ed25519",
     "/id_ecdsa",
     "/.env",
-    "/credentials",
-    "/secret",
+    "/.aws/credentials",
     "/.kube/config",
-    "/token",
     // ── Cloud credentials (Credential Access, T1552.001) ──────────────
     // Docker Hub auth tokens: `docker login` writes a base64'd
     // username:password (or registry token) into config.json.
@@ -65,6 +68,14 @@ const SENSITIVE_PATHS: &[&str] = &[
     "/logins.json",
     "/cookies.sqlite",
 ];
+
+/// GENERIC credential keywords — high recall, but they also appear in ordinary
+/// source/package file paths (`dist/secret-contract-api.js` contains `/secret`,
+/// `.../token/const.mjs` contains `/token`). These match ONLY when the file is
+/// not a source/package artifact, so loading a JS module never looks like a
+/// credential read. They never gate the SPECIFIC list above, so a genuine
+/// credential is still caught even if its path also looks code-like.
+const SENSITIVE_GENERIC_TOKENS: &[&str] = &["/secret", "/token", "/credentials"];
 
 /// Browser process names (truncated to 15 chars by Linux's TASK_COMM_LEN
 /// where applicable). Reading browser-data paths from a browser process
@@ -176,14 +187,43 @@ impl DataExfilEbpfDetector {
             return None;
         }
 
-        // Skip processes that legitimately read /etc/passwd for NSS uid→name
-        // resolution and then make outbound connections (CrowdSec, web servers).
+        // Cloud guest-agent downgrade: the platform's own management agent
+        // (Azure WALinuxAgent / ExtHandler) reads /etc/passwd (getpwuid) then
+        // connects to the control plane — a read-then-connect shape that cannot
+        // be told from exfil at the kernel layer. Observed as a persistent FP
+        // from `ExtHandler` on an Azure VM. The short-lived `ExtHandler` child
+        // often EXITS before this detector runs (its `/proc` is gone), so fall
+        // back to its LONG-LIVED PARENT (`WALinuxAgent ... -run-exthandlers`,
+        // carried as `ppid`) whose `/proc` lineage still resolves. NON-FORGEABLE
+        // (real /proc lineage), gated on a DMI-detected cloud VM + uid 0.
+        // Downgrade-only: a real process from /tmp, or any non-root, still fires.
+        let guest_uid = if ev_uid == u64::MAX { 0 } else { ev_uid };
+        let ev_ppid = event.details.get("ppid").and_then(|v| v.as_u64());
+        let is_guest = crate::cloud_platform::is_guest_agent(pid, guest_uid as u32)
+            || ev_ppid.is_some_and(|pp| {
+                pp != 0 && crate::cloud_platform::is_guest_agent(pp as u32, guest_uid as u32)
+            });
+        if is_guest {
+            return None;
+        }
+
+        // BLANKET-exempt processes: server DAEMONS that read /etc/passwd for
+        // NSS uid→name resolution on every request/session and are always
+        // making outbound calls as part of their job (CrowdSec bouncers, web
+        // servers, MTAs). Their read-then-connect shape cannot be distinguished
+        // from exfil at the kernel layer, so they are allowed for ALL files.
         //
-        // This list is for DAEMONS that read /etc/passwd as part of normal
-        // operation (uid lookup for every request, session setup, etc.) and
-        // are always making outbound calls as part of their job. These
-        // cannot meaningfully be distinguished from the exfil pattern, so
-        // they are always allowed.
+        // 2026-07-02 (agent-runtime blind spot, found by a live red-team):
+        // the interpreter/agent runtimes `python`, `python3`, `node`, `ruby`,
+        // `java`, `php`, `openclaw`, `libuv-worker` used to be in THIS blanket
+        // list. That silently exempted every AI coding agent (which runs as
+        // exactly those comms) from this detector: a compromised python/node/
+        // openclaw agent reading `~/.aws/credentials` / `~/.ssh/id_rsa` / `.env`
+        // and connecting out was dropped here before it was ever tracked — the
+        // exact threat the product exists to catch. They are now handled by the
+        // NARROW `/etc/passwd`-only NSS-init gate below (their only benign
+        // read-then-connect is the getpwuid_r startup read of /etc/passwd), so
+        // their reads of REAL secrets now fire again.
         const PASSWD_READERS: &[&str] = &[
             "http",
             "https",
@@ -207,17 +247,27 @@ impl DataExfilEbpfDetector {
             "systemd",
             "dbus-daemon",
             "polkitd",
-            "node",
-            "python",
-            "python3",
-            "ruby",
-            "java",
-            "php",
-            "openclaw",
-            "libuv-worker",
         ];
         if PASSWD_READERS.iter().any(|p| ev_comm.starts_with(p)) {
-            return None;
+            // `comm` is attacker-forgeable (prctl/argv0), so `cp evil /tmp/sshd`
+            // would otherwise inherit sshd's blanket credential-read exemption and
+            // exfiltrate `~/.aws/credentials` undetected (found by a live red-team,
+            // 2026-07-02). Only honour the daemon exemption when the NON-forgeable
+            // kernel-captured exe path is OS-trusted (a real daemon under
+            // /usr/sbin etc.). A comm-spoofed reader from an untrusted path (/tmp,
+            // /home, /dev/shm) is NOT exempt and its secret reads fire. exe_path
+            // absent (a daemon whose execve predates the sensor, so it was never
+            // cached) → fall back to the comm exemption to avoid a FP on legitimate
+            // long-running daemons.
+            let comm_spoofed_from_untrusted_path = event
+                .details
+                .get("exe_path")
+                .and_then(|v| v.as_str())
+                .map(|exe| !crate::path_trust::is_trusted_system_path(exe))
+                .unwrap_or(false);
+            if !comm_spoofed_from_untrusted_path {
+                return None;
+            }
         }
 
         // 2026-05-25: backup tools (rclone, restic, borg, …) read
@@ -282,7 +332,27 @@ impl DataExfilEbpfDetector {
                 return None;
             }
 
-            if let Some(read) = self.pending_reads.remove(&pid) {
+            // Correlate the connect to a pending sensitive read: same PID first,
+            // then (split-pid evasion, 2026-07-02) the connecting process's PARENT.
+            // An attacker who reads the secret in a parent and forks a child to do
+            // the outbound connect would otherwise slip the same-PID correlation.
+            // The parent read must itself be a genuinely sensitive file (only those
+            // are in `pending_reads`), so a shell that read `~/.aws/credentials`
+            // then forked a `curl` to send it out is caught — a legitimately
+            // suspicious shape, not a broad heuristic.
+            let ppid = event
+                .details
+                .get("ppid")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .filter(|&pp| pp != 0 && pp != pid);
+            let matched = self
+                .pending_reads
+                .remove(&pid)
+                .map(|r| (pid, r))
+                .or_else(|| ppid.and_then(|pp| self.pending_reads.remove(&pp).map(|r| (pp, r))));
+            if let Some((read_pid, read)) = matched {
+                let split_pid = read_pid != pid;
                 // Same PID read a sensitive file then made outbound connection
                 let dst_ip = event
                     .details
@@ -385,6 +455,21 @@ impl DataExfilEbpfDetector {
                     "composer",
                     "mvn",
                     "gradle",
+                    // Interpreter / AI-agent runtimes. They also getpwuid_r at
+                    // startup (reads /etc/passwd) then connect to their LLM/API,
+                    // so their /etc/passwd read-then-connect is benign NSS init
+                    // and is suppressed HERE — but, unlike the old blanket gate,
+                    // their reads of REAL secrets (.aws/.ssh/.env) are NOT
+                    // covered by this `== "/etc/passwd"` match and now fire
+                    // (2026-07-02 agent-runtime blind-spot fix).
+                    "python",
+                    "python3",
+                    "node",
+                    "ruby",
+                    "java",
+                    "php",
+                    "openclaw",
+                    "libuv-worker",
                 ];
                 let is_nss_init = read.filename == "/etc/passwd"
                     && NSS_INIT_CLI_TOOLS.iter().any(|p| read.comm.starts_with(p));
@@ -412,17 +497,24 @@ impl DataExfilEbpfDetector {
                         read.filename
                     ),
                     summary: format!(
-                        "Process {comm} (pid={pid}) read sensitive file {} then made outbound \
+                        "Process {comm} (pid={pid}){} read sensitive file {} then made outbound \
                          connection to {dst_ip}:{dst_port} within {elapsed}s. This pattern \
                          indicates data exfiltration — the file content may have been sent \
                          to the remote host.",
+                        if split_pid {
+                            format!(" (child of the reader pid={read_pid})")
+                        } else {
+                            String::new()
+                        },
                         read.filename
                     ),
                     evidence: serde_json::json!([{
                         "kind": "data_exfil_ebpf",
-                        "detection": "read_then_connect",
+                        "detection": if split_pid { "parent_read_child_connect" } else { "read_then_connect" },
                         "comm": comm,
                         "pid": pid,
+                        "reader_pid": read_pid,
+                        "split_pid": split_pid,
                         "sensitive_file": read.filename,
                         "file_read_ts": read.ts.to_rfc3339(),
                         "connect_ts": now.to_rfc3339(),
@@ -465,9 +557,37 @@ impl DataExfilEbpfDetector {
 
 fn is_sensitive_path(path: &str) -> bool {
     let lower = path.to_lowercase();
-    SENSITIVE_PATHS
-        .iter()
-        .any(|sensitive| lower.contains(sensitive))
+    // SPECIFIC credential paths ALWAYS count — distinctive enough that an
+    // attacker can't evade by giving a real key a code-like name or hiding it
+    // under node_modules. /etc/shadow, id_rsa, .aws/credentials, etc. are
+    // credentials wherever they appear.
+    if SENSITIVE_PATHS.iter().any(|s| lower.contains(s)) {
+        return true;
+    }
+    // GENERIC keyword matches (/secret, /token, /credentials) are relaxed ONLY
+    // for source/package artifacts, because those words routinely appear in
+    // ordinary JS/TS module paths. This was the dominant false positive: an AI
+    // agent loading its own `node_modules/.../dist/secret-contract-api.js` then
+    // calling an API was flagged CRITICAL "data exfiltration". A read of a
+    // non-code file whose path contains a generic keyword is still sensitive.
+    // (`.json` is NOT treated as code — gcloud credentials.json is genuine.)
+    if is_source_or_package_artifact(&lower) {
+        return false;
+    }
+    SENSITIVE_GENERIC_TOKENS.iter().any(|t| lower.contains(t))
+}
+
+/// True for JS/TS source and package artifacts (or anything under
+/// `node_modules/`) — module code, never a real credential.
+fn is_source_or_package_artifact(lower_path: &str) -> bool {
+    lower_path.contains("/node_modules/")
+        || lower_path.ends_with(".js")
+        || lower_path.ends_with(".mjs")
+        || lower_path.ends_with(".cjs")
+        || lower_path.ends_with(".ts")
+        || lower_path.ends_with(".tsx")
+        || lower_path.ends_with(".jsx")
+        || lower_path.ends_with(".map")
 }
 
 /// True when a browser process is reading its own credential store.
@@ -570,6 +690,32 @@ mod tests {
         assert!(det.process(&iw_connect).is_none());
     }
 
+    /// The cloud guest-agent gate is DOWNGRADE-ONLY: a real credential exfil (a
+    /// non-guest-agent process reading a secret then connecting out) still fires.
+    /// Uses a pid above the kernel pid_max ceiling so `/proc` has no lineage and
+    /// `is_guest_agent` is reliably inert on cloud CI runners (GitHub runners are
+    /// Azure); the guest-agent suppression itself is unit-tested in
+    /// `crate::cloud_platform`.
+    #[test]
+    fn guest_agent_gate_does_not_suppress_real_exfil() {
+        const DEAD_PID: u32 = 4_000_000_001;
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        assert!(det
+            .process(&read_event(DEAD_PID, "/etc/shadow", now))
+            .is_none());
+        let inc = det.process(&connect_event(
+            DEAD_PID,
+            "185.220.101.44",
+            4444,
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_some(),
+            "a real (non-guest-agent) shadow-read-then-connect must still fire"
+        );
+    }
+
     fn read_event_with_comm(pid: u32, filename: &str, comm: &str, ts: DateTime<Utc>) -> Event {
         Event {
             ts,
@@ -608,6 +754,40 @@ mod tests {
             tags: vec!["ebpf".into()],
             entities: vec![EntityRef::ip(dst_ip)],
         }
+    }
+
+    // Same as the *_with_comm helpers but stamped with a (non-forgeable)
+    // exe_path — for the comm-rename evasion tests.
+    fn read_event_exe(pid: u32, filename: &str, comm: &str, exe: &str, ts: DateTime<Utc>) -> Event {
+        let mut ev = read_event_with_comm(pid, filename, comm, ts);
+        ev.details["exe_path"] = serde_json::Value::String(exe.to_string());
+        ev
+    }
+    fn connect_event_exe(
+        pid: u32,
+        dst_ip: &str,
+        dst_port: u16,
+        comm: &str,
+        exe: &str,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        let mut ev = connect_event_with_comm(pid, dst_ip, dst_port, comm, ts);
+        ev.details["exe_path"] = serde_json::Value::String(exe.to_string());
+        ev
+    }
+
+    // A connect event stamped with a parent pid — for the split-pid tests.
+    fn connect_event_ppid(
+        pid: u32,
+        ppid: u32,
+        dst_ip: &str,
+        dst_port: u16,
+        comm: &str,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        let mut ev = connect_event_with_comm(pid, dst_ip, dst_port, comm, ts);
+        ev.details["ppid"] = serde_json::Value::from(ppid);
+        ev
     }
 
     #[test]
@@ -687,6 +867,227 @@ mod tests {
         let inc = inc.expect("ssh reading id_ed25519 MUST still fire");
         assert_eq!(inc.severity, Severity::Critical);
         assert!(inc.title.contains("id_ed25519"));
+    }
+
+    #[test]
+    fn python_agent_reading_aws_credentials_then_connecting_fires_critical() {
+        // 2026-07-02 agent-runtime blind-spot regression anchor.
+        //
+        // `python3` (and `node`, `openclaw`, ...) used to be in the BLANKET
+        // PASSWD_READERS exemption, which `return None`-d for EVERY file
+        // before Phase-1 read tracking. That silently exempted every AI
+        // coding agent (which runs as exactly those comms) from this
+        // detector: a compromised python agent reading ~/.aws/credentials
+        // and connecting out was dropped before it was ever tracked — the
+        // exact threat the product exists to catch. Proven live on test001
+        // (0.15.32): comm=python3 read=~/.aws/credentials + outbound :443
+        // both captured, NO incident. The fix moves those runtimes to the
+        // NARROW /etc/passwd-only NSS-init gate. This test locks the catch.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8100,
+            "/home/test001/.aws/credentials",
+            "python3",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8100,
+            "8.8.8.8",
+            443,
+            "python3",
+            now + Duration::milliseconds(3),
+        ));
+        let inc = inc.expect("python3 reading .aws/credentials MUST fire (agent blind spot)");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("credentials"));
+    }
+
+    #[test]
+    fn openclaw_agent_reading_dotenv_then_connecting_fires_critical() {
+        // Same class as the python test, for the openclaw runtime and a
+        // `.env` secret. Confirms the fix is not python-specific.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8101,
+            "/home/test001/project/.env",
+            "openclaw",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8101,
+            "5.6.7.8",
+            443,
+            "openclaw",
+            now + Duration::milliseconds(3),
+        ));
+        let inc = inc.expect("openclaw reading .env MUST fire (agent blind spot)");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains(".env"));
+    }
+
+    #[test]
+    fn python_agent_reading_etc_passwd_then_connecting_stays_suppressed() {
+        // Counterpart: the runtimes were moved to the NARROW NSS-init gate,
+        // NOT removed entirely. Their one benign read-then-connect shape is
+        // the getpwuid_r startup read of the literal /etc/passwd before they
+        // dial their LLM/API. That must STILL be suppressed, otherwise every
+        // python/node process start becomes a Critical false positive.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(8102, "/etc/passwd", "python3", now));
+        let inc = det.process(&connect_event_with_comm(
+            8102,
+            "8.8.8.8",
+            443,
+            "python3",
+            now + Duration::milliseconds(3),
+        ));
+        assert!(
+            inc.is_none(),
+            "python3 + /etc/passwd + outbound must stay suppressed (NSS-init pattern)"
+        );
+    }
+
+    #[test]
+    fn comm_spoofed_daemon_from_untrusted_path_still_fires() {
+        // 2026-07-02 comm-rename evasion anchor. `cp evil /tmp/sshd` gives comm=sshd
+        // (in the PASSWD_READERS daemon blanket), but the NON-forgeable exe_path is
+        // /tmp/sshd (untrusted). It must NOT inherit sshd's exemption: reading
+        // ~/.aws/credentials then connecting out fires Critical.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_exe(
+            8200,
+            "/home/u/.aws/credentials",
+            "sshd",
+            "/tmp/sshd",
+            now,
+        ));
+        let inc = det.process(&connect_event_exe(
+            8200,
+            "8.8.8.8",
+            443,
+            "sshd",
+            "/tmp/sshd",
+            now + Duration::milliseconds(3),
+        ));
+        let inc = inc.expect("comm=sshd from /tmp (untrusted exe) reading creds MUST fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("credentials"));
+    }
+
+    #[test]
+    fn real_daemon_from_trusted_path_stays_exempt() {
+        // Counterpart: a REAL sshd (exe under /usr/sbin) keeps the blanket
+        // exemption — reading a cred file then connecting out must NOT fire (it
+        // does NSS lookups + serves connections; this is its job, indistinguishable
+        // from exfil at this layer).
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_exe(
+            8201,
+            "/home/u/.aws/credentials",
+            "sshd",
+            "/usr/sbin/sshd",
+            now,
+        ));
+        let inc = det.process(&connect_event_exe(
+            8201,
+            "8.8.8.8",
+            443,
+            "sshd",
+            "/usr/sbin/sshd",
+            now + Duration::milliseconds(3),
+        ));
+        assert!(
+            inc.is_none(),
+            "trusted /usr/sbin/sshd must keep its exemption"
+        );
+    }
+
+    #[test]
+    fn daemon_comm_without_exe_path_falls_back_to_exemption() {
+        // A daemon whose execve predates the sensor has no cached exe_path. We must
+        // fall back to the comm exemption (no exe evidence to prove spoofing) rather
+        // than FP on every long-running daemon. No incident.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8202,
+            "/home/u/.aws/credentials",
+            "sshd",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8202,
+            "8.8.8.8",
+            443,
+            "sshd",
+            now + Duration::milliseconds(3),
+        ));
+        assert!(
+            inc.is_none(),
+            "comm=sshd with no exe_path must fall back to the exemption (no FP)"
+        );
+    }
+
+    #[test]
+    fn split_pid_parent_read_child_connect_fires() {
+        // 2026-07-02 split-pid evasion anchor. The PARENT (pid 9000) reads
+        // ~/.aws/credentials; a forked CHILD (pid 9001, ppid 9000) does the
+        // outbound connect. The same-PID correlation would miss it; the parent-pid
+        // fallback catches it and marks it split_pid.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            9000,
+            "/home/u/.aws/credentials",
+            "bash",
+            now,
+        ));
+        let inc = det.process(&connect_event_ppid(
+            9001,
+            9000,
+            "8.8.8.8",
+            443,
+            "curl",
+            now + Duration::milliseconds(5),
+        ));
+        let inc = inc.expect("parent-read + child-connect MUST fire (split-pid)");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.summary.contains("child of the reader pid=9000"));
+        assert_eq!(inc.evidence[0]["detection"], "parent_read_child_connect");
+        assert_eq!(inc.evidence[0]["split_pid"], true);
+    }
+
+    #[test]
+    fn unrelated_child_connect_does_not_borrow_a_stranger_read() {
+        // The ppid fallback must only match the connecting process's OWN parent. A
+        // child whose parent never read a secret does not fire just because some
+        // unrelated pid has a pending read.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            9100,
+            "/home/u/.aws/credentials",
+            "bash",
+            now,
+        ));
+        // Child 9201's parent is 9200 (NOT the reader 9100) — no correlation.
+        let inc = det.process(&connect_event_ppid(
+            9201,
+            9200,
+            "8.8.8.8",
+            443,
+            "curl",
+            now + Duration::milliseconds(5),
+        ));
+        assert!(
+            inc.is_none(),
+            "a child whose parent did not read must not borrow an unrelated pending read"
+        );
     }
 
     #[test]
@@ -809,6 +1210,38 @@ mod tests {
         assert!(is_sensitive_path("/home/user/.kube/config"));
         assert!(!is_sensitive_path("/var/log/syslog"));
         assert!(!is_sensitive_path("/usr/bin/ls"));
+    }
+
+    #[test]
+    fn source_and_node_modules_files_are_not_sensitive() {
+        // Regression: an AI agent loading its own package code was flagged as
+        // credential access because the path contained the generic words
+        // "secret"/"token" (only the GENERIC tokens are relaxed for code).
+        assert!(!is_sensitive_path(
+            "/home/lab/.openclaw/npm/projects/openclaw-slack-x/node_modules/@openclaw/slack/dist/secret-contract-api.js"
+        ));
+        assert!(!is_sensitive_path(
+            "/home/lab/.openclaw/npm/projects/x/node_modules/typebox/build/type/script/token/const.mjs"
+        ));
+        assert!(!is_sensitive_path("/srv/app/src/secret-utils.ts"));
+        // Genuine credentials are still sensitive (incl. the gcloud .json).
+        assert!(is_sensitive_path(
+            "/home/u/.config/gcloud/application_default_credentials.json"
+        ));
+        assert!(is_sensitive_path("/home/u/secrets/api.key.env"));
+    }
+
+    #[test]
+    fn specific_credentials_cannot_be_evaded_by_code_naming() {
+        // Anti-evasion (advanced-attacker thinking): a SPECIFIC credential path
+        // is detected regardless of extension or location — an attacker cannot
+        // hide a real key by naming it `.js` or stashing it under node_modules.
+        assert!(is_sensitive_path("/srv/app/node_modules/evil/id_rsa"));
+        assert!(is_sensitive_path("/tmp/loot/id_rsa.js"));
+        assert!(is_sensitive_path(
+            "/home/u/proj/node_modules/x/.aws/credentials"
+        ));
+        assert!(is_sensitive_path("/etc/shadow"));
     }
 
     // ---------------------------------------------------------------------

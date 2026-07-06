@@ -1,0 +1,29 @@
+[package]
+name = "iw-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "InnerWarden AI-agent guardrail as a standalone, cross-platform CLI (Linux, macOS, Windows). Screens an AI agent's shell commands for danger before they run - no sensor, no kernel, no install."
+
+[[bin]]
+name = "iw-guard"
+path = "src/main.rs"
+
+[dependencies]
+# The guardrail engine. Pure Rust, already Windows-clean (no /proc, cfg(unix),
+# libc, TLS, or C deps on the check-command path). This binary is a thin,
+# additive driver over it - it intentionally does NOT depend on the agent,
+# sensor, ctl, or store crates so it stays portable to Windows.
+innerwarden-agent-guard = { path = "../agent-guard" }
+serde_json = "1"
+# Pure-Rust, no-TLS HTTP server for the optional `serve` mode (loopback only).
+tiny_http = "0.12"
+# Async runtime for the `proxy` mode (the enforcing MCP stdio guard, which pumps
+# the wrapped server's stdio via tokio::process). Windows-clean: no unix APIs.
+tokio = { version = "1", features = ["rt-multi-thread", "io-std", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

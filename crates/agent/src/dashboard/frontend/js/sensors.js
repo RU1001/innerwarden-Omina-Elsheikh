@@ -36,6 +36,7 @@ const COLLECTOR_CATEGORY = {
   cloudtrail: 'telemetry',
   dns_capture: 'telemetry',
   ebpf: 'telemetry',
+  etw: 'telemetry',
   file_extract: 'telemetry',
   http_capture: 'telemetry',
   journald: 'telemetry',

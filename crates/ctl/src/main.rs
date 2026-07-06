@@ -185,6 +185,60 @@ enum Command {
         command: RuleCommand,
     },
 
+    /// Execution Gate (spec 083): arm the in-kernel exec gate around your AI
+    /// agent's process — observe first, then enforce. Agent-scoped, so the host
+    /// itself is never gated.
+    ///
+    /// Examples:
+    ///   innerwarden exec-gate status
+    ///   innerwarden exec-gate arm --pid 1234 --observe --path /usr/bin/python3
+    ///   innerwarden exec-gate disarm
+    #[command(name = "exec-gate")]
+    ExecGate {
+        #[command(subcommand)]
+        command: ExecGateCommand,
+    },
+
+    /// Decision-log external-anchor integrity audit.
+    ///
+    /// The hash chain proves the log is internally consistent, but cannot detect
+    /// the whole log being deleted or rolled back and re-grown from a fresh root.
+    /// `anchor` prints a compact commitment to the log's tip that you store
+    /// OUTSIDE this host; `verify` later proves the log still contains that exact
+    /// committed history (Intact / Truncated / Rewritten). The paid tier signs
+    /// the anchor (Ed25519) via `innerwarden-config-sign audit`.
+    ///
+    /// Examples:
+    ///   innerwarden audit anchor --json > anchor.json
+    ///   innerwarden audit verify --file anchor.json
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+
+    /// Internal: privileged helper for the `suspend-user-sudo` response. Invoked
+    /// only via a narrow sudoers grant; generates + installs a deny-all sudoers
+    /// drop-in for a user (no arbitrary-content primitive). Not for direct use.
+    #[clap(name = "__sudo-suspend", hide = true)]
+    SudoSuspend {
+        /// Username to suspend sudo for (validated; `root` refused).
+        #[arg(long)]
+        user: String,
+        /// Informational expiry recorded in the drop-in (RFC 3339). sudo does
+        /// not enforce it; the agent's cleanup loop removes the file.
+        #[arg(long)]
+        expires: String,
+    },
+
+    /// Internal: privileged helper that removes a `suspend-user-sudo` deny
+    /// drop-in for a user. Invoked only via the narrow sudoers grant.
+    #[clap(name = "__sudo-restore", hide = true)]
+    SudoRestore {
+        /// Username to restore sudo for (validated; `root` refused).
+        #[arg(long)]
+        user: String,
+    },
+
     /// SOC playbook tools (spec 056).
     ///
     /// Examples:
@@ -316,6 +370,11 @@ enum Command {
         /// Skip interactive confirmation prompts (e.g. privacy gate)
         #[arg(long)]
         yes: bool,
+
+        /// Re-apply even if already enabled. Repairs drift such as a missing
+        /// sudoers drop-in (the side effect that makes block-ip actually work).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Deactivate a capability
@@ -363,6 +422,37 @@ enum Command {
     Scan {
         #[arg(long, default_value = "")]
         modules_dir: String,
+    },
+
+    /// Open or check the security dashboard — easy + secure access.
+    ///
+    /// The dashboard binds to localhost by default (secure). This sets it up in
+    /// one step instead of editing systemd units + firewall by hand.
+    ///
+    /// Examples:
+    ///   innerwarden dashboard            # how to reach it (URL, login, SSH tunnel)
+    ///   innerwarden dashboard open       # expose securely (password + firewall-locked to your IP)
+    ///   innerwarden dashboard close      # back to localhost only
+    ///   innerwarden dashboard tunnel     # print the exact SSH-tunnel command
+    Dashboard {
+        #[command(subcommand)]
+        action: Option<commands::dashboard::DashboardAction>,
+    },
+
+    /// Uninstall InnerWarden — stop + remove services, binaries, eBPF maps,
+    /// sudoers + firewall rules. Keeps config + data unless --purge.
+    ///
+    /// Examples:
+    ///   innerwarden uninstall            # remove the software, keep config/data
+    ///   innerwarden uninstall --purge    # also remove config, data, logs + the user
+    ///   innerwarden uninstall --yes      # no confirmation prompt
+    Uninstall {
+        /// Also remove /etc/innerwarden, /var/lib/innerwarden, logs, and the user.
+        #[arg(long)]
+        purge: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
 
     #[clap(hide = true)]
@@ -633,6 +723,57 @@ enum AgentCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         server_cmd: Vec<String>,
     },
+
+    /// Expose InnerWarden as an MCP server over stdio (spec 082 Phase 2).
+    ///
+    /// The advisory front door: an AI coding agent can wire this as an MCP
+    /// server and ask InnerWarden, before acting, whether a command is safe
+    /// (`innerwarden_check_command`), whether an IP is a known threat
+    /// (`innerwarden_check_ip`), or what the host threat level is
+    /// (`innerwarden_security_context`). A thin adapter over the loopback Agent
+    /// API; stdio only (no network listener); returns capability-level answers
+    /// (deny/review/allow) without exposing detection internals. The host's
+    /// enforcement (the `proxy` MCP guard + eBPF) is unchanged: this is
+    /// additive, for a cooperating agent.
+    McpServe {
+        /// Optional label for audit / alerts.
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// Install InnerWarden's in-path command guard into an AI coding agent.
+    ///
+    /// Writes a small guard script and a PreToolUse hook so every shell command
+    /// the agent proposes is POSTed to the loopback `check-command` brain and
+    /// BLOCKED before it runs when dangerous, failing closed if the agent is not
+    /// reachable. Unlike `mcp-serve`/`check-command` (advisory), this enforces
+    /// even when the agent uses its raw shell tool. Currently supports Claude
+    /// Code. Example:
+    ///   innerwarden agent install-hook    # claude-code, ~/.claude/settings.json
+    #[command(name = "install-hook")]
+    InstallHook {
+        /// AI agent to wire up (currently only "claude-code").
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+
+        /// Path to the agent's settings.json (default ~/.claude/settings.json).
+        #[arg(long)]
+        settings: Option<String>,
+
+        /// InnerWarden dashboard base URL (default https://127.0.0.1:8787).
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Also block "review" verdicts, not just "deny".
+        #[arg(long)]
+        block_review: bool,
+
+        /// Tenant id to stamp on every guard check (spec 084 P0 1D), so a
+        /// multi-tenant fleet attributes per-container guard activity per
+        /// tenant. Bake it into the agent's container image / pod template.
+        #[arg(long)]
+        tenant: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -797,6 +938,28 @@ enum NotifyCommand {
     ///   innerwarden notify slack --webhook-url https://hooks.slack.com/services/...
     Slack {
         /// Slack Incoming Webhook URL (skips the wizard prompt)
+        #[arg(long)]
+        webhook_url: Option<String>,
+
+        /// Minimum severity to notify: low, medium, high, critical (default: high)
+        #[arg(long, default_value = "high")]
+        min_severity: String,
+
+        /// Skip the test message after configuring
+        #[arg(long)]
+        no_test: bool,
+    },
+
+    /// Set up Discord notifications (interactive wizard).
+    ///
+    /// Walks you through creating an Incoming Webhook in your Discord server.
+    /// The webhook URL is saved to agent.env.
+    ///
+    /// Examples:
+    ///   innerwarden notify discord
+    ///   innerwarden notify discord --webhook-url https://discord.com/api/webhooks/...
+    Discord {
+        /// Discord Incoming Webhook URL (skips the wizard prompt)
         #[arg(long)]
         webhook_url: Option<String>,
 
@@ -998,6 +1161,23 @@ enum MeshCommand {
         label: Option<String>,
     },
 
+    /// Connect to a peer in one step: enable mesh, add the peer, and open the
+    /// local firewall for the mesh port. The smooth path — one command and the
+    /// two nodes can reach each other (then restart the agent to apply).
+    ///
+    /// Examples:
+    ///   innerwarden mesh connect 203.0.113.7
+    ///   innerwarden mesh connect http://10.0.1.5:8790 --label prod-eu
+    Connect {
+        /// Peer host or endpoint. Accepts `host`, `host:port`, or
+        /// `http://host:port` (defaults to port 8790).
+        endpoint: String,
+
+        /// Human-friendly label for this peer
+        #[arg(long)]
+        label: Option<String>,
+    },
+
     /// Show mesh network status.
     Status,
 }
@@ -1066,6 +1246,84 @@ enum IntegrateCommand {
         /// How often to check (minutes, default: 10)
         #[arg(long, default_value = "10")]
         interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExecGateCommand {
+    /// Show the live gate: mode, scope, and allowlist / scope-cgroup counts.
+    Status,
+    /// Arm the gate around a process's cgroup. `--observe` logs would-be denials
+    /// but allows them (the safe onboarding mode). To then enforce, run
+    /// `exec-gate rehearse` and `exec-gate enforce` — enforce flips to DENY only
+    /// after a clean rehearsal (observe-armed, scoped, zero would-block), never
+    /// a blind flip.
+    Arm {
+        /// PID of the AI agent process to scope the gate to.
+        #[arg(long)]
+        pid: u32,
+        /// Observe mode: log what the gate WOULD block but allow it. Required
+        /// today (the only safe, non-bricking mode without a rehearsal).
+        #[arg(long)]
+        observe: bool,
+        /// A binary path to allowlist (repeatable). Observe tolerates an empty
+        /// allowlist — it simply learns what the agent runs.
+        #[arg(long = "path")]
+        paths: Vec<String>,
+    },
+    /// Rehearse: show what the gate WOULD block for a pid's cgroup over a recent
+    /// window (read-only). Run before `enforce` to confirm zero would-block and to
+    /// see which binaries still need allowlisting.
+    Rehearse {
+        /// PID of the AI agent process whose cgroup to inspect.
+        #[arg(long)]
+        pid: u32,
+        /// Lookback window in seconds (default 300).
+        #[arg(long)]
+        window: Option<u64>,
+    },
+    /// Enforce: flip the gate to DENY unknown execs in the pid's cgroup. Succeeds
+    /// only after a clean rehearsal (observe-armed, scoped to the pid, zero
+    /// would-block in the window) — never a blind flip.
+    Enforce {
+        /// PID of the AI agent process to enforce around.
+        #[arg(long)]
+        pid: u32,
+        /// Rehearsal window in seconds to require clean (default 300).
+        #[arg(long)]
+        window: Option<u64>,
+    },
+    /// Disarm: return the gate to inert. Always safe, no preconditions.
+    Disarm,
+}
+
+#[derive(Subcommand)]
+enum AuditCommand {
+    /// Compute and print a publishable anchor over the decision log's tip.
+    ///
+    /// Record the output OUTSIDE this host (a second box, a ticket, a
+    /// transparency log). Human-readable by default; `--json` emits a single
+    /// line that round-trips into `audit verify --anchor`. Prints nothing to
+    /// anchor when the log is empty.
+    Anchor {
+        /// Emit the anchor as a single-line JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify the live decision log against a previously-published anchor.
+    ///
+    /// Exit code is non-zero on tamper (Truncated / Rewritten), so this can gate
+    /// CI or a monitoring probe. Provide the anchor via `--file` or `--anchor`.
+    Verify {
+        /// Path to a JSON anchor file (as written by `audit anchor --json`).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// The anchor as an inline JSON string (alternative to `--file`).
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Emit the verdict as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1152,6 +1410,12 @@ enum PlaybookCommand {
         /// Basic-auth password (or INNERWARDEN_DASHBOARD_PASSWORD).
         #[arg(long)]
         password: Option<String>,
+
+        /// Skip TLS certificate verification. The agent dashboard serves
+        /// HTTPS with a self-signed cert, so `--url https://...` otherwise
+        /// fails with `UnknownIssuer`. Do NOT use over an untrusted network.
+        #[arg(long)]
+        insecure: bool,
     },
 }
 
@@ -1650,6 +1914,25 @@ enum ConfigAllCommand {
         no_test: bool,
     },
 
+    /// Set up Discord notifications.
+    ///
+    /// Examples:
+    ///   innerwarden config discord
+    ///   innerwarden config discord --webhook-url https://discord.com/api/webhooks/...
+    Discord {
+        /// Discord Incoming Webhook URL
+        #[arg(long)]
+        webhook_url: Option<String>,
+
+        /// Minimum severity to notify: low, medium, high, critical
+        #[arg(long, default_value = "high")]
+        min_severity: String,
+
+        /// Skip the test message after configuring
+        #[arg(long)]
+        no_test: bool,
+    },
+
     /// Set up HTTP webhook notifications.
     ///
     /// Examples:
@@ -2131,6 +2414,16 @@ fn dispatch_config(cli: &Cli, command: &Option<ConfigAllCommand>) -> Result<()> 
             min_severity,
             *no_test,
         ),
+        Some(ConfigAllCommand::Discord {
+            ref webhook_url,
+            ref min_severity,
+            no_test,
+        }) => commands::notify::cmd_configure_discord(
+            cli,
+            webhook_url.as_deref(),
+            min_severity,
+            *no_test,
+        ),
         Some(ConfigAllCommand::Webhook {
             ref url,
             ref min_severity,
@@ -2177,6 +2470,10 @@ fn dispatch_config(cli: &Cli, command: &Option<ConfigAllCommand>) -> Result<()> 
                 ref endpoint,
                 ref label,
             } => commands::mesh::cmd_mesh_add_peer(cli, endpoint, label.as_deref()),
+            MeshCommand::Connect {
+                ref endpoint,
+                ref label,
+            } => commands::mesh::cmd_mesh_connect(cli, endpoint, label.as_deref()),
             MeshCommand::Status => commands::mesh::cmd_mesh_status(cli),
         },
         Some(ConfigAllCommand::Validate { ref path }) => cmd_config_validate(path),
@@ -2286,22 +2583,33 @@ fn dispatch_module(cli: &Cli, command: &ModuleCommand) -> Result<()> {
 
 /// Check if we have write access to the config directory.
 fn am_root() -> bool {
-    let config_dir = Path::new("/etc/innerwarden");
-    if config_dir.exists() {
-        // Try to check write permission
-        std::fs::metadata(config_dir)
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                m.uid() == 0 && unsafe { libc_geteuid() } == 0
-            })
-            .unwrap_or(false)
-    } else {
-        // Config dir doesn't exist yet — need root to create it
-        unsafe { libc_geteuid() == 0 }
+    // On Windows (spec 085 Phase 0) return false: treat self as non-elevated,
+    // so ctl warns / offers a re-exec instead of writing config as if
+    // privileged (fail-closed). Real IsUserAnAdmin/token-elevation is a later phase.
+    #[cfg(unix)]
+    {
+        let config_dir = Path::new("/etc/innerwarden");
+        if config_dir.exists() {
+            // Try to check write permission
+            std::fs::metadata(config_dir)
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.uid() == 0 && unsafe { libc_geteuid() } == 0
+                })
+                .unwrap_or(false)
+        } else {
+            // Config dir doesn't exist yet - need root to create it
+            unsafe { libc_geteuid() == 0 }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
 /// Safe wrapper for geteuid without libc dep.
+#[cfg(unix)]
 unsafe fn libc_geteuid() -> u32 {
     // geteuid is always available on Linux/macOS
     extern "C" {
@@ -2629,15 +2937,56 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             ref capability,
             ref params,
             yes,
+            force,
         } => {
             let params = commands::capability::parse_params(params)?;
-            commands::capability::cmd_enable(&cli, &registry, capability, params, yes)
+            commands::capability::cmd_enable(&cli, &registry, capability, params, yes, force)
         }
         Command::Disable {
             ref capability,
             yes,
         } => commands::capability::cmd_disable(&cli, &registry, capability, yes),
         Command::List => commands::core::cmd_list(&cli, &registry),
+        Command::ExecGate { ref command } => match command {
+            ExecGateCommand::Status => commands::exec_gate::cmd_status(),
+            ExecGateCommand::Arm {
+                pid,
+                observe,
+                ref paths,
+            } => commands::exec_gate::cmd_arm(*pid, *observe, paths),
+            ExecGateCommand::Rehearse { pid, window } => commands::exec_gate::cmd_rehearse(
+                *pid,
+                *window,
+                &resolve_data_dir(&cli, &cli.data_dir),
+            ),
+            ExecGateCommand::Enforce { pid, window } => commands::exec_gate::cmd_enforce(
+                *pid,
+                *window,
+                &resolve_data_dir(&cli, &cli.data_dir),
+            ),
+            ExecGateCommand::Disarm => commands::exec_gate::cmd_disarm(),
+        },
+        Command::Audit { ref command } => match command {
+            AuditCommand::Anchor { json } => {
+                commands::audit::cmd_audit_anchor(&cli.agent_config, &cli.data_dir, *json)
+            }
+            AuditCommand::Verify {
+                ref file,
+                ref anchor,
+                json,
+            } => commands::audit::cmd_audit_verify(
+                &cli.agent_config,
+                &cli.data_dir,
+                file.as_deref(),
+                anchor.as_deref(),
+                *json,
+            ),
+        },
+        Command::SudoSuspend {
+            ref user,
+            ref expires,
+        } => commands::sudo_guard::cmd_sudo_suspend(user, expires),
+        Command::SudoRestore { ref user } => commands::sudo_guard::cmd_sudo_restore(user),
         Command::Rule { ref command } => match command {
             RuleCommand::List { ref r#type } => {
                 commands::rule::cmd_rule_list_all(&cli.sensor_config, r#type.as_deref())
@@ -2660,12 +3009,14 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 ref url,
                 ref user,
                 ref password,
+                insecure,
             } => commands::playbook::cmd_playbook_test(
                 id,
                 incident_file,
                 url.as_deref(),
                 user.as_deref(),
                 password.as_deref(),
+                *insecure,
             ),
         },
         Command::Module { ref command } => dispatch_module(&cli, command),
@@ -2682,6 +3033,13 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         Command::Welcome => commands::core::cmd_welcome(),
         Command::Navigator { ref output } => commands::status::cmd_navigator(output.as_deref()),
         Command::Scan { ref modules_dir } => scan::cmd_scan(modules_dir),
+        Command::Dashboard { ref action } => {
+            let act = action
+                .clone()
+                .unwrap_or(commands::dashboard::DashboardAction::Status);
+            commands::dashboard::run(&act, &cli.agent_config, cli.dry_run)
+        }
+        Command::Uninstall { purge, yes } => commands::uninstall::cmd_uninstall(&cli, purge, yes),
         Command::Status {
             ref target,
             ref modules_dir,
@@ -2746,6 +3104,16 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 min_severity,
                 *no_test,
             ),
+            Some(NotifyCommand::Discord {
+                ref webhook_url,
+                ref min_severity,
+                no_test,
+            }) => commands::notify::cmd_configure_discord(
+                &cli,
+                webhook_url.as_deref(),
+                min_severity,
+                *no_test,
+            ),
             Some(NotifyCommand::Webhook {
                 ref url,
                 ref min_severity,
@@ -2803,6 +3171,10 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 ref endpoint,
                 ref label,
             } => commands::mesh::cmd_mesh_add_peer(&cli, endpoint, label.as_deref()),
+            MeshCommand::Connect {
+                ref endpoint,
+                ref label,
+            } => commands::mesh::cmd_mesh_connect(&cli, endpoint, label.as_deref()),
             MeshCommand::Status => commands::mesh::cmd_mesh_status(&cli),
         },
         Command::Incidents {
@@ -3235,6 +3607,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn known_module_id_recognises_registry_modules() {
         assert!(known_module_id("openclaw-protection"));
+        assert!(known_module_id("claude-code-protection"));
         assert!(known_module_id("cloudflare-integration"));
         assert!(known_module_id("ssh-protection"));
         assert!(known_module_id("container-security"));
@@ -3439,6 +3812,27 @@ bind_addr = "127.0.0.1:8787"
             Err(err) => err,
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cli_parses_enable_with_force_flag() {
+        let cli =
+            Cli::try_parse_from(["innerwarden", "enable", "block-ip", "--force"]).expect("parse");
+        match cli.command {
+            Some(Command::Enable {
+                capability, force, ..
+            }) => {
+                assert_eq!(capability, "block-ip");
+                assert!(force, "--force must parse to true");
+            }
+            _ => panic!("expected enable command"),
+        }
+        // Default: force is false.
+        let cli2 = Cli::try_parse_from(["innerwarden", "enable", "block-ip"]).expect("parse");
+        match cli2.command {
+            Some(Command::Enable { force, .. }) => assert!(!force),
+            _ => panic!("expected enable command"),
+        }
     }
 
     #[test]
@@ -4092,7 +4486,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn decisions_reads_jsonl() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("decisions-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4106,7 +4500,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn decisions_action_filter() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("decisions-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4129,7 +4523,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn entity_finds_ip_in_incident() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("incidents-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4143,7 +4537,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn entity_finds_user_in_decision() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("decisions-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4175,7 +4569,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn tune_no_suggestions_when_calibrated() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         // Write a modest event count that matches default thresholds - no suggestion expected
         let events_path = dir.path().join(format!("events-{today}.jsonl"));
         let mut content = String::new();
@@ -4256,7 +4650,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_export_finds_matching_records() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("incidents-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4278,7 +4672,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_erase_no_matching_records() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("events-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4295,7 +4689,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_erase_removes_matching_records() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("events-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4315,7 +4709,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_erase_recomputes_hash_chain_for_decisions() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("decisions-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4343,7 +4737,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_erase_creates_audit_entry() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let events_path = dir.path().join(format!("events-{today}.jsonl"));
         std::fs::write(
             &events_path,

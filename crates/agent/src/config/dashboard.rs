@@ -21,6 +21,16 @@ pub struct DashboardConfig {
     /// the HTTP/TLS runtime — disabling it cuts ~50-70 MB RSS.
     #[serde(default = "default_dashboard_enabled")]
     pub enabled: bool,
+    /// Listen address for the dashboard server, e.g. `"127.0.0.1:8787"`
+    /// (loopback-only, the secure default) or `"0.0.0.0:8787"` (all
+    /// interfaces — reachable on the public/LAN IP). When set, this takes
+    /// precedence over the `--dashboard-bind` CLI flag, so operators configure
+    /// dashboard access in ONE place (`agent.toml`) instead of editing the
+    /// systemd unit / watchdog `--agent-arg`. `None` = fall back to the CLI
+    /// flag (which defaults to loopback). Manage it with `innerwarden dashboard
+    /// {status,expose,local}`.
+    #[serde(default)]
+    pub bind: Option<String>,
     /// List of trusted reverse-proxy IPs. Only when the connecting IP is in
     /// this list will X-Forwarded-For / X-Real-IP headers be honoured.
     /// Example: `["127.0.0.1", "::1", "10.0.0.1"]`
@@ -38,6 +48,7 @@ impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
             enabled: default_dashboard_enabled(),
+            bind: None,
             trusted_proxies: vec![],
             session_timeout_minutes: default_session_timeout_minutes(),
             max_sessions: default_max_sessions(),

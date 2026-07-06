@@ -106,14 +106,23 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 /// Set file to 640 and group to "innerwarden" so the service user can read it.
 /// Silently ignored if the group doesn't exist or the chown call fails.
 fn ensure_service_readable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    // chmod 640
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o640));
-    // chgrp innerwarden - best-effort via the `chgrp` binary
-    let _ = std::process::Command::new("chgrp")
-        .arg("innerwarden")
-        .arg(path)
-        .output();
+    // Unix file-mode + group ownership. On Windows (spec 085 Phase 0) this is a
+    // no-op; the ACL equivalent belongs to a later phase.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // chmod 640
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o640));
+        // chgrp innerwarden - best-effort via the `chgrp` binary
+        let _ = std::process::Command::new("chgrp")
+            .arg("innerwarden")
+            .arg(path)
+            .output();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -886,6 +886,12 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
         actionBtns += `<button type="button" class="journey-btn action-unblock" style="${watchStyle}"${watchAttrs}
           onclick="showActionModal('unblock_ip','${esc(subjectValue)}',null)">⊘ Unblock IP</button>`;
       }
+      // Trust IP (monitor-only): mark this IP benign so the agent stops
+      // AUTO-blocking it. Still detected/logged/notified — only the automated
+      // response is suppressed (see /api/action/trust-ip). Available whether or
+      // not it's currently blocked.
+      actionBtns += `<button type="button" class="journey-btn action-trust" style="${watchStyle}"${watchAttrs}
+        onclick="showActionModal('trust_ip','${esc(subjectValue)}',null)">✓ Trust IP</button>`;
     }
     if (actionCfg && actionCfg.enabled && subjectType === 'user') {
       actionBtns += `<button type="button" class="journey-btn action-suspend" style="${watchStyle}"${watchAttrs}

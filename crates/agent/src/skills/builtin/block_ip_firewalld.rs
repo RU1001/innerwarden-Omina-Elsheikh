@@ -26,9 +26,17 @@ pub struct BlockIpFirewalld;
 /// the rule string (and the v4/v6 family selection firewalld requires)
 /// is unit-testable without invoking `firewall-cmd`. The caller MUST
 /// have validated `ip` with `is_valid_firewall_target` first.
+///
+/// `priority="-1"` (a negative, i.e. low, priority) makes this source drop
+/// evaluate BEFORE the zone's allowed services/ports — the firewalld analogue of
+/// `ufw insert 1` / `iptables -I INPUT 1`. A default-priority (0) source drop can
+/// be ordered after the port/service accepts, letting an attacker's HTTP flood
+/// through on an already-open 80/443 (the same first-match leak fixed in the ufw
+/// skill live on 2026-07-02; the firewalld path was not live-verified — only ufw
+/// was — but the priority is the documented firewalld precedence mechanism).
 fn build_block_rich_rule(ip: &str) -> String {
     let family = if ip.contains(':') { "ipv6" } else { "ipv4" };
-    format!("rule family=\"{family}\" source address=\"{ip}\" drop")
+    format!("rule priority=\"-1\" family=\"{family}\" source address=\"{ip}\" drop")
 }
 
 /// The decided action for a block-ip-firewalld call, separated from the
@@ -155,7 +163,7 @@ mod tests {
     fn rich_rule_selects_ipv4_family() {
         assert_eq!(
             build_block_rich_rule("203.0.113.5"),
-            r#"rule family="ipv4" source address="203.0.113.5" drop"#
+            r#"rule priority="-1" family="ipv4" source address="203.0.113.5" drop"#
         );
     }
 
@@ -163,7 +171,23 @@ mod tests {
     fn rich_rule_selects_ipv6_family() {
         assert_eq!(
             build_block_rich_rule("2001:db8::1"),
-            r#"rule family="ipv6" source address="2001:db8::1" drop"#
+            r#"rule priority="-1" family="ipv6" source address="2001:db8::1" drop"#
+        );
+    }
+
+    #[test]
+    fn rich_rule_has_low_priority_to_win_over_allows() {
+        // Regression anchor: without a low (negative) priority a source-drop rich
+        // rule can be ordered after the zone's allowed services, leaking on open
+        // ports (the firewalld analogue of the ufw append leak).
+        let r = build_block_rich_rule("203.0.113.5");
+        assert!(
+            r.contains(r#"priority="-1""#),
+            "drop must have a low priority: {r}"
+        );
+        assert!(
+            r.starts_with("rule priority="),
+            "priority comes right after `rule`"
         );
     }
 
@@ -206,7 +230,7 @@ mod tests {
                 assert_eq!(ip, "203.0.113.5");
                 assert_eq!(
                     rich_rule,
-                    r#"rule family="ipv4" source address="203.0.113.5" drop"#
+                    r#"rule priority="-1" family="ipv4" source address="203.0.113.5" drop"#
                 );
             }
             other => panic!("expected Execute, got {other:?}"),

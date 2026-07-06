@@ -372,6 +372,82 @@ impl Default for SlackConfig {
     }
 }
 
+/// Configuration for Discord Incoming Webhook notifications (spec 078 P3).
+///
+/// Mirrors [`SlackConfig`]: a new operator-facing chat channel plugs in here +
+/// in `notification_channels::collect_chat_channels` + `loops::boot`, with no
+/// dispatch-site edits.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscordConfig {
+    /// Enable Discord notifications (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Discord Incoming Webhook URL.
+    /// Example: "https://discord.com/api/webhooks/<id>/<token>"
+    /// Prefer env var DISCORD_WEBHOOK_URL.
+    #[serde(default)]
+    pub webhook_url: String,
+
+    /// Minimum severity to notify (default: "high").
+    #[serde(default = "default_discord_min_severity")]
+    pub min_severity: String,
+
+    /// Optional base URL for dashboard deep-links in messages.
+    #[serde(default)]
+    pub dashboard_url: String,
+
+    /// Notification pipeline filter and digest settings.
+    #[serde(default)]
+    pub channel_notifications: ChannelNotificationConfig,
+}
+
+fn default_discord_min_severity() -> String {
+    "high".to_string()
+}
+
+impl DiscordConfig {
+    /// Resolve webhook_url: config field takes precedence, then env var DISCORD_WEBHOOK_URL.
+    pub fn resolved_webhook_url(&self) -> String {
+        if !self.webhook_url.is_empty() {
+            return self.webhook_url.clone();
+        }
+        std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default()
+    }
+
+    /// Parse min_severity string into a Severity, defaulting to High on error.
+    pub fn parsed_min_severity(&self) -> Severity {
+        match self.min_severity.to_lowercase().as_str() {
+            "debug" => Severity::Debug,
+            "info" => Severity::Info,
+            "low" => Severity::Low,
+            "medium" => Severity::Medium,
+            "high" => Severity::High,
+            "critical" => Severity::Critical,
+            other => {
+                tracing::warn!(
+                    min_severity = other,
+                    "unrecognised discord min_severity - defaulting to 'high'"
+                );
+                Severity::High
+            }
+        }
+    }
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook_url: String::new(),
+            min_severity: default_discord_min_severity(),
+            dashboard_url: String::new(),
+            channel_notifications: ChannelNotificationConfig::default(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Web Push
 // ---------------------------------------------------------------------------

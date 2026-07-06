@@ -2,11 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use rand_core::{OsRng, RngCore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use super::types::AdvisoryEntry;
@@ -31,6 +31,35 @@ impl Drop for SseGuard {
     fn drop(&mut self) {
         SSE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #71: Dashboard 2FA approval endpoints
+// ---------------------------------------------------------------------------
+
+/// The outcome of an approve or deny decision, sent back to the agent loop
+/// via the `approval_outcome_tx` channel.
+#[derive(Debug, Clone)]
+pub(crate) struct DashboardApprovalOutcome {
+    pub incident_id: String,
+    pub approved: bool,
+    /// Username of the operator who acted.
+    pub operator: String,
+    /// Whether the TOTP code was verified (true = verified or not enforced).
+    /// The raw code is intentionally NOT stored here to avoid CWE-532 leakage
+    /// if the struct is ever serialised or logged.
+    pub totp_verified: bool,
+}
+
+/// Request body used by the 2FA approve and deny handlers.
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct TwoFaActionRequest {
+    /// 6-digit TOTP code (approve only; ignored on deny).
+    #[serde(default)]
+    pub totp: String,
+    /// Optional denial reason (deny only; ignored on approve).
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// Configuration for dashboard-initiated actions (D3).
@@ -68,6 +97,8 @@ pub struct DashboardActionConfig {
     pub telegram_enabled: bool,
     /// Whether Slack notifications are enabled.
     pub slack_enabled: bool,
+    /// Whether Discord notifications are enabled.
+    pub discord_enabled: bool,
     /// Whether Cloudflare integration is enabled.
     pub cloudflare_enabled: bool,
     /// Whether CrowdSec integration is enabled.
@@ -126,6 +157,7 @@ impl Default for DashboardActionConfig {
             honeypot_port: 2222,
             telegram_enabled: false,
             slack_enabled: false,
+            discord_enabled: false,
             cloudflare_enabled: false,
             crowdsec_enabled: false,
             webhook_format: "default".to_string(),
@@ -216,6 +248,16 @@ pub(crate) struct DashboardState {
     /// as a small clone so the simulate endpoint does not pull the whole
     /// `AgentConfig` into `DashboardState`.
     pub(super) playbook_sim: Arc<PlaybookSimContext>,
+    // ── Issue #71: Dashboard 2FA approval endpoints ──────────────────────
+    /// Pending confirmations visible to the dashboard 2FA endpoints.
+    /// Shared with the main agent loop via `AgentState.dashboard_pending`;
+    /// populated by `decision_confirmation.rs` when a Telegram confirmation
+    /// is created, consumed by `/api/2fa/approve` and `/api/2fa/deny`.
+    pub(crate) pending_approvals: Arc<Mutex<HashMap<String, crate::telegram::PendingConfirmation>>>,
+    /// Optional channel for sending approve/deny outcomes back to the
+    /// agent loop. `None` in tests and in standalone dashboard mode
+    /// (outcomes are fire-and-forget in those cases).
+    pub(crate) approval_outcome_tx: Option<tokio::sync::mpsc::Sender<DashboardApprovalOutcome>>,
 }
 
 /// Inputs the playbook-test simulate endpoint feeds into the executor so
@@ -291,6 +333,12 @@ pub struct AgentGuardAlert {
     pub signals: Vec<String>,
     pub atr_rule_ids: Vec<String>,
     pub explanation: String,
+    /// The tenant the calling agent's container belongs to (spec 084), so a
+    /// multi-tenant fleet can attribute + investigate each guard check per
+    /// tenant in the incident layer (agent-guard-events JSONL → Loki). Omitted
+    /// from the JSON when absent so existing single-tenant logs are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 // ── Session ─────────────────────────────────────────────────────────────
@@ -355,6 +403,8 @@ pub(super) fn test_dashboard_state(data_dir: &std::path::Path) -> DashboardState
         fleet_state: None,
         two_factor: Arc::new(TwoFactorSettings::default()),
         playbook_sim: Arc::new(PlaybookSimContext::default()),
+        pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+        approval_outcome_tx: None,
     }
 }
 

@@ -62,6 +62,15 @@ static CLOUDFLARE_EDGE_RANGES: OnceLock<Vec<CidrRange>> = OnceLock::new();
 /// own VPC IP misclassified as an attacker.
 static LOCAL_INTERFACE_IPS: OnceLock<Vec<u32>> = OnceLock::new();
 
+/// Operator-configured "your own infrastructure" ranges, loaded at startup
+/// from `[allowlist] self_infra_ips` via `init_operator_self_infra()`. These
+/// are OTHER boxes the operator runs (a sibling server, a CI runner) that the
+/// feed-serving agent sees as a remote source. Treated as self-traffic so the
+/// incidents are flagged `research_only` (kept for detection/training, hidden
+/// from the operator + public feeds). EMPTY by default - nothing is hardcoded
+/// into the product; every deployment lists only its own addresses.
+static OPERATOR_SELF_INFRA: OnceLock<Vec<CidrRange>> = OnceLock::new();
+
 /// Cloudflare IPv4 ranges (from https://www.cloudflare.com/ips-v4).
 /// Updated 2026-04-01. These rarely change.
 const CLOUDFLARE_RANGES: &[&str] = &[
@@ -387,7 +396,72 @@ fn init_local_interface_ips() {
 /// flag the incident as `research_only` instead of surfacing it in the
 /// threats feed.
 pub fn is_self_traffic_ip(ip_str: &str) -> bool {
-    is_cloud_provider_ip(ip_str) || is_local_interface_ip(ip_str)
+    is_cloud_provider_ip(ip_str)
+        || is_local_interface_ip(ip_str)
+        || is_operator_self_infra_ip(ip_str)
+}
+
+/// Load the operator's own-infrastructure ranges from config
+/// (`[allowlist] self_infra_ips`). Idempotent (first call wins, like the
+/// other `OnceLock` loaders). Bare IPs are treated as `/32`. Invalid entries
+/// are skipped with a warning so one typo never silences the whole list.
+/// Empty input is valid and the common case (nothing hardcoded in-product).
+pub fn init_operator_self_infra(entries: &[String]) {
+    let ranges = build_self_infra_ranges(entries);
+    let n = ranges.len();
+    let _ = OPERATOR_SELF_INFRA.set(ranges);
+    if n > 0 {
+        info!(
+            self_infra_ranges = n,
+            "Operator self-infrastructure ranges loaded (hidden from feeds, still detected)"
+        );
+    }
+}
+
+/// Pure parse of the config entries into ranges. A bare IP is `/32`; an empty
+/// entry is dropped; an invalid one is skipped with a warning (not fatal).
+/// Extracted from `init_operator_self_infra` so it is testable without touching
+/// the process-global `OPERATOR_SELF_INFRA` (which would poison parallel tests
+/// that share the `is_self_traffic_ip` gate).
+fn build_self_infra_ranges(entries: &[String]) -> Vec<CidrRange> {
+    entries
+        .iter()
+        .filter_map(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let normalized = if trimmed.contains('/') {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/32")
+            };
+            match CidrRange::from_str(&normalized) {
+                Some(r) => Some(r),
+                None => {
+                    tracing::warn!(entry = %raw, "self_infra_ips: skipping invalid IP/CIDR");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Pure membership test against a parsed range list. Non-IPv4 input is false.
+fn ip_in_ranges(ranges: &[CidrRange], ip_str: &str) -> bool {
+    let Ok(IpAddr::V4(v4)) = ip_str.parse::<IpAddr>() else {
+        return false;
+    };
+    let ip = u32::from(v4);
+    ranges.iter().any(|r| r.contains(ip))
+}
+
+/// True if `ip_str` is in the operator-configured own-infrastructure list.
+/// Returns false when the list is unset/empty (the default).
+pub fn is_operator_self_infra_ip(ip_str: &str) -> bool {
+    OPERATOR_SELF_INFRA
+        .get()
+        .is_some_and(|ranges| ip_in_ranges(ranges, ip_str))
 }
 
 /// Number of local interface IPs loaded (for boot self-test).
@@ -809,6 +883,40 @@ mod tests {
         init();
         assert!(is_self_traffic_ip("185.125.188.58"));
         assert!(is_self_traffic_ip("91.189.88.1"));
+    }
+
+    #[test]
+    fn operator_self_infra_parse_and_match_pure() {
+        // Pure helpers, so this does NOT set the process-global
+        // OPERATOR_SELF_INFRA. Setting it would poison parallel tests that use
+        // TEST-NET IPs as fake attackers and share the is_self_traffic_ip gate
+        // (that is exactly what an earlier version of this test did). A bare IP
+        // is /32, a CIDR matches its block, an empty/typo entry is skipped.
+        let ranges = build_self_infra_ranges(&[
+            "203.0.113.34".to_string(),
+            "203.0.113.64/26".to_string(),
+            "  ".to_string(),
+            "definitely-not-an-ip".to_string(),
+        ]);
+        assert_eq!(ranges.len(), 2, "valid entries kept, blank + typo dropped");
+        assert!(ip_in_ranges(&ranges, "203.0.113.34"), "exact /32 own box");
+        assert!(ip_in_ranges(&ranges, "203.0.113.99"), "inside the /26");
+        assert!(!ip_in_ranges(&ranges, "203.0.113.10"), "outside the /26");
+        // A real external attacker, in no list, never matches.
+        assert!(!ip_in_ranges(&ranges, "198.51.100.7"));
+        // Non-IPv4 input is safely false, never a panic.
+        assert!(!ip_in_ranges(&ranges, "not-an-ip"));
+    }
+
+    #[test]
+    fn operator_self_infra_empty_config_adds_nothing() {
+        // The default/empty config is the only init we exercise in tests:
+        // setting the global to an EMPTY list is safe (it can never make another
+        // test's IP self-traffic), unlike loading real ranges which would poison
+        // the shared is_self_traffic_ip gate. Covers init + the Some(empty) arm.
+        init_operator_self_infra(&[]);
+        assert!(!is_operator_self_infra_ip("198.51.100.42"));
+        assert!(!is_self_traffic_ip("198.51.100.42"));
     }
 
     #[test]

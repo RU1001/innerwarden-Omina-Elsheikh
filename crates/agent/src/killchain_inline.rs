@@ -64,26 +64,34 @@ pub(crate) fn process_events(
                 .and_then(|s| s.as_str())
                 .unwrap_or("medium");
 
-            // Spec 052 Phase 1b: register the offending PID with the
+            // Spec 052 Phase 1b: the offending PID is registered with the
             // kernel LSM block so the chain's NEXT execve hits -EPERM
-            // synchronously (instead of waiting for the agent's
-            // kill_process skill to race against the malicious exec).
-            // Idempotent + best-effort: if the BLOCKED_PIDS map isn't
-            // pinned (sensor off, built without LSM, etc.) this is a
-            // logged no-op and the existing userspace skill pipeline
-            // continues unchanged.
+            // synchronously (instead of waiting for the agent's kill_process
+            // skill to race against the malicious exec).
             //
-            // Spec 053 fix (2026-05-22): use `evidence_obj` helper which
-            // tolerates both Array and Object shapes. Pre-fix every site
-            // accessed `evidence` as object → silent None → register
-            // never fired.
-            if let Some(pid) = evidence_obj(inc)
-                .and_then(|ev| ev.get("pid"))
-                .and_then(|p| p.as_u64())
-            {
-                let reason = format!("kill_chain:{pattern}");
-                crate::lsm_policy::register_blocked_pid(pid as u32, &reason);
-            }
+            // Spec 081 (2026-06-18): the kernel PID-block registration is NO
+            // LONGER done here. This function is sync and has no access to the
+            // agent-guard registry, so it cannot tell a real attacker apart
+            // from a legit, IW-managed AI agent whose own startup matched the
+            // chain signature. Kernel-denying a managed agent's next execve
+            // severs the very agent IW is meant to guard. The registration moves
+            // to `register_kernel_blocks` (async), which consults the
+            // `managed_agent_guard` verifier and WITHHOLDS the kernel block ONLY
+            // for a positively-verified managed agent. The verifier fails closed,
+            // so a real attacker is still kernel-blocked. Detection is unchanged:
+            // the incident still fires.
+            //
+            // NO TIMING REGRESSION (Defect-3 review): `process_events` is, and
+            // always was, called ONLY from the slow_loop tick (`slow_loop.rs`),
+            // never the fast incident loop. `register_kernel_blocks` is invoked
+            // in the SAME tick, immediately after `process_events` returns (see
+            // `slow_loop.rs`: `process_events(...)` then `register_kernel_blocks(
+            // &kc_incidents, state).await`). So a real-attacker (non-managed) PID
+            // is registered with the kernel block in the same tick it was before
+            // this change — the verify happens inline and never delays the block
+            // for non-managed PIDs. The block was never a fast-loop / kernel-time
+            // response in the first place; the move only adds the agent-aware
+            // withhold, it does not change WHEN the block lands.
 
             let kind = format!("killchain.{}", pattern);
             let mut corr_event = correlation_engine::CorrelationEngine::killchain_event(
@@ -153,6 +161,151 @@ pub(crate) fn process_events(
     }
 
     all_incidents
+}
+
+/// Kill chain patterns for which the kernel PID-block is gated by the
+/// managed-agent verifier (spec 081). These are exactly the patterns the
+/// co-located OpenClaw class trips on its own startup
+/// (sensitive-read → outbound-connect): `data_exfil` (sensitive_read|socket)
+/// and `exploit_c2` (mprotect|socket — node's V8 JIT RWX + its own outbound
+/// socket). For every OTHER pattern (reverse_shell, code_inject, bind_shell,
+/// …) the kernel block is registered UNCONDITIONALLY — those are not the
+/// managed-agent false-positive shape and an attacker must never buy the
+/// kernel-deny exemption by tripping one of them.
+const MANAGED_AGENT_GATED_PATTERNS: &[&str] = &["data_exfil", "exploit_c2"];
+
+fn is_managed_agent_gated_pattern(pattern: &str) -> bool {
+    MANAGED_AGENT_GATED_PATTERNS
+        .iter()
+        .any(|p| pattern.eq_ignore_ascii_case(p))
+}
+
+/// Spec 081 — kernel PID-block registration, gated by the managed-agent
+/// verifier. Runs in the slow_loop (async) AFTER `process_events`, where the
+/// agent-guard registry + signature index are reachable.
+///
+/// For each kill chain incident carrying a pid:
+///   - For `data_exfil` / `exploit_c2` (the managed-agent FP shape), consult
+///     `managed_agent_guard::verify_managed_agent_self_activity`. If the source
+///     is a positively-verified, IW-managed agent acting on its own services,
+///     WITHHOLD the kernel block (the irreversible execve-deny) and emit a
+///     truthful audit line — the incident + notification still fired in
+///     `process_events`. The verifier fails closed: a real attacker, a forged
+///     identity, a recycled pid, or an unregistered process is still blocked.
+///   - For every other pattern, register the kernel block unconditionally
+///     (preserves spec 052 Phase 1b behaviour for the non-FP chains).
+///
+/// Best-effort + idempotent: if the BLOCKED_PIDS map isn't pinned this is a
+/// logged no-op, exactly as before.
+pub(crate) async fn register_kernel_blocks(
+    incidents: &[serde_json::Value],
+    state: &crate::AgentState,
+) {
+    if incidents.is_empty() {
+        return;
+    }
+    // Snapshot the registry once for this batch (cheap clone-free read behind
+    // the async mutex). Held only for the duration of the verification loop.
+    let registry = state.agent_registry.lock().await;
+    let resolver = crate::managed_agent_guard::SystemProc;
+
+    for inc in incidents {
+        let Some(ev) = evidence_obj(inc) else {
+            continue;
+        };
+        let Some(pid) = ev.get("pid").and_then(|p| p.as_u64()) else {
+            continue;
+        };
+        let pid = pid as u32;
+        let pattern = ev.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+
+        // Per-incident decision: Some((agent_id, name)) → WITHHOLD the kernel
+        // block (positively-verified managed agent on its own services); None →
+        // register the block. Pulled into a pure-of-AgentState helper so the
+        // gating logic is testable with a stub resolver + hand-built registry.
+        if let Some((agent_id, name)) =
+            evaluate_kernel_block_withhold(ev, &registry, &state.signature_index, &resolver)
+        {
+            let comm = ev.get("comm").and_then(|c| c.as_str()).unwrap_or("");
+            warn!(
+                pid,
+                comm = %comm,
+                pattern = %pattern,
+                agent_id = %agent_id,
+                agent = %name,
+                "withheld_kernel_block: managed-agent-self-activity — kill chain {pattern} \
+                 attributed to verified managed agent {agent_id} ({name}); kernel PID-block \
+                 WITHHELD (incident + notification still fired). Detection unchanged."
+            );
+            continue;
+        }
+
+        // Default: register the kernel block (spec 052 Phase 1b behaviour).
+        let reason = format!("kill_chain:{pattern}");
+        crate::lsm_policy::register_blocked_pid(pid, &reason);
+    }
+}
+
+/// Pure-of-`AgentState` per-incident decision for the kernel PID-block (spec
+/// 081). `ev` is the killchain incident's evidence object (from
+/// [`evidence_obj`]). Returns `Some((agent_id, name))` when the kernel block
+/// should be WITHHELD — i.e. the pattern is in the managed-agent-gated set AND
+/// `managed_agent_guard::verify_managed_agent_self_activity` returns `Managed`
+/// (a positively-verified, IW-managed agent acting on its own services).
+/// Returns `None` (block proceeds) for any non-gated pattern, and for a gated
+/// pattern whose source fails verification (unregistered pid, forged identity,
+/// recycled pid, …) — the verifier fails closed.
+///
+/// IDENTICAL behaviour to the former inline body of [`register_kernel_blocks`];
+/// extracting it lets the gate be exercised with a stub resolver without an
+/// async `AgentState`. The caller still owns the actual
+/// `register_blocked_pid`/audit-log side effects.
+pub(crate) fn evaluate_kernel_block_withhold(
+    ev: &serde_json::Value,
+    registry: &innerwarden_agent_guard::registry::Registry,
+    sigindex: &innerwarden_agent_guard::signatures::SignatureIndex,
+    resolver: &dyn crate::managed_agent_guard::ProcResolver,
+) -> Option<(String, String)> {
+    let pid = ev.get("pid").and_then(|p| p.as_u64())? as u32;
+    let pattern = ev.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+    if !is_managed_agent_gated_pattern(pattern) {
+        return None;
+    }
+    let comm = ev.get("comm").and_then(|c| c.as_str()).unwrap_or("");
+    // DATA_EXFIL kill chains now carry the sensitive read path (the killchain
+    // tracker records the file that set CHAIN_SENSITIVE_READ and emits it as
+    // `sensitive_file`, spec-081). When present, the verifier's own-config gate
+    // applies on THIS kernel-block path too, exactly like the userspace
+    // IP-block path: a subverted-but-genuine managed agent reading a NON-own
+    // file (/etc/shadow, another user's key) is NotManaged → the kernel block
+    // lands. `exploit_c2` (mprotect-RWX + socket, no file read) legitimately has
+    // no path → identity-only verification, as before.
+    let read_path = ev.get("sensitive_file").and_then(|p| p.as_str());
+
+    // Fail closed: a DATA_EXFIL chain can ONLY complete through a sensitive
+    // `file.open` (that is what sets CHAIN_SENSITIVE_READ), so the tracker
+    // always records the path. An absent `sensitive_file` on a data_exfil
+    // incident is therefore anomalous — never withhold the kernel block on
+    // identity alone for it, because we cannot prove the read was own-config.
+    // (exploit_c2 has no file dimension and is exempt from this guard.)
+    if pattern.eq_ignore_ascii_case("data_exfil") && read_path.is_none() {
+        return None;
+    }
+
+    let verdict = crate::managed_agent_guard::verify_managed_agent_self_activity(
+        pid, comm, read_path, registry, sigindex, resolver,
+        // Destination reputation is not threaded into the kernel-block path
+        // today (the kernel block is source-keyed, not dst-keyed); the userspace
+        // IP-block path is where a known-bad destination forces the block. Pass
+        // false here.
+        false,
+    );
+    match verdict {
+        crate::managed_agent_guard::ManagedAgentVerdict::Managed { agent_id, name } => {
+            Some((agent_id, name))
+        }
+        crate::managed_agent_guard::ManagedAgentVerdict::NotManaged => None,
+    }
 }
 
 /// Write kill chain incidents to the daily JSONL file **and** the unified
@@ -870,6 +1023,7 @@ pub(crate) fn notify_telegram(
     deferred: &mut std::collections::HashMap<String, u32>,
     gate_suppressed_counter: &AtomicU64,
     self_traffic_list: &[String],
+    host: &str,
 ) {
     let Some(tg) = telegram_client else { return };
 
@@ -933,8 +1087,20 @@ pub(crate) fn notify_telegram(
             crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
                 *deferred.entry(ctx.detector.clone()).or_insert(0) += 1;
                 if ctx.is_contained {
-                    if let Some(count) = burst_tracker.record_contained() {
-                        let msg = crate::notification_gate::format_burst_summary(count);
+                    let category = crate::notification_gate::burst_category(&ctx.detector);
+                    // Attacker IP best-effort from the kill-chain evidence
+                    // (C2 endpoint) so the burst summary can count sources.
+                    let source_ip = evidence_obj(inc)
+                        .and_then(|ev| {
+                            ev.get("c2_ip")
+                                .or_else(|| ev.get("source_ip"))
+                                .or_else(|| ev.get("remote_ip"))
+                        })
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    if let Some(mut summary) = burst_tracker.record_contained(category, source_ip) {
+                        summary.host = host.to_string();
+                        let msg = crate::notification_gate::format_burst_summary(host, &summary);
                         let tg = tg.clone();
                         tokio::spawn(async move {
                             let _ = tg.send_alert_html(&msg).await;
@@ -2603,5 +2769,202 @@ mod tests {
         // updates). Both names must be present and distinct.
         assert!(src.contains("KILLCHAIN_SERVICE_ALLOWLIST"));
         assert!(src.contains("BUILTIN_SELF_TRAFFIC_COMMS"));
+    }
+
+    // ── Spec 081 — kernel-block withhold gate (evaluate_kernel_block_withhold) ──
+    //
+    // The async `register_kernel_blocks` loop body is extracted into the pure
+    // `evaluate_kernel_block_withhold` so the gating logic is testable with a
+    // stub `/proc` resolver + hand-built registry, no AgentState. These cover:
+    //   - gated pattern (data_exfil/exploit_c2) + verified managed agent → Some
+    //     (withhold)
+    //   - non-gated pattern (reverse_shell) → None (block proceeds)
+    //   - gated pattern but unregistered pid → None (fail closed)
+    //   - the `is_managed_agent_gated_pattern` predicate itself.
+
+    use innerwarden_agent_guard::registry::Registry;
+    use innerwarden_agent_guard::signatures::SignatureIndex;
+
+    const KC_INTERP: &str = "/usr/bin/node";
+    const KC_SCRIPT: &str = "/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js";
+
+    fn kc_registry_with_openclaw(pid: u32) -> Registry {
+        let mut reg = Registry::new();
+        reg.connect_with_facts(
+            "OpenClaw",
+            pid,
+            Some("ag-kc"),
+            Some(KC_INTERP.to_string()),
+            Some(1000),
+            Some(format!("{KC_INTERP}|{KC_SCRIPT}")),
+        )
+        .expect("connect");
+        reg
+    }
+
+    fn kc_openclaw_stub(pid: u32) -> crate::managed_agent_guard::test_support::StubProc {
+        crate::managed_agent_guard::test_support::StubProc::default().with_proc(
+            pid,
+            crate::managed_agent_guard::ResolvedProcess {
+                argv: vec![
+                    KC_INTERP.to_string(),
+                    KC_SCRIPT.to_string(),
+                    "gateway".to_string(),
+                ],
+                exe_path: Some(KC_INTERP.to_string()),
+                uid: Some(1000),
+            },
+        )
+    }
+
+    #[test]
+    fn is_managed_agent_gated_pattern_matches_data_exfil_and_exploit_c2_only() {
+        assert!(is_managed_agent_gated_pattern("data_exfil"));
+        assert!(is_managed_agent_gated_pattern("exploit_c2"));
+        assert!(is_managed_agent_gated_pattern("DATA_EXFIL")); // case-insensitive
+                                                               // Other patterns are NOT gated — an attacker must never buy the
+                                                               // kernel-deny exemption by tripping reverse_shell / code_inject.
+        assert!(!is_managed_agent_gated_pattern("reverse_shell"));
+        assert!(!is_managed_agent_gated_pattern("code_inject"));
+        assert!(!is_managed_agent_gated_pattern(""));
+    }
+
+    #[test]
+    fn evaluate_kernel_block_withhold_managed_for_gated_pattern() {
+        let pid = 4242;
+        let reg = kc_registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = kc_openclaw_stub(pid);
+        // exploit_c2 (node V8 JIT mprotect-RWX + its own outbound socket) has no
+        // file dimension, so identity-only verification withholds the block —
+        // this is OpenClaw's every-boot FP. (data_exfil now requires a present
+        // own-config `sensitive_file`; see the own-config tests below.)
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "exploit_c2",
+            "comm": "MainThread",
+        });
+        let out = evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub);
+        let (_id, name) = out.expect("gated pattern + managed agent → withhold");
+        assert_eq!(name, "OpenClaw");
+    }
+
+    #[test]
+    fn evaluate_kernel_block_withhold_blocks_data_exfil_without_sensitive_file() {
+        // Fail-closed guard: a data_exfil incident with NO `sensitive_file`
+        // (anomalous — the chain can only complete via a sensitive file.open)
+        // must NOT be withheld on identity alone. The block lands.
+        let pid = 4242;
+        let reg = kc_registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = kc_openclaw_stub(pid);
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+        });
+        assert!(
+            evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub).is_none(),
+            "data_exfil with no sensitive_file must fail closed (block proceeds)"
+        );
+    }
+
+    #[test]
+    fn evaluate_kernel_block_withhold_none_for_non_gated_pattern() {
+        let pid = 4242;
+        let reg = kc_registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = kc_openclaw_stub(pid);
+        // reverse_shell is NOT in the managed-agent-gated set → block proceeds
+        // (None) WITHOUT even consulting the verifier.
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "reverse_shell",
+            "comm": "MainThread",
+        });
+        assert!(
+            evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub).is_none(),
+            "non-gated pattern must never be withheld"
+        );
+    }
+
+    #[test]
+    fn evaluate_kernel_block_withhold_none_for_unregistered_pid() {
+        let pid = 4242;
+        let reg = Registry::new(); // nobody registered
+        let sigindex = SignatureIndex::new();
+        let stub = kc_openclaw_stub(pid);
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+        });
+        assert!(
+            evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub).is_none(),
+            "gated pattern but unregistered pid must fail closed (block proceeds)"
+        );
+    }
+
+    #[test]
+    fn evaluate_kernel_block_withhold_none_without_pid() {
+        let reg = kc_registry_with_openclaw(4242);
+        let sigindex = SignatureIndex::new();
+        let stub = kc_openclaw_stub(4242);
+        // Evidence missing pid → None (no source to attribute).
+        let ev = serde_json::json!({ "pattern": "data_exfil", "comm": "MainThread" });
+        assert!(evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub).is_none());
+    }
+
+    // ── Spec-081 own-config gate ON the kernel-block path ──────────────────
+    //
+    // DATA_EXFIL kill chains now carry the read path as `sensitive_file`
+    // (killchain tracker change). The two tests below prove the verifier's
+    // own-config gate now governs the kernel execve-deny exactly like the
+    // userspace IP-block path: reading OWN config → withhold; reading
+    // /etc/shadow → the block LANDS even for the genuine managed agent. Before
+    // this change `read_path` was always None on the kernel path, so a
+    // subverted-but-genuine agent reading /etc/shadow wrongly bought the
+    // execve-deny exemption.
+
+    #[test]
+    fn evaluate_kernel_block_withhold_managed_when_sensitive_file_is_own_config() {
+        let pid = 4242;
+        let reg = kc_registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        // Agent reading its OWN /home/lab/.env (under the script-derived home,
+        // owned by the agent uid) — the legitimate startup FP.
+        let stub = kc_openclaw_stub(pid).with_owner("/home/lab/.env", 1000);
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+            "sensitive_file": "/home/lab/.env",
+        });
+        let out = evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub);
+        let (_id, name) = out.expect("own-config read by verified managed agent → withhold");
+        assert_eq!(name, "OpenClaw");
+    }
+
+    #[test]
+    fn evaluate_kernel_block_withhold_blocks_when_sensitive_file_is_etc_shadow() {
+        let pid = 4242;
+        let reg = kc_registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        // SAME verified managed agent + SAME gated pattern, but the read is
+        // /etc/shadow — NOT its own config. Owner uid 0 != proc uid 1000, and
+        // the path is outside the agent's home/install. The kernel block MUST
+        // land (None). This is the hole #5 closes: identity alone no longer
+        // buys the execve-deny exemption when the read is a foreign secret.
+        let stub = kc_openclaw_stub(pid).with_owner("/etc/shadow", 0);
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+            "sensitive_file": "/etc/shadow",
+        });
+        assert!(
+            evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub).is_none(),
+            "a verified managed agent reading /etc/shadow must still be kernel-blocked"
+        );
     }
 }

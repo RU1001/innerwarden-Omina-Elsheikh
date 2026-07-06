@@ -22,6 +22,7 @@ pub fn cmd_playbook_test(
     url: Option<&str>,
     user: Option<&str>,
     password: Option<&str>,
+    insecure: bool,
 ) -> Result<()> {
     let incident = read_incident_json(incident_file)?;
     let base = url.unwrap_or(DEFAULT_URL).trim_end_matches('/');
@@ -31,7 +32,10 @@ pub fn cmd_playbook_test(
         "incident": incident,
     });
 
-    let mut req = ureq::post(&endpoint).header("Content-Type", "application/json");
+    let agent = build_agent(insecure);
+    let mut req = agent
+        .post(&endpoint)
+        .header("Content-Type", "application/json");
     // Basic auth: flag wins, else env (matches the dashboard's
     // INNERWARDEN_DASHBOARD_USER / _PASSWORD knobs). Loopback-no-auth
     // installs need neither.
@@ -62,6 +66,24 @@ pub fn cmd_playbook_test(
 
     print!("{}", format_test_output(playbook_id, &value));
     Ok(())
+}
+
+/// Build the HTTP agent. With `insecure`, TLS certificate verification is
+/// disabled so the CLI can reach the agent dashboard's self-signed HTTPS
+/// cert (`https://127.0.0.1:8787`); otherwise the default verifying agent.
+fn build_agent(insecure: bool) -> ureq::Agent {
+    if insecure {
+        ureq::Agent::config_builder()
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .disable_verification(true)
+                    .build(),
+            )
+            .build()
+            .into()
+    } else {
+        ureq::Agent::new_with_defaults()
+    }
 }
 
 /// Read the incident JSON from `path`. Accepts a single JSON object or a
@@ -185,6 +207,14 @@ mod tests {
         assert!(out1.contains("[queued] alert (route_alert)"));
         assert!(out1.contains("Queued commands"));
         assert!(out1.contains("route_alert"));
+    }
+
+    #[test]
+    fn build_agent_constructs_in_both_modes() {
+        // Both the verifying and the insecure (cert-skip) agents construct
+        // without panicking; the insecure path exercises the TlsConfig builder.
+        let _verifying = build_agent(false);
+        let _insecure = build_agent(true);
     }
 
     #[test]

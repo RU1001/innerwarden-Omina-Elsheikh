@@ -10,15 +10,18 @@ description = "AI-assisted defense agent with response skills for InnerWarden."
 keywords = ["security", "incident-response", "autonomous-defense", "linux", "rust"]
 categories = ["command-line-utilities", "network-programming"]
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+# All jemalloc + journald + aya are Linux-only. jemalloc was previously gated
+# `cfg(not(target_os = "macos"))`; spec 085 (Phantom-on-Windows) narrows it to
+# `target_os = "linux"` so Windows uses the system allocator, exactly like the
+# macOS build. Merged into the single existing linux target table.
+#
 # `profiling` compiles the jemalloc heap profiler into the binary; it
 # is inert at runtime until `MALLOC_CONF=prof:true,...` is set, so
 # there is no steady-state overhead. `unprefixed_malloc_on_supported_platforms`
 # is required for `MALLOC_CONF` and the `malloc_conf` weak symbol to
 # be picked up by the runtime. See docs/heap-profile.md for the
 # on-demand workflow.
-tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
-
+#
 # Wave 9f (AUDIT-009 root): journald sink wired in main.rs when the
 # binary runs under systemd (detected via `JOURNAL_STREAM` env var). The
 # tracing-subscriber fmt layer writes plain text to stdout which journald
@@ -27,18 +30,19 @@ tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_mall
 # PRIORITY based on the tracing level via sd_journal_send so operator
 # severity filters work as documented.
 [target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 tracing-journald = "0.3"
 # Spec 052 Phase 1b: aya userspace opens the pinned BLOCKED_PIDS map and
 # writes PID/TGID entries the kernel LSM hook consults. Aya is Linux-only
 # (depends on libc symbols that don't exist on macOS/Windows); the
 # `lsm_policy` module stubs to no-ops on non-Linux via cfg.
-aya = "0.13"
+aya = "0.14"
 
 [dependencies]
 innerwarden_core = { path = "../core" }
 innerwarden-store = { path = "../store" }
 innerwarden-agent-guard = { path = "../agent-guard" }
-innerwarden-mesh = { git = "https://github.com/InnerWarden/innerwarden-mesh.git", rev = "ef89c9a468709454ed501b528e30fca2741a2313" }
+innerwarden-mesh = { git = "https://github.com/InnerWarden/innerwarden-mesh.git", rev = "12890c08f7b2e9fa9f34c9bdf2972750a43a3a55" }
 innerwarden-smm = { path = "../smm" }
 innerwarden-hypervisor = { path = "../hypervisor" }
 innerwarden-killchain = { path = "../killchain" }
@@ -66,13 +70,14 @@ futures-core = "0.3"
 # for explicit handlers).
 futures-util = "0.3"
 axum = { version = "0.7", features = ["json"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 argon2 = "0.5"
 base64 = "0.22"
 rpassword = "7"
 rand_core = { version = "0.6", features = ["std"] }
 rand = "0.10"
 toml = "1.1"
+toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 fs2 = "0.4"
@@ -81,7 +86,7 @@ sha2 = "0.10"
 sha2_011 = { package = "sha2", version = "=0.11.0" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 serde_yaml = "0.9"
-russh = "0.61"
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2", "rsa"] }
 regex = "1"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
 aes-gcm = "0.10"
@@ -92,7 +97,7 @@ bytes = "1"
 # but compiles cleanly on any target and is easier to distribute).
 tract-onnx = { version = "0.22", optional = true }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
-axum-server = { version = "0.8", features = ["tls-rustls"] }
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen = "0.14"
 rustls-pki-types = "1"

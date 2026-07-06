@@ -117,14 +117,22 @@ impl CrontabPersistenceDetector {
         if lower.contains("crontab -e") || lower.contains("crontab -r") {
             return true;
         }
-        if let Some(idx) = lower.find("crontab -") {
-            let rest = &lower[idx + "crontab -".len()..];
+        // Scan EVERY `crontab -` occurrence, not just the first. A benign leading
+        // `crontab -l` (list) must not shadow a trailing modifying `crontab -` on
+        // the same line, e.g. `(crontab -l; echo evil) | crontab -` — the classic
+        // "read current, append payload, reinstall" persistence one-liner. The
+        // 2026-05-09 -l FP fix correctly skips -l/-u/--help, but `find` only
+        // returned the FIRST hit, so the read-only list shadowed the real write.
+        let mut rest_all = lower.as_str();
+        while let Some(idx) = rest_all.find("crontab -") {
+            let rest = &rest_all[idx + "crontab -".len()..];
             match rest.chars().next() {
                 None => return true,                         // ends in "crontab -"
                 Some(c) if c.is_whitespace() => return true, // "crontab - <file"
                 Some('<') => return true,                    // "crontab -<file"
-                _ => {} // -l, -u, --help — read-only; fall through
+                _ => {} // -l, -u, --help — read-only; keep scanning past it
             }
+            rest_all = rest;
         }
 
         // echo ... >> ... cron pattern
@@ -576,6 +584,31 @@ mod tests {
         assert!(
             inc.is_none(),
             "crontab -u <user> -l is read-only and MUST NOT trigger a persistence alert"
+        );
+    }
+
+    /// Regression anchor (atomic-bench T1053.003, 2026-06-20): the classic
+    /// "read current crontab, append payload, reinstall" one-liner
+    /// `(crontab -l; echo '* * * * * /tmp/payload') | crontab -`. Pre-fix the
+    /// detector used `lower.find("crontab -")` (FIRST match only), so the benign
+    /// leading `crontab -l` shadowed the trailing MODIFYING `crontab -` and the
+    /// whole persistence install was missed. The fix scans every occurrence;
+    /// this MUST fire. Keep it paired with the `-l`-alone anchor above so the
+    /// fix cannot regress in either direction (miss the write / FP on the list).
+    #[test]
+    fn crontab_list_then_reinstall_still_triggers_persistence_alert() {
+        let mut det = CrontabPersistenceDetector::new("test", 300);
+        let now = Utc::now();
+        let inc = det.process(&command_event(
+            "(crontab -l; echo '* * * * * /tmp/atomic-payload.sh') | crontab -",
+            "bash",
+            1234,
+            now,
+        ));
+        assert!(
+            inc.is_some(),
+            "a trailing modifying `crontab -` MUST fire even when a read-only \
+             `crontab -l` appears earlier on the same line"
         );
     }
 

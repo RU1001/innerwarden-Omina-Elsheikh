@@ -9,6 +9,23 @@ use super::firewall_target::{format_skill_outcome, is_valid_firewall_target};
 
 pub struct BlockIpUfw;
 
+/// PURE: the `ufw` argv for blocking `ip`. `insert 1` (not a bare `deny`, which
+/// appends) so the attacker deny wins over broad `allow <port>` rules — ufw is
+/// first-match-wins. Kept as a function so a regression to append is caught by a
+/// unit test, not only in production.
+fn ufw_block_args(ip: &str) -> Vec<&str> {
+    vec![
+        "ufw",
+        "insert",
+        "1",
+        "deny",
+        "from",
+        ip,
+        "comment",
+        "innerwarden",
+    ]
+}
+
 impl ResponseSkill for BlockIpUfw {
     fn id(&self) -> &'static str {
         "block-ip-ufw"
@@ -18,8 +35,10 @@ impl ResponseSkill for BlockIpUfw {
     }
     fn description(&self) -> &'static str {
         "Permanently blocks the attacking IP using ufw (Uncomplicated Firewall). \
-         Adds a DENY rule with the 'innerwarden' comment for traceability. \
-         Requires: sudo ufw deny from <IP> (configured in /etc/sudoers.d/innerwarden)."
+         Inserts a DENY rule at position 1 (with the 'innerwarden' comment) so it \
+         wins over any broad `allow <port>` rules — ufw is first-match-wins, so an \
+         appended deny would leak on already-allowed ports (80/443). \
+         Requires: sudo ufw insert 1 deny from <IP> (configured in /etc/sudoers.d/innerwarden)."
     }
     fn tier(&self) -> SkillTier {
         SkillTier::Open
@@ -63,7 +82,7 @@ impl ResponseSkill for BlockIpUfw {
             if dry_run {
                 info!(
                     ip,
-                    "DRY RUN: would execute: sudo ufw deny from {ip} comment 'innerwarden'"
+                    "DRY RUN: would execute: sudo ufw insert 1 deny from {ip} comment 'innerwarden'"
                 );
                 return SkillResult {
                     success: true,
@@ -71,8 +90,16 @@ impl ResponseSkill for BlockIpUfw {
                 };
             }
 
+            // `ufw insert 1` — NOT a bare `ufw deny` (which appends). ufw evaluates
+            // user rules top-to-bottom, first match wins. A web/hosting box has
+            // broad `allow 80/443` rules; an APPENDED `deny from <ip>` sits below
+            // them and never matches for HTTP traffic, so the attacker's flood is
+            // allowed by the port rule and the "block" silently leaks (proven live
+            // 2026-07-02: an abuser kept reaching :8080 through an appended deny;
+            // inserting at position 1 cut it off). Position 1 puts the attacker
+            // deny above every allow so it wins.
             let output = tokio::process::Command::new("sudo")
-                .args(["ufw", "deny", "from", &ip, "comment", "innerwarden"])
+                .args(ufw_block_args(&ip))
                 .output()
                 .await;
 
@@ -132,6 +159,26 @@ mod tests {
         let result = BlockIpUfw.execute(&ctx, true).await;
         assert!(!result.success);
         assert!(result.message.contains("no target IP"));
+    }
+
+    #[test]
+    fn ufw_block_inserts_at_position_1_not_append() {
+        // Regression anchor for the 2026-07-02 finding: a bare `ufw deny from` is
+        // APPENDED and loses to a broad `allow 80/443` above it (first-match-wins),
+        // so the block silently leaks on the exact ports a web host has open. The
+        // deny must be inserted at position 1.
+        let args = ufw_block_args("1.2.3.4");
+        assert_eq!(
+            &args[0..3],
+            &["ufw", "insert", "1"],
+            "must insert at position 1"
+        );
+        assert!(args.contains(&"deny") && args.contains(&"from") && args.contains(&"1.2.3.4"));
+        assert!(args.contains(&"innerwarden"), "keeps the audit comment");
+        // position of `1` is immediately after `insert` and before `deny`.
+        let ins = args.iter().position(|a| *a == "insert").unwrap();
+        assert_eq!(args[ins + 1], "1");
+        assert!(args.iter().position(|a| *a == "deny").unwrap() > ins);
     }
 
     #[test]

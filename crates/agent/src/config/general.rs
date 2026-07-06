@@ -24,6 +24,19 @@ pub struct AllowlistConfig {
     /// Examples: ["deploy", "backup"]
     #[serde(default)]
     pub trusted_users: Vec<String>,
+
+    /// YOUR OWN infrastructure IPs/CIDRs (other boxes you run, a sibling
+    /// server, a CI runner). Traffic whose external IPs are all your own
+    /// infrastructure is treated as self-traffic: it is still detected and
+    /// kept for training/investigation, but it is flagged `research_only` so
+    /// it does NOT appear in the operator threats feed or the public live
+    /// feed. This is for YOUR boxes only, set per deployment; it is empty by
+    /// default and nothing is hardcoded into the product. Do NOT list a cloud
+    /// provider range here to silence an attacker (attackers use the cloud
+    /// too) - this is for addresses you own and control.
+    /// Examples: ["172.212.178.34", "10.20.0.0/24"]
+    #[serde(default)]
+    pub self_infra_ips: Vec<String>,
 }
 
 /// Spec 056 SOC response playbooks.

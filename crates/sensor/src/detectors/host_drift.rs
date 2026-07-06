@@ -3,23 +3,6 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use innerwarden_core::{entities::EntityRef, event::Event, event::Severity, incident::Incident};
 
-/// Directories where package managers install binaries.
-const TRUSTED_PATHS: &[&str] = &[
-    "/usr/bin/",
-    "/usr/sbin/",
-    "/usr/local/bin/",
-    "/usr/local/sbin/",
-    "/usr/lib/",
-    "/usr/libexec/",
-    "/bin/",
-    "/sbin/",
-    "/lib/",
-    "/lib64/",
-    "/opt/",
-    "/snap/",
-    "/nix/store/",
-];
-
 /// Paths where executables are expected but not from package managers.
 /// These are NOT flagged as drift.
 const DEVELOPMENT_PATHS: &[&str] = &[
@@ -267,7 +250,9 @@ impl HostDriftDetector {
 }
 
 fn is_trusted_path(path: &str) -> bool {
-    TRUSTED_PATHS.iter().any(|p| path.starts_with(p))
+    // Single source of truth shared with `kernel_promote`'s memfd trust check
+    // (cross-test: `host_drift_and_path_trust_agree`).
+    crate::path_trust::is_trusted_system_path(path)
 }
 
 fn is_development_path(path: &str) -> bool {
@@ -412,6 +397,27 @@ mod tests {
         let mut det = HostDriftDetector::new("test", 300);
         let ev = exec_event("bash", "/usr/bin/bash");
         assert!(det.process(&ev).is_none());
+    }
+
+    #[test]
+    fn host_drift_and_path_trust_agree() {
+        // Cross-test: host_drift's exec-location trust check and the shared
+        // `path_trust` predicate kernel_promote uses for memfd creators MUST
+        // agree, so a binary trusted for one is trusted for the other. Pins the
+        // single-source-of-truth refactor.
+        use crate::path_trust::is_trusted_system_path;
+        for p in [
+            "/usr/bin/fwupdmgr",
+            "/usr/local/bin/innerwarden-agent",
+            "/lib/systemd/systemd-executor",
+        ] {
+            assert!(is_trusted_path(p), "drift should trust {p}");
+            assert!(is_trusted_system_path(p), "path_trust should trust {p}");
+        }
+        for p in ["/tmp/iw_dl_sensor", "/dev/shm/x", "/home/u/payload"] {
+            assert!(!is_trusted_path(p), "drift should distrust {p}");
+            assert!(!is_trusted_system_path(p), "path_trust should distrust {p}");
+        }
     }
 
     #[test]

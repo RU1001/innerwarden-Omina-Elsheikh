@@ -157,53 +157,94 @@ pub(crate) async fn handle_telegram_bot_command(
         return true;
     }
 
-    // Sensitivity buttons from onboarding menu
+    // Sensitivity buttons from the Settings menu. These ACTUATE now: the change
+    // is queued for the main loop (which owns cfg), applied to the bot channel's
+    // alert filter, and persisted. No 2FA (alert noise is not a privileged
+    // action). Unknown words are rejected.
     if let Some(level) = result.incident_id.strip_prefix("__sensitivity__:") {
         info!(operator = %result.operator_name, level, "Telegram sensitivity change");
-        if let Some(ref tg) = state.telegram_client {
-            let (emoji, desc) = match level {
-                "quiet" => ("🔇", "Only Critical alerts (server compromised, privesc)"),
-                "verbose" => ("🔊", "Medium, High, and Critical alerts"),
-                _ => ("🔔", "High and Critical alerts (recommended)"),
-            };
-            let msg = format!(
-                "{emoji} <b>Notification sensitivity: {level}</b>\n\n\
-                 <i>{desc}</i>\n\n\
-                 To apply permanently, run on server:\n\
-                 <code>innerwarden configure sensitivity {level}</code>"
-            );
-            let tg = tg.clone();
-            tokio::spawn(async move {
-                let _ = tg.send_raw_html(&msg).await;
-            });
+        if cfg.telegram.bot.enabled {
+            if crate::agent_context::sensitivity_to_filter(level).is_some() {
+                let (emoji, desc) = match level {
+                    "quiet" => ("🔇", "only Critical alerts (compromise, privesc)"),
+                    "verbose" => ("🔊", "Medium, High and Critical alerts"),
+                    _ => ("🔔", "High and Critical alerts (recommended)"),
+                };
+                state
+                    .pending_setting_changes
+                    .push(crate::SettingChange::Sensitivity(level.to_string()));
+                bot_helpers::write_telegram_triage_audit(
+                    state,
+                    "__sensitivity__",
+                    &result.operator_name,
+                    "sensitivity_change",
+                    None,
+                    None,
+                    format!(
+                        "Operator {} set sensitivity to {level}",
+                        result.operator_name
+                    ),
+                    format!("sensitivity:{level}"),
+                );
+                tg_reply(
+                    state,
+                    format!(
+                        "{emoji} <b>Alerts: {level}</b>\n<i>{desc}.</i>\nApplied now and saved."
+                    ),
+                );
+            } else {
+                tg_reply(
+                    state,
+                    "Unknown level. Use <b>quiet</b>, <b>normal</b>, or <b>verbose</b>."
+                        .to_string(),
+                );
+            }
         }
         return true;
     }
 
-    // Profile toggle: "profile:simple" or "profile:technical"
+    // Profile toggle: ACTUATES now. Queues the change for the main loop, which
+    // flips cfg.telegram.user_profile, persists it, and re-registers the
+    // profile-scoped command menu so the operator immediately sees the right one.
     if let Some(profile) = result.incident_id.strip_prefix("__profile__:") {
         info!(operator = %result.operator_name, profile, "Telegram profile change");
-        if let Some(ref tg) = state.telegram_client {
-            let (emoji, desc) = match profile {
-                "simple" => (
+        if cfg.telegram.bot.enabled {
+            let simple = profile.eq_ignore_ascii_case("simple");
+            let (emoji, desc) = if simple {
+                (
                     "✨",
-                    "Simple mode. Plain language alerts, no technical details.",
-                ),
-                _ => (
+                    "Simple mode. Plain-language alerts, no jargon, a 5-command menu.",
+                )
+            } else {
+                (
                     "🔧",
-                    "Technical mode. Full details, IPs, detectors, evidence.",
-                ),
+                    "Technical mode. Full detail (IPs, detectors, evidence) and the full menu.",
+                )
             };
-            let msg = format!(
-                "{emoji} <b>Profile: {profile}</b>\n\n\
-                 <i>{desc}</i>\n\n\
-                 To apply permanently, run on server:\n\
-                 <code>innerwarden configure profile {profile}</code>"
+            state
+                .pending_setting_changes
+                .push(crate::SettingChange::Profile(simple));
+            bot_helpers::write_telegram_triage_audit(
+                state,
+                "__profile__",
+                &result.operator_name,
+                "profile_change",
+                None,
+                None,
+                format!(
+                    "Operator {} switched profile to {}",
+                    result.operator_name,
+                    if simple { "simple" } else { "technical" }
+                ),
+                format!("profile:{}", if simple { "simple" } else { "technical" }),
             );
-            let tg = tg.clone();
-            tokio::spawn(async move {
-                let _ = tg.send_raw_html(&msg).await;
-            });
+            tg_reply(
+                state,
+                format!(
+                    "{emoji} <b>Profile: {}</b>\n<i>{desc}</i>\nApplied now and saved; the menu just updated.",
+                    if simple { "simple" } else { "technical" }
+                ),
+            );
         }
         return true;
     }
@@ -529,6 +570,80 @@ pub(crate) async fn handle_telegram_bot_command(
         return true;
     }
 
+    // /mode [guard|watch|dryrun] - live guardian-mode control from the phone.
+    // Bare /mode shows the current mode + options; an argument flips it (2FA-gated
+    // because it changes whether the responder enforces for real). The actual
+    // cfg mutation + persist happens in the main loop via pending_mode_change.
+    if let Some(mode_arg) = result.incident_id.strip_prefix("__mode__:") {
+        let mode_arg = mode_arg.trim().to_string();
+        info!(operator = %result.operator_name, mode = %mode_arg, "Telegram /mode command received");
+        if cfg.telegram.bot.enabled {
+            if mode_arg.is_empty() {
+                // No argument: report the current mode and the choices.
+                let mode = guardian_mode(cfg);
+                tg_reply(
+                    state,
+                    format!(
+                        "\u{1f6e1}\u{fe0f} <b>Current mode: {}</b>\n<i>{}</i>\n\n\
+                         Change it: <code>/mode guard</code> (auto-defend), \
+                         <code>/mode watch</code> (monitor only), \
+                         <code>/mode dryrun</code> (simulate).",
+                        mode.label(),
+                        mode.description()
+                    ),
+                );
+            } else if bot_helpers::check_2fa_gate(
+                state,
+                cfg,
+                &result.operator_name,
+                two_factor::PendingActionType::ModeChange {
+                    mode: mode_arg.clone(),
+                },
+            ) {
+                // 2FA enabled: pending stored, TOTP requested. The post-TOTP
+                // path applies the change via apply_mode_change_request.
+            } else {
+                // 2FA disabled: apply immediately.
+                bot_helpers::apply_mode_change_request(state, &result.operator_name, &mode_arg);
+            }
+        }
+        return true;
+    }
+
+    // /unblock <ip> - reverse a containment from the phone (2FA-gated; queues an
+    // operator_unblock_request the slow loop drains through the lifecycle).
+    if let Some(ip_arg) = result.incident_id.strip_prefix("__unblock__:") {
+        let ip_arg = ip_arg.trim().to_string();
+        info!(operator = %result.operator_name, ip = %ip_arg, "Telegram /unblock command received");
+        if cfg.telegram.bot.enabled {
+            if ip_arg.is_empty() {
+                tg_reply(
+                    state,
+                    "Usage: <code>/unblock &lt;ip&gt;</code>. See <code>/blocked</code> for what is contained."
+                        .to_string(),
+                );
+            } else if ip_arg.parse::<std::net::IpAddr>().is_err() {
+                tg_reply(
+                    state,
+                    format!(
+                        "<code>{}</code> is not a valid IP address.",
+                        telegram::escape_html_pub(&ip_arg)
+                    ),
+                );
+            } else if bot_helpers::check_2fa_gate(
+                state,
+                cfg,
+                &result.operator_name,
+                two_factor::PendingActionType::Unblock { ip: ip_arg.clone() },
+            ) {
+                // 2FA enabled: pending stored, TOTP requested; post-TOTP applies.
+            } else {
+                bot_helpers::request_unblock(state, data_dir, &result.operator_name, &ip_arg);
+            }
+        }
+        return true;
+    }
+
     if result.incident_id == "__guard__" {
         info!(operator = %result.operator_name, "Telegram /guard command received");
         if cfg.telegram.bot.enabled {
@@ -590,8 +705,14 @@ pub(crate) async fn handle_telegram_bot_command(
         if cfg.telegram.bot.enabled {
             let blocked: Vec<String> = state.blocklist.as_vec();
             let text = if blocked.is_empty() {
-                "🛡 No kills this session - perimeter's been clean.\n\
-                 <i>Previous firewall rules still active.</i>"
+                // Honest framing: an empty SESSION list does not mean unprotected.
+                // The old "perimeter's been clean" read as "nothing is guarding
+                // you" to a lay operator, while persistent firewall rules and
+                // active enforcement were both still in effect.
+                "🛡 <b>Nobody new in the cooler this session.</b>\n\
+                 <i>Still locked down: every IP I dropped earlier is still \
+                 blackholed at the firewall (those rules outlive restarts), and \
+                 I'm watching the door. Use /unblock &lt;ip&gt; to release one.</i>"
                     .to_string()
             } else {
                 let mut sorted = blocked;
@@ -602,7 +723,8 @@ pub(crate) async fn handle_telegram_bot_command(
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    "🛡 <b>Kill list</b> - {} contained this session\n\n{list}",
+                    "🛡 <b>Contained this session: {}</b>\n<i>(earlier blocks persist \
+                     at the firewall too)</i>\n\n{list}\n\nRelease one: /unblock &lt;ip&gt;",
                     sorted.len()
                 )
             };
@@ -808,6 +930,27 @@ pub(crate) async fn handle_telegram_bot_command(
     }
 
     // /capabilities - list capabilities and integrations with inline enable buttons
+    // Bare /enable or /disable (no capability arg): show usage + the tappable
+    // capabilities keyboard instead of an "unknown command" hint.
+    if result.incident_id == "__cap_usage__" {
+        info!(operator = %result.operator_name, "Telegram bare /enable or /disable received");
+        if cfg.telegram.bot.enabled {
+            let text = format!(
+                "Usage: <code>/enable &lt;capability&gt;</code> or <code>/disable &lt;capability&gt;</code>.\n\
+                 Tap a capability below, or run <code>/capabilities</code> for the full list.\n\n{}",
+                format_capabilities(cfg)
+            );
+            let keyboard = capabilities_keyboard(cfg);
+            if let Some(ref tg) = state.telegram_client {
+                let tg = tg.clone();
+                tokio::spawn(async move {
+                    let _ = tg.send_text_with_keyboard(&text, keyboard).await;
+                });
+            }
+        }
+        return true;
+    }
+
     if result.incident_id == "__capabilities__" {
         info!(operator = %result.operator_name, "Telegram /capabilities command received");
         if cfg.telegram.bot.enabled {
@@ -1165,6 +1308,7 @@ mod tests {
             "__blocked__",
             "__unknown_cmd__",
             "__capabilities__",
+            "__cap_usage__",
             "__start__",
             "__enable2fa__",
         ];
@@ -1196,6 +1340,127 @@ mod tests {
             let handled = handle_telegram_bot_command(&cmd(id), dir.path(), &cfg, &mut state).await;
             assert!(handled, "command {id} should be handled");
         }
+    }
+
+    #[tokio::test]
+    async fn mode_command_queues_change_and_reports_current() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+        // Default config has no 2FA, so /mode applies inline (queues the change).
+        let handled =
+            handle_telegram_bot_command(&cmd("__mode__:guard"), dir.path(), &cfg, &mut state).await;
+        assert!(handled, "__mode__:guard must be handled");
+        assert!(
+            matches!(
+                state.pending_mode_change,
+                Some(telegram::GuardianMode::Guard)
+            ),
+            "/mode guard (no 2FA) must queue a Guard change for the main loop"
+        );
+
+        // Bare /mode reports the current mode and queues nothing new.
+        state.pending_mode_change = None;
+        let handled_bare =
+            handle_telegram_bot_command(&cmd("__mode__:"), dir.path(), &cfg, &mut state).await;
+        assert!(handled_bare, "bare /mode must be handled");
+        assert!(
+            state.pending_mode_change.is_none(),
+            "bare /mode just reports; it must not queue a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_buttons_actuate_by_queuing_changes() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+
+        // Profile button queues a Profile(simple) change for the main loop.
+        assert!(
+            handle_telegram_bot_command(&cmd("__profile__:simple"), dir.path(), &cfg, &mut state)
+                .await
+        );
+        assert!(
+            matches!(
+                state.pending_setting_changes.last(),
+                Some(crate::SettingChange::Profile(true))
+            ),
+            "profile button must queue an actuating change, not print a CLI hint"
+        );
+
+        // Sensitivity button queues a Sensitivity change.
+        assert!(
+            handle_telegram_bot_command(
+                &cmd("__sensitivity__:quiet"),
+                dir.path(),
+                &cfg,
+                &mut state
+            )
+            .await
+        );
+        assert!(matches!(
+            state.pending_setting_changes.last(),
+            Some(crate::SettingChange::Sensitivity(s)) if s == "quiet"
+        ));
+
+        // A garbage sensitivity word queues NOTHING (handled, but rejected).
+        let before = state.pending_setting_changes.len();
+        assert!(
+            handle_telegram_bot_command(&cmd("__sensitivity__:loud"), dir.path(), &cfg, &mut state)
+                .await
+        );
+        assert_eq!(
+            state.pending_setting_changes.len(),
+            before,
+            "unknown sensitivity must not queue a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_command_validates_and_queues() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+
+        // Valid IP (no 2FA) → handled + queues an operator_unblock_request.
+        let ok = handle_telegram_bot_command(
+            &cmd("__unblock__:198.51.100.9"),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+        assert!(ok, "valid /unblock must be handled");
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let jsonl =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{today}.jsonl"))).unwrap();
+        assert!(
+            jsonl.contains("operator_unblock_request") && jsonl.contains("198.51.100.9"),
+            "valid /unblock queues the request"
+        );
+
+        // Garbage IP and bare /unblock are still handled (reply with an error /
+        // usage), and must NOT queue anything.
+        for id in ["__unblock__:not-an-ip", "__unblock__:"] {
+            assert!(
+                handle_telegram_bot_command(&cmd(id), dir.path(), &cfg, &mut state).await,
+                "{id} must be handled"
+            );
+        }
+        let after =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{today}.jsonl"))).unwrap();
+        assert_eq!(
+            after.matches("operator_unblock_request").count(),
+            1,
+            "only the valid IP queued; garbage + bare queue nothing"
+        );
     }
 
     #[tokio::test]

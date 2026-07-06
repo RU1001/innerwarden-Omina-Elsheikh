@@ -1864,17 +1864,14 @@ fn build_suggestions(report: &TrialReport) -> Vec<String> {
             / report.agent_ai_summary.total_decisions as f64;
         if ignore_ratio > 0.8 {
             suggestions.push(
-                "Most AI decisions are ignore; review detector thresholds and context_events for signal quality."
+                "Most activity is being filtered as benign — normal for an internet-facing host. No action needed unless you expected some of it to be blocked."
                     .to_string(),
             );
         }
     }
-    if report.data_quality.incidents_without_entities > 0 {
-        suggestions.push(
-            "Some incidents were emitted without entities; improve detector payload completeness."
-                .to_string(),
-        );
-    }
+    // `incidents_without_entities` is an internal detector-payload diagnostic,
+    // not something the operator can act on, so it is deliberately NOT surfaced
+    // as an operator suggestion.
     if !report.data_quality.files_not_growing.is_empty() {
         suggestions.push(
             "Some active-day files appear stale (>6h without updates); verify ingest pipeline health."
@@ -1883,13 +1880,13 @@ fn build_suggestions(report: &TrialReport) -> Vec<String> {
     }
     if !report.operational_telemetry.available {
         suggestions.push(
-            "Operational telemetry snapshot not found; run agent with telemetry enabled to improve rollout confidence."
+            "Telemetry snapshot not found; run the agent with telemetry enabled for richer health metrics on the dashboard."
                 .to_string(),
         );
     } else {
         if !report.operational_telemetry.errors_by_component.is_empty() {
             suggestions.push(
-                "Operational telemetry reports component errors; inspect error counters before widening rollout."
+                "Some components reported errors; check the Health tab and inspect the error counters."
                     .to_string(),
             );
         }
@@ -1897,22 +1894,19 @@ fn build_suggestions(report: &TrialReport) -> Vec<String> {
             && report.operational_telemetry.avg_decision_latency_ms > 2000.0
         {
             suggestions.push(
-                "AI decision latency is high (>2s avg); review provider/network latency before enabling broader active response."
+                "AI decision latency is high (>2s avg); check your AI provider and network — slow decisions delay automatic responses."
                     .to_string(),
             );
         }
     }
     if !report.anomaly_hints.is_empty() {
         suggestions.push(
-            "Review anomaly hints for day-over-day spikes and behavior shifts before changing responder settings."
+            "Recent activity shows day-over-day spikes or behaviour shifts — worth a look in the Intelligence tab."
                 .to_string(),
         );
     }
     if suggestions.is_empty() {
-        suggestions.push(
-            "Trial looks healthy; proceed to next phase by enabling responder in dry-run mode."
-                .to_string(),
-        );
+        suggestions.push("Everything looks healthy — no action needed.".to_string());
     }
 
     suggestions
@@ -2943,10 +2937,7 @@ mod tests {
 
         assert_eq!(
             build_suggestions(&report),
-            vec![
-                "Trial looks healthy; proceed to next phase by enabling responder in dry-run mode."
-                    .to_string()
-            ]
+            vec!["Everything looks healthy — no action needed.".to_string()]
         );
     }
 
@@ -3415,6 +3406,7 @@ mod tests {
             events_by_collector,
             incidents_by_detector,
             gate_pass_count: 4,
+            incidents_by_tenant: Default::default(),
             ai_sent_count: 4,
             ai_decision_count: 4,
             avg_decision_latency_ms: 210.0,

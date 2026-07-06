@@ -628,6 +628,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_suppress_response_file_loads_clean_and_is_skipped() {
+        // The dashboard "Trust IP" feature writes suppress_response/scope:ip
+        // rules into the SHARED event_pipeline dir. The sensor must load that
+        // file WITHOUT error (no warn-and-skip) and contribute zero event rules
+        // / suppressions from it — it is an agent-side concern. This is the
+        // regression anchor for the SuppressConfig {detector?, scope?} change.
+        let yaml = r#"
+version: 1
+rules:
+  - id: operator-trust-203-0-113-10
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["203.0.113.10"]
+    drop_reason: "office vpn"
+    tags: [operator-trust]
+"#;
+        let loaded = load_rules_from_yaml(yaml, "70-operator-trust.yml", &HashMap::new())
+            .expect("suppress_response/scope file must load without error");
+        assert!(loaded.event_rules.is_empty());
+        assert!(loaded.suppressions.is_empty());
+    }
+
+    #[test]
     fn builtin_packs_load_successfully() {
         let dir = tempfile::tempdir().unwrap();
         let pipeline = EventPipeline::new(dir.path(), true);

@@ -1,5 +1,6 @@
 mod boot;
 mod btf_offsets;
+mod cloud_platform;
 mod collector_health;
 mod collectors;
 mod config;
@@ -11,6 +12,7 @@ mod event_pipeline;
 mod incident_builders;
 mod kernel_promote;
 mod main_helpers;
+mod path_trust;
 mod seccomp;
 mod sensor;
 mod sinks;
@@ -54,6 +56,13 @@ pub(crate) struct WriteStats {
     pub(crate) events_written: u64,
     pub(crate) events_dropped: u64,
     pub(crate) incidents_written: u64,
+    // Container scope of the event currently being processed, set at the top of
+    // each `process_event` (None for host events and the emergency-lane signal).
+    // It rides here so the single incident sink (`write_incident`) can attribute
+    // an incident to its Kubernetes tenant without threading the event through
+    // every detector emit site. Request-scoped, overwritten each event. (spec 084)
+    pub(crate) current_container_id: Option<String>,
+    pub(crate) current_pod_uid: Option<String>,
 }
 
 fn load_config_for_cli(cli: &Cli) -> Result<config::Config> {
@@ -66,9 +75,25 @@ async fn run_cli(cli: Cli) -> Result<()> {
     sensor::run(cfg).await
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    run_cli(Cli::parse()).await
+/// Number of tokio worker threads to size the runtime with, given the detected
+/// CPU parallelism (`None` if undetectable). A FLOOR of 4 is applied instead of
+/// the `#[tokio::main]` num_cpus default: a few collectors (AF_PACKET dns/http
+/// capture) do blocking `recv` loops on the runtime, and on a 2-vCPU cloud VM the
+/// default 2 workers were BOTH consumed by those blocking calls, starving the
+/// eBPF ring-drain task so kernel events were captured in-ring but never read to
+/// userspace (observed on Azure k7.0, 2 vCPU: kprobes fired, ring filled, 0
+/// events surfaced). The floor keeps spare workers; larger hosts still scale up.
+fn sensor_worker_threads(available: Option<usize>) -> usize {
+    available.unwrap_or(2).max(4)
+}
+
+fn main() -> Result<()> {
+    let workers = sensor_worker_threads(std::thread::available_parallelism().ok().map(|n| n.get()));
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?
+        .block_on(async { run_cli(Cli::parse()).await })
 }
 
 // 11 small helpers (load_blocked_ips, state_path_for, blocked_ips_path_for,
@@ -104,6 +129,20 @@ mod tests {
     // (passthrough_sources_are_disabled_by_default moved to main_helpers.rs
     //  as `is_passthrough_source_returns_false_for_all_known_sources` — same
     //  contract, broader source coverage.)
+
+    #[test]
+    fn sensor_worker_threads_applies_a_floor_of_four() {
+        // Below the floor (incl. the 2-vCPU Azure case that starved the drain) is
+        // raised to 4 so blocking capture collectors can't consume every worker.
+        assert_eq!(sensor_worker_threads(Some(1)), 4);
+        assert_eq!(sensor_worker_threads(Some(2)), 4);
+        assert_eq!(sensor_worker_threads(Some(4)), 4);
+        // Larger hosts still scale up with their CPU count.
+        assert_eq!(sensor_worker_threads(Some(8)), 8);
+        assert_eq!(sensor_worker_threads(Some(64)), 64);
+        // Undetectable parallelism falls back to the floor, never below.
+        assert_eq!(sensor_worker_threads(None), 4);
+    }
 
     #[test]
     fn cli_parses_default_and_custom_config_path() {
@@ -242,6 +281,9 @@ enabled = false
 enabled = false
 
 [collectors.audit_state]
+enabled = false
+
+[collectors.tunnel_iface]
 enabled = false
 
 [detectors.suid_page_cache_integrity]
