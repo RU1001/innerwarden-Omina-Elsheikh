@@ -52,8 +52,8 @@ It lives where the action is: on the machine the agent can affect. Agent-facing 
 
 **In plain terms, it does three things:**
 
-- **Supervise.** It screens an agent's commands and MCP/tool calls *before* they run and returns allow, review, or block, scored against embedded Agent Threat Rules.
-- **Watch.** It sees what actually executes on the host with eBPF, so if something slips past the polite guardrail it is still caught.
+- **Supervise.** It screens an agent's commands and MCP/tool calls *before* they run and returns allow, review, or block, scored against embedded Agent Threat Rules. The command check is shell-rewrite aware: obfuscation that fools a plain blocklist (`r''m -rf`, `rm$IFS-rf`, `$(echo rm)`) is normalized back to the real command before matching.
+- **Watch.** It sees what actually executes on the host with eBPF, so if something slips past the polite guardrail it is still caught, on the real post-rewrite command.
 - **Prove.** It records every decision locally in a tamper-evident audit trail. No cloud, your data never leaves the box.
 
 Under the hood: 27 eBPF programs loaded (kernel-dependent), 82 detectors, 69 cross-layer correlation rules, 56 MITRE ATT&CK technique IDs (90+ detector mappings), and 9800+ tests gate every change. The full tour is further down: [what it does](#what-it-does), [what it detects](#what-it-detects), [how it works](#how-it-works).
@@ -826,10 +826,13 @@ innerwarden agent proxy -- npx -y some-mcp-server   # wrap an MCP server with in
 
 ## Supported environments
 
-- **Linux**: Ubuntu 22.04+, any systemd-based distro. Full feature set: 27 eBPF kernel programs loaded (kernel-dependent; tracepoints, kprobes, LSM, XDP, raw_tracepoints), kill chain detection, wire-speed XDP blocking.
+- **Linux**: Ubuntu 22.04+, any systemd-based distro. Full feature set: 27 eBPF kernel programs loaded (kernel-dependent; tracepoints, kprobes, LSM, XDP, raw_tracepoints), kill chain detection, wire-speed XDP blocking, and the in-kernel Execution Gate.
 - **macOS**: Ventura and later (launchd, pf firewall, unified log). Detection and response work fully, but eBPF kernel programs are Linux-only. macOS uses log-based collectors instead.
+- **Windows**: the per-user AI-agent guardrail (`iw-guard`) runs standalone, and `install.ps1 -Full` installs the host tier (Windows Event Log / ETW telemetry through the same detectors, dashboard, and Windows Firewall containment, monitor-only by default). Like macOS, the kernel EDR (eBPF, Execution Gate) is Linux-only.
 
-Pre-built binaries: `x86_64` and `aarch64` for both platforms.
+The complete host EDR (eBPF sensor + Execution Gate) is Linux. Windows and macOS run the "Phantom" tier: the cross-platform agent guardrail plus log/event-based detection and response.
+
+Pre-built binaries: `x86_64` and `aarch64` for Linux and macOS, plus a signed Windows guardrail (`x86_64` / `aarch64`) and host-tier trio (`x86_64`).
 
 ---
 
@@ -871,20 +874,19 @@ Yes. See [module authoring guide](https://github.com/InnerWarden/innerwarden/wik
 
 ---
 
-## Disclaimer
+## Before you enable enforcement
 
-> **Warning**
-> InnerWarden is an **experimental** security agent that can **block IP addresses, kill processes, suspend user privileges, pause containers, and modify firewall rules** on your system. These are powerful, potentially disruptive actions. Read this document carefully before deploying. Always start in observe-only mode and review behavior before enabling automatic responses.
+> **Recommended: start in dry-run.**
+> Every install ships in observe-only mode (`responder.enabled = false`, `dry_run = true`), so InnerWarden logs what it *would* do without touching your system. We recommend running it that way first, reviewing the decisions in the dashboard, and setting up allowlists for your trusted IPs, users, and services before you flip enforcement on. Nothing acts until you opt in.
 
-InnerWarden is provided as-is, without warranty. It is experimental software that interacts with your system's firewall, process table, and user permissions. Automated security responses carry inherent risk. A false positive can block a legitimate user or disrupt a production service.
+Once live, InnerWarden can block IP addresses, kill processes, suspend user privileges, pause containers, and modify firewall rules. Those are powerful actions, so it is worth:
 
-**You are responsible for:**
-- Testing thoroughly in observe/dry-run mode before enabling responses
+- Running in observe/dry-run mode first and reviewing the audit trail
 - Configuring allowlists to protect trusted IPs, users, and services
-- Monitoring the audit trail and adjusting thresholds for your environment
-- Understanding the response skills you enable and their effects
+- Tuning thresholds for your environment
+- Knowing which response skills you have enabled and what they do
 
-The authors are not responsible for downtime, data loss, or service disruption caused by misconfiguration or false positives. Use good judgment and test in a staging environment first.
+A misconfigured allowlist or an overly aggressive threshold can affect a legitimate user or service, so test in staging before production. InnerWarden is open source and provided under the Apache-2.0 license, without warranty.
 
 ---
 
