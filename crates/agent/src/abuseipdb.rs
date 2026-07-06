@@ -283,6 +283,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_returns_false_when_unconfigured() {
+        let client = AbuseIpDbClient::new(String::new(), 30);
+        let result = client.report("1.2.3.4", "18,22", "test comment").await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn report_returns_true_on_success(){
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("POST", "/api/v2/report")
+            .with_status(200)
+            .create_async()
+            .await;
+        
+        let client = test_client(&server);
+        let result = client.report("1.2.3.4", "18,22", "test comment").await;
+
+        mock.assert_async().await;
+
+        assert!(result);
+
+    }
+
+    #[tokio::test]
+    async fn report_returns_false_on_429(){
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("POST", "/api/v2/report")
+            .with_status(429)
+            .create_async()
+            .await;
+        
+        let client = test_client(&server);
+        let result = client.report("1.2.3.4", "18,22", "test comment").await;
+
+        mock.assert_async().await;
+
+        assert!(!result);
+
+    }
+
+    #[tokio::test]
+    async fn report_returns_false_on_422(){
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("POST", "/api/v2/report")
+            .with_status(422)
+            .create_async()
+            .await;
+        
+        let client = test_client(&server);
+        let result = client.report("1.2.3.4", "18,22", "test comment").await;
+
+        mock.assert_async().await;
+
+        assert!(!result);
+
+    }
+    #[tokio::test]
+    async fn report_returns_false_on_non_200(){
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("POST", "/api/v2/report")
+            .with_status(500)
+            .create_async()
+            .await;
+        
+        let client = test_client(&server);
+        let result = client.report("1.2.3.4", "18,22", "test comment").await;
+
+        mock.assert_async().await;
+
+        assert!(!result);
+
+    }
+
+    #[tokio::test]
     async fn check_returns_none_when_unconfigured() {
         let client = AbuseIpDbClient::new(String::new(), 30);
         let result = client.check("1.2.3.4").await;
